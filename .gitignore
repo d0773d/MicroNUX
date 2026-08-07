@@ -1,0 +1,30 @@
+# Build outputs
+build/
+out/
+output/
+.cache/
+CMakeFiles/
+
+# ESP-IDF generated state
+sdkconfig
+sdkconfig.old
+
+# Buildroot generated output
+buildroot/output/
+
+# Compiled firmware and objects
+*.a
+*.bin
+*.d
+*.elf
+*.map
+*.o
+
+# Full-device backups may contain credentials or private data
+artifacts/flash-backups/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

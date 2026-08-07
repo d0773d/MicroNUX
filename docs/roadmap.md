@@ -1,0 +1,90 @@
+# MicroNUX Milestone Roadmap
+
+## M0 - Reference hardware contract
+
+Status: **complete**
+
+- Freeze the reference board and silicon revision.
+- Verify flash, PSRAM, clock, console, and wireless-coprocessor link.
+- Pin ESP-IDF and host-tool versions.
+- Establish the factory-flash backup and recovery policy.
+
+Exit artifact: [hardware contract](hardware.md).
+
+## M1 - Reproducible NOMMU Linux under QEMU
+
+Status: **next**
+
+- Pin Linux, Buildroot, BusyBox, uClibc-ng, and QEMU revisions.
+- Define the RV32 ISA and ABI contract.
+- Produce a deterministic kernel and initramfs build.
+- Boot to an interactive BusyBox shell under QEMU.
+- Exercise NOMMU-safe process creation and basic filesystem operations.
+
+Exit criterion: one documented command builds and boots the shell from a clean
+checkout.
+
+## M2 - ESP-IDF loader and kernel handoff
+
+- Initialize and test external PSRAM with ESP-IDF v6.0.1.
+- Load and validate the Linux image without requiring Linux flash drivers.
+- Define a versioned handoff block for memory, clocks, console, silicon revision,
+  device tree, and reserved regions.
+- Quiesce or explicitly transfer every loader-owned peripheral.
+- Jump to the kernel with a documented RISC-V register contract.
+
+Exit criterion: the loader reliably reaches a diagnostic kernel entry point in
+PSRAM and reports the same handoff data on every cold boot.
+
+## M3 - Minimal ESP32-P4 Linux platform
+
+- Add early UART output.
+- Implement revision-correct traps and CLIC interrupt handling.
+- Add the system timer and monotonic clocksource.
+- Add reset/power control and the minimal device tree.
+- Reserve loader and communication memory correctly.
+
+Exit criterion: the kernel boots far enough to mount its initramfs without
+unhandled traps or timer stalls.
+
+## M4 - First hardware shell
+
+- Boot single-core Linux from the ESP-IDF loader.
+- Mount the read-only initramfs.
+- Start an interactive BusyBox shell on UART0.
+- Record cold-boot time, free memory, and kernel/initramfs sizes.
+
+Exit criterion: repeatable hardware boots reach a usable shell without manual
+intervention after reset.
+
+## M5 - NOMMU hardening
+
+- Audit programs for `vfork()`/`execve()` and NOMMU-safe allocation behavior.
+- Add memory-pressure, repeated-exec, timer, and console stress tests.
+- Detect stack exhaustion, memory corruption, and loader-region overlap.
+- Document supported and unsupported Unix behavior.
+
+Exit criterion: the baseline test suite survives repeated cold boots and an
+extended stress run within a fixed memory budget.
+
+## M6 - Storage, networking, and peripherals
+
+- Add storage only after its pin mux and DMA behavior are frozen.
+- Integrate ESP32-C6 networking through a narrow, documented transport.
+- Evaluate Ethernet, USB, microSD, display, and other board peripherals
+  independently.
+- Keep optional drivers out of the minimal boot configuration.
+
+Exit criterion: selected services work without destabilizing the minimal shell
+or violating reserved-memory boundaries.
+
+## M7 - Isolation, SMP, and upstream evaluation
+
+- Use PMP to protect critical kernel, loader, and coprocessor regions where
+  practical.
+- Measure whether a second HP core provides a net benefit under NOMMU limits.
+- Split experimental board code from patches suitable for upstream submission.
+- Publish reproducible results, limitations, and maintenance expectations.
+
+Exit criterion: decide, from measurements, which isolation, SMP, and upstream
+paths MicroNUX will support.
