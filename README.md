@@ -46,5 +46,10 @@ userspace image and workload.
 
 ## License
 
-No project license has been selected yet. Until a license is added, normal
-copyright restrictions apply even though the repository is public.
+Original MicroNUX code and documentation are available under the
+[MIT License](LICENSE).
+
+Third-party components and material derived from upstream projects retain
+their original licenses. In particular, Linux kernel-derived files must retain
+their applicable GPL-2.0-only and Linux syscall-exception notices. The top-level
+MIT license does not relicense those files.
