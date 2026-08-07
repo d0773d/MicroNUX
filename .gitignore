@@ -4,6 +4,8 @@ out/
 output/
 .cache/
 CMakeFiles/
+__pycache__/
+*.pyc
 
 # ESP-IDF generated state
 sdkconfig

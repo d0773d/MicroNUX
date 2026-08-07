@@ -13,7 +13,7 @@ Exit artifact: [hardware contract](hardware.md).
 
 ## M1 - Reproducible NOMMU Linux under QEMU
 
-Status: **next**
+Status: **complete**
 
 - Pin Linux, Buildroot, BusyBox, uClibc-ng, and QEMU revisions.
 - Define the RV32 ISA and ABI contract.

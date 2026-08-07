@@ -109,7 +109,8 @@ was read-only apart from resetting the board to collect its boot log.
 - Loader and hardware diagnostics: ESP-IDF v6.0.1
 - ROM inspection: esptool v5.3.0
 - Linux root filesystem: Buildroot, uClibc-ng, and BusyBox on a Linux/WSL2 host
-- Linux ABI: RV32 NOMMU; exact ISA/ABI flags will be frozen by the QEMU milestone
+- Linux ABI: RV32 NOMMU `rv32imac_zicsr_zifencei` with soft-float `ilp32`;
+  Linux must not be exposed to `F` or `D` in the initial profile
 - Build outputs must record source revisions, configuration files, and hashes
 
 ## M0 exit criteria

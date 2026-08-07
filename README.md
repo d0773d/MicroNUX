@@ -10,11 +10,9 @@ desktop Linux compatibility or MMU-backed process isolation.
 
 ## Current status
 
-Milestone M0 is complete. The reference board, silicon revision, boot console,
-memory baseline, loader SDK, and first-write safety policy are frozen.
-
-Next: M1 will produce a reproducible RV32 NOMMU Linux and BusyBox shell under
-QEMU before hardware-specific kernel work begins.
+Milestones M0 and M1 are complete. The pinned `rv32imac`/`ilp32` NOMMU image
+boots a reduced BusyBox bFLT shell with 32 MiB RAM under QEMU and passes the
+automated repeated-exec test. M2 is the ESP-IDF loader and kernel handoff.
 
 ## Design baseline
 
@@ -34,6 +32,7 @@ userspace image and workload.
 
 - [Hardware contract](docs/hardware.md)
 - [Milestone roadmap](docs/roadmap.md)
+- [M1 QEMU build and test](docs/m1-qemu.md)
 
 ## Project policy
 
