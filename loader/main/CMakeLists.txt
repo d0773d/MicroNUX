@@ -1,0 +1,15 @@
+idf_component_register(
+    SRCS
+        "micronux_loader.c"
+        "handoff_jump.S"
+    INCLUDE_DIRS "."
+    PRIV_REQUIRES
+        esp_mm
+        esp_partition
+        esp_psram
+        esp_hw_support
+        esp_rom
+        esp_system
+        freertos
+        mbedtls
+)

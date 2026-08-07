@@ -26,6 +26,8 @@ checkout.
 
 ## M2 - ESP-IDF loader and kernel handoff
 
+Status: **complete**
+
 - Initialize and test external PSRAM with ESP-IDF v6.0.1.
 - Load and validate the Linux image without requiring Linux flash drivers.
 - Define a versioned handoff block for memory, clocks, console, silicon revision,
@@ -35,6 +37,10 @@ checkout.
 
 Exit criterion: the loader reliably reaches a diagnostic kernel entry point in
 PSRAM and reports the same handoff data on every cold boot.
+
+Exit artifact: [M2 loader and handoff report](m2-loader.md). The automated gate
+uses an EN hard reset, which restarts at the P4 ROM and reinitializes the IDF
+boot path; it does not remove power from the carrier.
 
 ## M3 - Minimal ESP32-P4 Linux platform
 
