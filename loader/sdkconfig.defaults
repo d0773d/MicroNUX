@@ -11,6 +11,18 @@ CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_SPEED_200M=y
 CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+
+# Linux takes over the P4 in machine mode and needs the whole PSRAM window to
+# remain RWX for both kernel execution and NOMMU userspace. ESP-IDF's locked
+# W^X PMP split only covers the loader's own PSRAM text and would make a loaded
+# kernel in heap PSRAM non-executable. M7 will revisit isolation deliberately.
+# CONFIG_ESP_SYSTEM_MEMPROT is not set
+
+# The ESP-IDF watchdogs are serviced by FreeRTOS.  Linux takes over the HP
+# cores after the loader jump, so leaving either watchdog armed would reset a
+# healthy kernel before it can install its own watchdog policy.
+# CONFIG_ESP_INT_WDT is not set
+# CONFIG_ESP_TASK_WDT_EN is not set
 CONFIG_SPIRAM_MEMTEST=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=49152
@@ -20,5 +32,6 @@ CONFIG_CACHE_L2_CACHE_LINE_128B=y
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_UART_NUM=0
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y

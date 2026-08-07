@@ -2,4 +2,5 @@
 *.config text eol=lf
 *.py text eol=lf
 *.sh text eol=lf
+*.patch text eol=lf -whitespace
 *_defconfig text eol=lf

@@ -7,8 +7,8 @@
 
 /*
  * a0: boot hart ID
- * a1: pointer to micronux_handoff_v1_t
- * a2: diagnostic entry virtual address in executable PSRAM
+ * a1: pointer to the flattened device tree
+ * a2: Linux entry virtual address in executable PSRAM
  */
 micronux_handoff_jump:
     fence   rw, rw

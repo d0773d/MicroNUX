@@ -7,6 +7,7 @@ idf_component_register(
         esp_mm
         esp_partition
         esp_psram
+        esp_timer
         esp_hw_support
         esp_rom
         esp_system

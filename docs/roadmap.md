@@ -44,20 +44,26 @@ boot path; it does not remove power from the carrier.
 
 ## M3 - Minimal ESP32-P4 Linux platform
 
-- Add early UART output.
+Status: **complete**
+
+- Add early output through the board's native USB Serial/JTAG port.
 - Implement revision-correct traps and CLIC interrupt handling.
 - Add the system timer and monotonic clocksource.
-- Add reset/power control and the minimal device tree.
+- Add reset control and the minimal device tree.
 - Reserve loader and communication memory correctly.
 
 Exit criterion: the kernel boots far enough to mount its initramfs without
 unhandled traps or timer stalls.
 
+Exit artifact: [M3 platform and hardware acceptance report](m3-platform.md).
+The final image passed three ROM-reset boots with identical kernel and DTB
+hashes and reached `/init` in approximately 0.281 seconds on every boot.
+
 ## M4 - First hardware shell
 
 - Boot single-core Linux from the ESP-IDF loader.
 - Mount the read-only initramfs.
-- Start an interactive BusyBox shell on UART0.
+- Start an interactive BusyBox shell on the native USB Serial/JTAG console.
 - Record cold-boot time, free memory, and kernel/initramfs sizes.
 
 Exit criterion: repeatable hardware boots reach a usable shell without manual
