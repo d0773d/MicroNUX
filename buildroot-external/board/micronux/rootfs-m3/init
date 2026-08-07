@@ -1,0 +1,8 @@
+#!/bin/sh
+
+# M3 deliberately stops before a full USB tty driver and interactive shell.
+# Reaching this process proves that the embedded initramfs was unpacked and
+# mounted. Repeated sleeps keep the system timer active for the hardware gate.
+while :; do
+	/bin/busybox sleep 3600
+done

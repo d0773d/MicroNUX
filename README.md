@@ -10,14 +10,17 @@ desktop Linux compatibility or MMU-backed process isolation.
 
 ## Current status
 
-Milestones M0 through M2 are complete. The pinned `rv32imac`/`ilp32` NOMMU
+Milestones M0 through M3 are complete. The pinned `rv32imac`/`ilp32` NOMMU
 image boots a reduced BusyBox bFLT shell with 32 MiB RAM under QEMU. On the
-physical ESP32-P4, the M2 loader tests PSRAM, loads that exact image from flash,
-verifies its SHA-256, and reaches a PSRAM-resident diagnostic entry point with
-a stable handoff over three ROM-reset boots.
+physical ESP32-P4 revision 1.3, the M3 loader validates and loads Linux and its
+device tree from flash, installs an exact PMP memory window, and hands off to a
+single-core machine-mode kernel. Linux initializes the revision-correct CLIC
+trap path and 360 MHz CLINT timer, mounts its initramfs, and starts `/init`.
+The final artifacts passed three independent ROM-reset boots with identical
+hashes and no unhandled traps or timer stalls.
 
-Linux has not executed on the ESP32-P4 yet. M3 is the first ESP32-P4 Linux
-platform work: early UART, traps/interrupts, timer, reset, and device tree.
+M4 is the next milestone: replace the polling output-only early console with a
+proper interactive console and reach a usable BusyBox shell on the board.
 
 ## Design baseline
 
@@ -26,7 +29,7 @@ platform work: early UART, traps/interrupts, timer, reset, and device tree.
 - ESP-IDF v6.0.1 second-stage loader
 - Linux image loaded into external PSRAM
 - BusyBox with uClibc-ng userspace
-- UART0 as the first boot and shell console
+- Native USB Serial/JTAG as the first hardware output path
 - ESP32-C6 networking treated as a later coprocessor-backed service
 
 NOMMU constraints are part of the platform contract: no demand paging, no
@@ -39,12 +42,13 @@ userspace image and workload.
 - [Milestone roadmap](docs/roadmap.md)
 - [M1 QEMU build and test](docs/m1-qemu.md)
 - [M2 ESP32-P4 loader and handoff](docs/m2-loader.md)
+- [M3 ESP32-P4 Linux platform](docs/m3-platform.md)
 
 ## Project policy
 
 - Keep builds reproducible and record upstream revisions and configuration.
 - Make the first hardware path as small as possible: loader, timer, interrupts,
-  UART, initramfs, and shell.
+  native USB console, initramfs, and shell.
 - Preserve the factory flash image before the first firmware write.
 - Do not burn security eFuses during development.
 - Treat ESP32-P4 silicon revisions as distinct platform profiles where required.
