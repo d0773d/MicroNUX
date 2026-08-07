@@ -10,9 +10,14 @@ desktop Linux compatibility or MMU-backed process isolation.
 
 ## Current status
 
-Milestones M0 and M1 are complete. The pinned `rv32imac`/`ilp32` NOMMU image
-boots a reduced BusyBox bFLT shell with 32 MiB RAM under QEMU and passes the
-automated repeated-exec test. M2 is the ESP-IDF loader and kernel handoff.
+Milestones M0 through M2 are complete. The pinned `rv32imac`/`ilp32` NOMMU
+image boots a reduced BusyBox bFLT shell with 32 MiB RAM under QEMU. On the
+physical ESP32-P4, the M2 loader tests PSRAM, loads that exact image from flash,
+verifies its SHA-256, and reaches a PSRAM-resident diagnostic entry point with
+a stable handoff over three ROM-reset boots.
+
+Linux has not executed on the ESP32-P4 yet. M3 is the first ESP32-P4 Linux
+platform work: early UART, traps/interrupts, timer, reset, and device tree.
 
 ## Design baseline
 
@@ -33,6 +38,7 @@ userspace image and workload.
 - [Hardware contract](docs/hardware.md)
 - [Milestone roadmap](docs/roadmap.md)
 - [M1 QEMU build and test](docs/m1-qemu.md)
+- [M2 ESP32-P4 loader and handoff](docs/m2-loader.md)
 
 ## Project policy
 

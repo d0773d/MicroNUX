@@ -64,6 +64,11 @@ The user confirmed that this attached device is the linked
 `ESP32-P4-Module-DEV-KIT`. This probe supersedes the earlier observation of a
 different attached Waveshare Touch-LCD-3.5 board.
 
+The reference carrier enumerated as a CH343 UART port and a separate USB
+Serial/JTAG port. M2 flashing and acceptance testing used the CH343 UART port;
+port numbers are deliberately not part of the contract because Windows can
+reassign them.
+
 ## Frozen boot-critical pin map
 
 | Function | ESP32-P4 GPIO | Evidence |
@@ -98,11 +103,13 @@ The selected reference board reports:
 - flash encryption disabled; and
 - `SPI_BOOT_CRYPT_CNT` equal to zero.
 
-Before the first MicroNUX write, read the entire 16 MiB factory flash into a
-local backup, record its SHA-256 hash, and verify that a sample can be read
-back. Then review the MicroNUX partition offsets and rehearse ROM download-mode
-recovery. No eFuse change is part of the development plan. All M0 inspection
-was read-only apart from resetting the board to collect its boot log.
+Before the first MicroNUX write, the policy requires reading the entire 16 MiB
+factory flash into a local backup, recording its SHA-256 hash, and verifying a
+sample readback. No retained pre-M2 factory backup was found in the project
+workspace, so the original factory image must not be described as preserved.
+Recovery currently means ROM download mode plus the vendor firmware or a fresh
+MicroNUX flash. M2 did not change any eFuse, secure-boot, or flash-encryption
+setting.
 
 ## Toolchain contract
 
