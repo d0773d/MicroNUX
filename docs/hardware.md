@@ -81,10 +81,11 @@ reassign them.
 | ESP32-C6 SDIO D0-D3 | 14, 15, 16, 17 | live ESP-Hosted initialization |
 | ESP32-C6 reset | 54 | live ESP-Hosted initialization |
 
-UART0 at 115200 8N1 is the only console required for the first Linux shell.
-Storage, Ethernet, display, camera, and USB pins will be frozen in their own
-driver milestones so their mux and DMA conflicts are reviewed at the point of
-use.
+The native USB Serial/JTAG controller is the M3/M4 Linux console; UART0 at
+115200 8N1 remains the wired recovery and alternate-debug path. Storage,
+Ethernet, display, camera, and general-purpose USB pins will be frozen in their
+own driver milestones so their mux and DMA conflicts are reviewed at the point
+of use.
 
 ## Silicon and interrupt-controller risk
 

@@ -67,6 +67,13 @@
 #define ESP32P4_CLIC_NLBITS_MASK (UINT32_C(0xF) << 1)
 #define ESP32P4_CLIC_NLBITS_3 (UINT32_C(3) << 1)
 
+/* USB Serial/JTAG is peripheral interrupt source 22 on ESP32-P4. */
+#define ESP32P4_USB_SERIAL_JTAG_INT_ENA UINT32_C(0x500D2010)
+#define ESP32P4_USB_SERIAL_JTAG_INT_CLR UINT32_C(0x500D2014)
+#define ESP32P4_CORE0_USB_SERIAL_JTAG_INT_MAP UINT32_C(0x500D6058)
+#define ESP32P4_INTERRUPT_MAP_MASK UINT32_C(0x3F)
+#define MICRONUX_USB_SERIAL_JTAG_CLIC_ID UINT32_C(16)
+
 static const char *const TAG = "micronux_m3";
 static DRAM_ATTR micronux_handoff_v1_t s_handoff;
 static DRAM_ATTR micronux_payload_v1_t s_payload;
@@ -246,6 +253,30 @@ static void prepare_clic_for_linux(void)
                 (config & ~ESP32P4_CLIC_NLBITS_MASK) |
                 ESP32P4_CLIC_NLBITS_3);
     write_reg32(ESP32P4_CLIC_THRESHOLD, 0);
+}
+
+static void prepare_usb_serial_jtag_for_linux(void)
+{
+    /*
+     * Linux owns CLIC ID 16 (external slot 0).  Stop the IDF driver's
+     * peripheral interrupts, clear stale endpoint status, then transfer the
+     * source through the core-0 interrupt matrix.  Polling TX remains usable
+     * by the early console throughout the handoff.
+     */
+    write_reg32(ESP32P4_USB_SERIAL_JTAG_INT_ENA, 0);
+    write_reg32(ESP32P4_USB_SERIAL_JTAG_INT_CLR, UINT32_MAX);
+
+    const uint32_t map = read_reg32(
+        ESP32P4_CORE0_USB_SERIAL_JTAG_INT_MAP);
+    write_reg32(ESP32P4_CORE0_USB_SERIAL_JTAG_INT_MAP,
+        (map & ~ESP32P4_INTERRUPT_MAP_MASK) |
+        MICRONUX_USB_SERIAL_JTAG_CLIC_ID);
+
+    if ((read_reg32(ESP32P4_CORE0_USB_SERIAL_JTAG_INT_MAP) &
+         ESP32P4_INTERRUPT_MAP_MASK) !=
+        MICRONUX_USB_SERIAL_JTAG_CLIC_ID) {
+        fail("usb-serial-jtag-route");
+    }
 }
 
 static void prepare_pmp_for_linux(void)
@@ -479,6 +510,11 @@ void app_main(void)
     ESP_LOGI(TAG,
              "MICRONUX:M3:JUMP a0=0 a1=%p entry=%08" PRIx32,
              dtb, s_payload.kernel_load_vaddr);
+    ESP_LOGI(TAG,
+             "MICRONUX:M4:IRQ source=22 matrix=%08" PRIx32
+             " clic=%" PRIu32 " handoff=armed",
+             ESP32P4_CORE0_USB_SERIAL_JTAG_INT_MAP,
+             MICRONUX_USB_SERIAL_JTAG_CLIC_ID);
 
     fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -491,6 +527,7 @@ void app_main(void)
     vTaskSuspendAll();
     portDISABLE_INTERRUPTS();
     esp_cpu_intr_disable(UINT32_MAX);
+    prepare_usb_serial_jtag_for_linux();
     prepare_clic_for_linux();
 
     micronux_handoff_jump(0, dtb, s_payload.kernel_load_vaddr);

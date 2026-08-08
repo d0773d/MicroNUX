@@ -10,17 +10,16 @@ desktop Linux compatibility or MMU-backed process isolation.
 
 ## Current status
 
-Milestones M0 through M3 are complete. The pinned `rv32imac`/`ilp32` NOMMU
+Milestones M0 through M4 are complete. The pinned `rv32imac`/`ilp32` NOMMU
 image boots a reduced BusyBox bFLT shell with 32 MiB RAM under QEMU. On the
 physical ESP32-P4 revision 1.3, the M3 loader validates and loads Linux and its
 device tree from flash, installs an exact PMP memory window, and hands off to a
 single-core machine-mode kernel. Linux initializes the revision-correct CLIC
-trap path and 360 MHz CLINT timer, mounts its initramfs, and starts `/init`.
-The final artifacts passed three independent ROM-reset boots with identical
-hashes and no unhandled traps or timer stalls.
-
-M4 is the next milestone: replace the polling output-only early console with a
-proper interactive console and reach a usable BusyBox shell on the board.
+trap path and 360 MHz CLINT timer, transitions from polling early output to the
+interrupt-driven native USB `ttyGS0` console, mounts its initramfs pseudo
+filesystems, and starts an interactive BusyBox shell. The M4 artifacts passed
+three independent ROM-reset boots with identical hashes, 20,544 KiB free, and
+working `cat`, `free`, and `uname` commands. M5 NOMMU hardening is next.
 
 ## Design baseline
 
@@ -43,6 +42,7 @@ userspace image and workload.
 - [M1 QEMU build and test](docs/m1-qemu.md)
 - [M2 ESP32-P4 loader and handoff](docs/m2-loader.md)
 - [M3 ESP32-P4 Linux platform](docs/m3-platform.md)
+- [M4 ESP32-P4 hardware shell](docs/m4-shell.md)
 
 ## Project policy
 

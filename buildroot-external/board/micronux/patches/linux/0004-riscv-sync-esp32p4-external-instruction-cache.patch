@@ -1,0 +1,59 @@
+From 8f4f1ed3404000d59c54f0f4b625da2b8de34b5c Mon Sep 17 00:00:00 2001
+From: MicroNUX Project <micronux@example.invalid>
+Date: Fri, 7 Aug 2026 18:00:00 -0700
+Subject: [PATCH] riscv: sync ESP32-P4 external instruction cache
+
+The architectural fence.i instruction synchronizes the CPU pipeline, but it
+does not operate the ESP32-P4's external-memory L1 cache controller.  NOMMU
+signal delivery writes an rt_sigreturn trampoline to the process stack in
+PSRAM, so stale I-cache data can otherwise be decoded when the handler
+returns.
+
+Write dirty core-0 D-cache lines into the shared L2 and invalidate the core-0
+I-cache through the revision-stable ESP32-P4 ROM cache API before fence.i.
+This also makes the generic RISC-V instruction-cache hooks safe for other
+dynamically loaded or generated code in external RAM.
+
+Signed-off-by: MicroNUX Project <micronux@example.invalid>
+---
+ arch/riscv/include/asm/cacheflush.h | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/arch/riscv/include/asm/cacheflush.h b/arch/riscv/include/asm/cacheflush.h
+index 915f532dcbb4..3656ef41c30c 100644
+--- a/arch/riscv/include/asm/cacheflush.h
++++ b/arch/riscv/include/asm/cacheflush.h
+@@ -7,8 +7,31 @@
+ 
+ #include <linux/mm.h>
+ 
++#ifdef CONFIG_SOC_ESP32P4
++#define ESP32P4_ROM_CACHE_INVALIDATE_ALL	0x4fc00404UL
++#define ESP32P4_ROM_CACHE_WRITEBACK_ALL		0x4fc00414UL
++#define ESP32P4_CACHE_MAP_L1_ICACHE0		(1U << 0)
++#define ESP32P4_CACHE_MAP_L1_DCACHE		(1U << 4)
++
++typedef int (*esp32p4_cache_all_fn)(unsigned int map);
++
++static inline void esp32p4_sync_external_icache(void)
++{
++	esp32p4_cache_all_fn writeback =
++		(esp32p4_cache_all_fn)ESP32P4_ROM_CACHE_WRITEBACK_ALL;
++	esp32p4_cache_all_fn invalidate =
++		(esp32p4_cache_all_fn)ESP32P4_ROM_CACHE_INVALIDATE_ALL;
++
++	writeback(ESP32P4_CACHE_MAP_L1_DCACHE);
++	invalidate(ESP32P4_CACHE_MAP_L1_ICACHE0);
++}
++#endif
++
+ static inline void local_flush_icache_all(void)
+ {
++#ifdef CONFIG_SOC_ESP32P4
++	esp32p4_sync_external_icache();
++#endif
+ 	asm volatile ("fence.i" ::: "memory");
+ }
+ 
+-- 
+2.50.1
