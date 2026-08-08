@@ -11,12 +11,16 @@ P4 peripheral sources enter CLIC interrupt IDs 16 through 47.  MicroNUX is
 currently single-core and uses ID 16 for USB Serial/JTAG, so handle external
 CLIC IDs as ordinary level IRQs rather than per-CPU local interrupts.
 
+Also arm the endpoint-empty interrupt when start_tx finds the previous USB
+packet busy.  Without that wakeup, a new tty burst can remain queued forever
+after the host drains the packet that was already in flight.
+
 Signed-off-by: MicroNUX Project <micronux@example.invalid>
 ---
- drivers/irqchip/irq-riscv-intc.c |  8 ++++++++
- drivers/tty/serial/Kconfig        |  6 +++---
- drivers/tty/serial/esp32_acm.c    | 18 +++++++++++++++---
- 3 files changed, 26 insertions(+), 6 deletions(-)
+ drivers/irqchip/irq-riscv-intc.c |  6 ++++++
+ drivers/tty/serial/Kconfig       |  6 +++---
+ drivers/tty/serial/esp32_acm.c   | 27 +++++++++++++++++++++++----
+ 3 files changed, 32 insertions(+), 7 deletions(-)
 
 diff --git a/drivers/irqchip/irq-riscv-intc.c b/drivers/irqchip/irq-riscv-intc.c
 index eb813b10f96c..0f974de38b74 100644
@@ -68,6 +72,26 @@ index 1bb9f79f244c..403f40a0ac83 100644
  	}, { /* sentinel */ }
  };
  MODULE_DEVICE_TABLE(of, esp32s3_acm_dt_ids);
+@@ -137,8 +139,18 @@ static void esp32s3_acm_transmit_buffer(struct uart_port *port)
+ 	unsigned int pending;
+ 	u8 ch;
+ 
+-	if (!esp32s3_acm_tx_fifo_free(port))
++	if (!esp32s3_acm_tx_fifo_free(port)) {
++		u32 int_ena;
++
++		/*
++		 * start_tx() can race the host draining the previous packet.
++		 * Arm the empty interrupt so queued bytes are not stranded.
++		 */
++		int_ena = esp32s3_acm_read(port, USB_SERIAL_JTAG_INT_ENA_REG);
++		int_ena |= USB_SERIAL_JTAG_SERIAL_IN_EMPTY_INT_ENA;
++		esp32s3_acm_write(port, USB_SERIAL_JTAG_INT_ENA_REG, int_ena);
+ 		return;
++	}
+ 
+ 	tx_fifo_used = esp32s3_acm_tx_fifo_cnt(port);
+ 	pending = uart_port_tx_limited(port, ch,
 @@ -217,7 +219,7 @@ static void esp32s3_acm_set_termios(struct uart_port *port,
  
  static const char *esp32s3_acm_type(struct uart_port *port)

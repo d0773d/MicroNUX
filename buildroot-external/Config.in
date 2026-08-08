@@ -1,1 +1,1 @@
-# MicroNUX does not define additional Buildroot packages yet.
+source "$BR2_EXTERNAL_MICRONUX_PATH/package/micronux-selftest/Config.in"
