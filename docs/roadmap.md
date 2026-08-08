@@ -107,8 +107,11 @@ Exit criterion: selected services work without destabilizing the minimal shell
 or violating reserved-memory boundaries.
 
 Current artifact: [M6 storage and peripheral bring-up](m6-peripherals.md). The
-onboard microSD controller now boots on physical hardware in forced PIO mode;
-the repeatable read gate is pending a removable card. MIPI-DSI is split into
+onboard microSD storage slice is complete on physical hardware using a
+read-only, synchronous-polled IDMAC path with internal-SRAM descriptors and a
+4 KiB bounce buffer. A clean image passed three ROM-reset boots with identical
+card samples, read-only VFAT mounts, stable payload hashes, and the complete M5
+regression. Networking and display remain open. MIPI-DSI is split into
 electrical-pattern, scanout-ownership, and Linux-console gates so display DMA
 cannot bypass the PSRAM cache contract.
 

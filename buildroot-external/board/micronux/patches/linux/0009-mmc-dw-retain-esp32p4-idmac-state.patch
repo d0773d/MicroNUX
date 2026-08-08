@@ -1,0 +1,34 @@
+From 6a91bda0eaa652e53a8604b9e2d16b186ac439a1 Mon Sep 17 00:00:00 2001
+From: MicroNUX Project <micronux@example.invalid>
+Date: Sat, 8 Aug 2026 04:46:00 -0700
+Subject: [PATCH] mmc: dw: retain ESP32-P4 IDMAC state between requests
+
+The ESP32-P4 controller retains its IDMAC setup between requests. Resetting
+the DMA blocks immediately before every request leaves the second descriptor
+owned but never executed. Keep the initialized engine running and retain the
+existing reset paths for error recovery.
+
+Signed-off-by: MicroNUX Project <micronux@example.invalid>
+---
+ drivers/mmc/host/dw_mmc.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -831,4 +831,10 @@ static int dw_mci_idmac_start_dma(struct dw_mci *host, unsigned int sg_len)
+-	/* Make sure to reset DMA in case we did PIO before this */
+-	dw_mci_ctrl_reset(host, SDMMC_CTRL_DMA_RESET);
+-	dw_mci_idmac_reset(host);
++	/*
++	 * The ESP32-P4 controller retains IDMAC ownership across requests, as
++	 * used by its native driver. Resetting both DMA blocks for every Linux
++	 * request races the next descriptor after the first successful read.
++	 */
++	if (!(host->quirks & DW_MMC_QUIRK_ESP32P4_POLLED_IDMAC)) {
++		dw_mci_ctrl_reset(host, SDMMC_CTRL_DMA_RESET);
++		dw_mci_idmac_reset(host);
++	}
+ 
+-- 
+2.43.0

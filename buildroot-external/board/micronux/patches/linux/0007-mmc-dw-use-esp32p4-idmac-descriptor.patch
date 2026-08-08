@@ -1,0 +1,25 @@
+From 532291a41b1db0d14d6a9ccb504b9ba14b4e999e Mon Sep 17 00:00:00 2001
+From: MicroNUX Project <micronux@example.invalid>
+Date: Sat, 8 Aug 2026 04:44:00 -0700
+Subject: [PATCH] mmc: dw: use the ESP32-P4 IDMAC descriptor
+
+Use the controller-specific descriptor builder for ESP32-P4 transfers.
+
+Signed-off-by: MicroNUX Project <micronux@example.invalid>
+---
+ drivers/mmc/host/dw_mmc.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -818,4 +818,6 @@ static int dw_mci_idmac_start_dma(struct dw_mci *host, unsigned int sg_len)
+-	if (host->dma_64bit_address == 1)
++	if (host->quirks & DW_MMC_QUIRK_ESP32P4_POLLED_IDMAC)
++		ret = dw_mci_esp32p4_prepare_desc(host);
++	else if (host->dma_64bit_address == 1)
+ 		ret = dw_mci_prepare_desc64(host, host->data, sg_len);
+ 	else
+ 		ret = dw_mci_prepare_desc32(host, host->data, sg_len);
+-- 
+2.43.0

@@ -129,16 +129,52 @@ index 9d4c38b8d11f..7b53f3986c69 100644
  	csrr s5, CSR_SCRATCH
  	REG_S s0, PT_SP(sp)
  	REG_S s1, PT_STATUS(sp)
-@@ -257,6 +266,12 @@ SYM_CODE_START_NOALIGN(ret_from_exception)
- 	csrw CSR_STATUS, a0
- 	csrw CSR_EPC, a2
- 
+@@ -257,6 +266,48 @@ SYM_CODE_START_NOALIGN(ret_from_exception)
 +#ifdef CONFIG_SOC_ESP32P4
-+	/* ESP32-P4 CLIC mret consumes the state captured in mcause. */
++	/*
++	 * ESP32-P4 CLIC mret consumes privilege and interrupt state from
++	 * mcause as well as mstatus. Keep the two saved views coherent before
++	 * either CSR becomes live.
++	 */
 +	REG_L a1, PT_CLIC_CAUSE(sp)
++	li t0, 0x1800
++	and t1, a0, t0
++	li t0, 0xcfffffff
++	and a1, a1, t0
++	slli t1, t1, 17
++	or a1, a1, t1
++	bnez t1, .Lesp32p4_clic_direct_return
++	bgez a1, .Lesp32p4_clic_direct_return
++
++	/*
++	 * Revision 1 ESP32-P4 cores restore the CLIC level only for an
++	 * interrupt-form mret, but that form cannot return directly to U-mode.
++	 * First unwind the CLIC state into an M-mode trampoline with interrupts
++	 * disabled. The trampoline then performs the exception-form U return.
++	 */
++	li t0, 0xf7ffffff
++	and t1, a1, t0
++	li t0, 0x30000000
++	or t1, t1, t0
++	csrw CSR_CAUSE, t1
++	li t0, SR_MPP
++	or t1, a0, t0
++	andi t1, t1, -129
++	csrw CSR_STATUS, t1
++	la t0, .Lesp32p4_clic_user_return
++	csrw CSR_EPC, t0
++	mret
++
++.Lesp32p4_clic_user_return:
++	li t0, 0x7fffffff
++	and a1, a1, t0
++.Lesp32p4_clic_direct_return:
 +	csrw CSR_CAUSE, a1
 +#endif
 +
+ 	csrw CSR_STATUS, a0
+ 	csrw CSR_EPC, a2
+ 
  	REG_L x1,  PT_RA(sp)
  	REG_L x3,  PT_GP(sp)
  	REG_L x4,  PT_TP(sp)
@@ -307,21 +343,27 @@ index 9e71c4428814..eb813b10f96c 100644
  
  	if (generic_handle_domain_irq(intc_domain, cause))
  		pr_warn_ratelimited("Failed to handle interrupt (cause: %ld)\n", cause);
-@@ -53,4 +70,9 @@ static void riscv_intc_irq_mask(struct irq_data *d)
+@@ -53,4 +70,12 @@ static void riscv_intc_irq_mask(struct irq_data *d)
  {
 +	if (esp32p4_clic) {
-+		writeb(0, (void __iomem *)(ESP32P4_CLIC_INT_BASE +
-+		       d->hwirq * ESP32P4_CLIC_INT_STRIDE + ESP32P4_CLIC_INT_IE));
++		void __iomem *ie = (void __iomem *)(ESP32P4_CLIC_INT_BASE +
++			d->hwirq * ESP32P4_CLIC_INT_STRIDE + ESP32P4_CLIC_INT_IE);
++
++		writeb(0, ie);
++		readb(ie);
 +		return;
 +	}
  	if (IS_ENABLED(CONFIG_32BIT) && d->hwirq >= BITS_PER_LONG)
  		csr_clear(CSR_IEH, BIT(d->hwirq - BITS_PER_LONG));
  	else
-@@ -62,4 +84,9 @@ static void riscv_intc_irq_unmask(struct irq_data *d)
+@@ -62,4 +87,12 @@ static void riscv_intc_irq_unmask(struct irq_data *d)
  {
 +	if (esp32p4_clic) {
-+		writeb(1, (void __iomem *)(ESP32P4_CLIC_INT_BASE +
-+		       d->hwirq * ESP32P4_CLIC_INT_STRIDE + ESP32P4_CLIC_INT_IE));
++		void __iomem *ie = (void __iomem *)(ESP32P4_CLIC_INT_BASE +
++			d->hwirq * ESP32P4_CLIC_INT_STRIDE + ESP32P4_CLIC_INT_IE);
++
++		writeb(1, ie);
++		readb(ie);
 +		return;
 +	}
  	if (IS_ENABLED(CONFIG_32BIT) && d->hwirq >= BITS_PER_LONG)

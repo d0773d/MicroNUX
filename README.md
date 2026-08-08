@@ -16,17 +16,19 @@ physical ESP32-P4 revision 1.3, the M3 loader validates and loads Linux and its
 device tree from flash, installs an exact PMP memory window, and hands off to a
 single-core machine-mode kernel. Linux initializes the revision-correct CLIC
 trap path and 360 MHz CLINT timer, transitions from polling early output to the
-interrupt-driven native USB `ttyGS0` console, mounts its initramfs pseudo
+native USB `ttyGS0` console, mounts its initramfs pseudo
 filesystems, and starts an interactive BusyBox shell. The M5 hardening image
 passed three independent ROM-reset boots with identical hashes. Each boot
 completed 64 `posix_spawn()`/exec/wait lifecycles, signal and timer return
 tests, a checked 4 MiB allocation, explicit stack canaries, and a 64-record
-console integrity burst while retaining 20,372 KiB free. M6 is in progress:
-the physical board now boots the onboard microSD controller through a
-read-only, PIO-only Linux path, with the repeatable media-read gate pending a
-card in the slot. Its controller-only image passed three ROM-reset boots and
-the complete M5 regression with stable payload hashes. MIPI-DSI bring-up is
-planned as a separate staged sub-track.
+console integrity burst while retaining 20,372 KiB free. The M6 microSD slice
+is complete: a clean physical-board image passed three ROM-reset boots using a
+read-only, synchronous-polled IDMAC path with internal-SRAM descriptors and a
+4 KiB bounce buffer. Every boot produced the same first-1-MiB card hash,
+mounted VFAT read-only, and passed the complete M5 regression. On revision 1.3,
+USB status is serviced once per kernel tick and interrupted userspace returns
+through a two-stage CLIC `mret` sequence. Networking and the staged MIPI-DSI
+sub-track remain open.
 
 ## Design baseline
 

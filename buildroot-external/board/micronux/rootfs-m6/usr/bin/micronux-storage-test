@@ -10,7 +10,7 @@ fail()
 	exit 1
 }
 
-echo 'MICRONUX:M6:STORAGE begin mode=pio access=read-only'
+echo 'MICRONUX:M6:STORAGE begin mode=idmac-sram-poll access=read-only'
 
 [ -b "$device" ] || fail no-card
 [ -r /sys/block/mmcblk0/size ] || fail no-size
@@ -37,4 +37,4 @@ if [ -b /dev/mmcblk0p1 ]; then
 fi
 
 echo "MICRONUX:M6:STORAGE mount=$mount_result"
-echo 'MICRONUX:M6:STORAGE:PASS mode=pio access=read-only'
+echo 'MICRONUX:M6:STORAGE:PASS mode=idmac-sram-poll access=read-only'

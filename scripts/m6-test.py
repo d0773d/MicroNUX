@@ -27,17 +27,20 @@ REQUIRED_MARKERS = (
     "MICRONUX:M3:JUMP",
     "MICRONUX:M4:IRQ source=22 matrix=500d6058 clic=16 handoff=armed",
     "MICRONUX:M6:SDMMC power=ldo4 voltage_mv=3300 slot=0 width=4",
-    "MICRONUX:M6:IRQ source=23 matrix=500d605c clic=17 dma=off handoff=armed",
+    "MICRONUX:M6:DMA reserved=[4ff80000,4ff82000) desc=4ff80000 data=4ff81000 uncached=8ff80000",
+    "MICRONUX:M6:IRQ source=23 matrix=500d605c route=parked:31 irq=17:placeholder-polled dma=idmac-sram-bounce handoff=armed",
     "Linux version 6.12.27",
-    "Using PIO mode.",
+    "Using internal DMA controller.",
+    "ESP32-P4 synchronous-polled I/O enabled",
+    "ESP32-P4 IDMAC internal-SRAM bounce: 4 KiB requests",
     "DW MMC controller at irq",
     "mmcblk0:",
     "console [ttyGS0] enabled",
     "USB Serial/JTAG ttyGS0",
-    "MICRONUX:M6:SHELL ready console=ttyGS0 storage=microsd-pio",
-    "MICRONUX:M6:STORAGE begin mode=pio access=read-only",
+    "MICRONUX:M6:SHELL ready console=ttyGS0 storage=microsd-idmac-sram-poll",
+    "MICRONUX:M6:STORAGE begin mode=idmac-sram-poll access=read-only",
     "MICRONUX:M6:STORAGE raw-pass",
-    "MICRONUX:M6:STORAGE:PASS mode=pio access=read-only",
+    "MICRONUX:M6:STORAGE:PASS mode=idmac-sram-poll access=read-only",
     "MICRONUX:M5:BASELINE",
     "MICRONUX:M5:RUN",
     f"MICRONUX:M5:SIGNALS pass count={SIGNAL_ITERATIONS}",
@@ -57,7 +60,6 @@ FORBIDDEN_MARKERS = (
     "MICRONUX:M5:FAIL",
     "MICRONUX:M6:FAIL",
     "MICRONUX:M6:STORAGE:FAIL",
-    "Using internal DMA controller.",
     "Kernel panic",
     "Oops:",
     "BUG:",
@@ -71,7 +73,7 @@ FORBIDDEN_MARKERS = (
 MEDIA_REQUIRED_MARKERS = (
     "mmcblk0:",
     "MICRONUX:M6:STORAGE raw-pass",
-    "MICRONUX:M6:STORAGE:PASS mode=pio access=read-only",
+    "MICRONUX:M6:STORAGE:PASS mode=idmac-sram-poll access=read-only",
 )
 
 STORAGE_LINES = ("/usr/bin/micronux-storage-test\n",)
@@ -127,6 +129,7 @@ def reset_probe_and_capture(
     device.port = port
     device.baudrate = 115200
     device.timeout = 0.1
+    device.write_timeout = 10.0
     device.dtr = False
     device.rts = False
     device.open()
@@ -141,12 +144,16 @@ def reset_probe_and_capture(
         done_seen_at: float | None = None
 
         while time.monotonic() < deadline:
-            chunk = device.read(device.in_waiting or 1)
+            chunk = device.read(4096)
             if chunk:
                 captured.extend(chunk)
             text = captured.decode("utf-8", errors="replace")
 
-            if not storage_started and "MICRONUX:M6:SHELL ready" in text:
+            storage_ready = (
+                "MICRONUX:M6:SHELL ready" in text
+                and (allow_no_card or "mmcblk0:" in text)
+            )
+            if not storage_started and storage_ready:
                 time.sleep(0.2)
                 write_lines(device, STORAGE_LINES)
                 storage_started = True
@@ -183,6 +190,8 @@ def reset_probe_and_capture(
     finally:
         device.dtr = False
         device.rts = False
+        device.cancel_read()
+        device.cancel_write()
         device.close()
 
 
@@ -220,7 +229,9 @@ def milestone_lines(log: str) -> list[str]:
                 "MICRONUX:M6:",
                 "MICRONUX:M5:",
                 "Linux version",
-                "Using PIO mode",
+                "Using internal DMA controller",
+                "synchronous-polled I/O",
+                "IDMAC internal-SRAM bounce",
                 "DW MMC controller",
                 "mmc0:",
                 "mmcblk0:",
@@ -290,6 +301,10 @@ def verify_console(log: str) -> None:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", required=True)
     parser.add_argument("--boots", type=int, default=3)
@@ -401,7 +416,7 @@ def main() -> int:
     if expected_card is None:
         print(
             f"M6 controller-only gate passed: boots={args.boots} "
-            "mode=pio media=not-tested reason=no-card "
+            "mode=idmac-sram-poll media=not-tested reason=no-card "
             f"m5_exec_per_boot={EXEC_ITERATIONS} "
             f"m5_elapsed_ms={','.join(str(value) for value in elapsed_times)} "
             f"mem_before_kib={','.join(str(value) for value in baseline_memory)} "
@@ -411,7 +426,7 @@ def main() -> int:
         return 0
 
     print(
-        f"M6 hardware gate passed: boots={args.boots} mode=pio access=read-only "
+        f"M6 hardware gate passed: boots={args.boots} mode=idmac-sram-poll access=read-only "
         f"card_sectors={expected_card[0]} sample_sha256={expected_card[1]} "
         f"m5_exec_per_boot={EXEC_ITERATIONS} "
         f"m5_elapsed_ms={','.join(str(value) for value in elapsed_times)} "

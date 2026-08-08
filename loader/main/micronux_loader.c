@@ -14,6 +14,7 @@
 #include "esp_cpu.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
+#include "heap_memory_layout.h"
 #include "esp_log.h"
 #include "esp_ldo_regulator.h"
 #include "esp_mmu_map.h"
@@ -105,7 +106,17 @@
 #define ESP32P4_SDMMC_CTRL_DMA_ENABLE (UINT32_C(1) << 5)
 #define ESP32P4_SDMMC_CTRL_USE_IDMAC (UINT32_C(1) << 25)
 #define ESP32P4_CORE0_SDIO_HOST_INT_MAP UINT32_C(0x500D605C)
-#define MICRONUX_SDMMC_CLIC_ID UINT32_C(17)
+#define MICRONUX_SDMMC_IRQ_PLACEHOLDER_ID UINT32_C(17)
+#define MICRONUX_SDMMC_PARK_CLIC_ID UINT32_C(31)
+#define MICRONUX_SD_DMA_DESC_ADDR UINT32_C(0x4FF80000)
+#define MICRONUX_SD_DMA_DATA_ADDR UINT32_C(0x4FF81000)
+#define MICRONUX_SD_DMA_END UINT32_C(0x4FF82000)
+#define MICRONUX_SD_DMA_UNCACHED_ALIAS UINT32_C(0x8FF80000)
+
+/* This system loader owns the fixed SRAM handoff contract used by Linux. */
+SOC_RESERVE_MEMORY_REGION(MICRONUX_SD_DMA_DESC_ADDR,
+                          MICRONUX_SD_DMA_END,
+                          micronux_sd_dma);
 
 static const char *const TAG = "micronux_m3";
 static DRAM_ATTR micronux_handoff_v1_t s_handoff;
@@ -377,16 +388,21 @@ static void prepare_sdmmc_electrical_state(void)
 static void prepare_sdmmc_for_linux(void)
 {
     /*
-     * M6 is deliberately PIO-only.  PSRAM is cached and Linux does not yet
-     * implement the ESP32-P4 cache maintenance needed by IDMAC descriptors.
+     * Linux reinitializes IDMAC after taking ownership.  Its descriptors and
+     * 4 KiB bounce buffer use the internal-SRAM range reserved above, and the
+     * driver accesses that range through the uncached alias.  The accepted
+     * M6 path is synchronous-polled, so park the physical source on CLIC 31.
+     * prepare_clic_for_linux() leaves that otherwise-unused input disabled;
+     * Linux IRQ 17 exists only so the generic driver can request and disable
+     * a valid placeholder IRQ without the SD line entering Linux.
      */
     quiesce_sdmmc_controller();
 
     const uint32_t map = read_reg32(ESP32P4_CORE0_SDIO_HOST_INT_MAP);
     write_reg32(ESP32P4_CORE0_SDIO_HOST_INT_MAP,
-        (map & ~ESP32P4_INTERRUPT_MAP_MASK) | MICRONUX_SDMMC_CLIC_ID);
+        (map & ~ESP32P4_INTERRUPT_MAP_MASK) | MICRONUX_SDMMC_PARK_CLIC_ID);
     if ((read_reg32(ESP32P4_CORE0_SDIO_HOST_INT_MAP) &
-         ESP32P4_INTERRUPT_MAP_MASK) != MICRONUX_SDMMC_CLIC_ID) {
+         ESP32P4_INTERRUPT_MAP_MASK) != MICRONUX_SDMMC_PARK_CLIC_ID) {
         fail("sdmmc-route");
     }
 }
@@ -445,6 +461,13 @@ void app_main(void)
 
     characterize_clint();
     prepare_sdmmc_electrical_state();
+    ESP_LOGI(TAG,
+             "MICRONUX:M6:DMA reserved=[%08" PRIx32 ",%08" PRIx32
+             ") desc=%08" PRIx32 " data=%08" PRIx32
+             " uncached=%08" PRIx32,
+             MICRONUX_SD_DMA_DESC_ADDR, MICRONUX_SD_DMA_END,
+             MICRONUX_SD_DMA_DESC_ADDR, MICRONUX_SD_DMA_DATA_ADDR,
+             MICRONUX_SD_DMA_UNCACHED_ALIAS);
 
     const size_t psram_size = esp_psram_get_size();
     const size_t psram_heap = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
@@ -630,9 +653,12 @@ void app_main(void)
              MICRONUX_USB_SERIAL_JTAG_CLIC_ID);
     ESP_LOGI(TAG,
              "MICRONUX:M6:IRQ source=23 matrix=%08" PRIx32
-             " clic=%" PRIu32 " dma=off handoff=armed",
+             " route=parked:%" PRIu32
+             " irq=%" PRIu32 ":placeholder-polled"
+             " dma=idmac-sram-bounce handoff=armed",
              ESP32P4_CORE0_SDIO_HOST_INT_MAP,
-             MICRONUX_SDMMC_CLIC_ID);
+             MICRONUX_SDMMC_PARK_CLIC_ID,
+             MICRONUX_SDMMC_IRQ_PLACEHOLDER_ID);
 
     fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(100));
