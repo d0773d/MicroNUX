@@ -95,6 +95,8 @@ free from a 20,400 KiB baseline.
 
 ## M6 - Storage, networking, and peripherals
 
+Status: **in progress**
+
 - Add storage only after its pin mux and DMA behavior are frozen.
 - Integrate ESP32-C6 networking through a narrow, documented transport.
 - Evaluate Ethernet, USB, microSD, display, and other board peripherals
@@ -103,6 +105,12 @@ free from a 20,400 KiB baseline.
 
 Exit criterion: selected services work without destabilizing the minimal shell
 or violating reserved-memory boundaries.
+
+Current artifact: [M6 storage and peripheral bring-up](m6-peripherals.md). The
+onboard microSD controller now boots on physical hardware in forced PIO mode;
+the repeatable read gate is pending a removable card. MIPI-DSI is split into
+electrical-pattern, scanout-ownership, and Linux-console gates so display DMA
+cannot bypass the PSRAM cache contract.
 
 ## M7 - Isolation, SMP, and upstream evaluation
 

@@ -21,8 +21,12 @@ filesystems, and starts an interactive BusyBox shell. The M5 hardening image
 passed three independent ROM-reset boots with identical hashes. Each boot
 completed 64 `posix_spawn()`/exec/wait lifecycles, signal and timer return
 tests, a checked 4 MiB allocation, explicit stack canaries, and a 64-record
-console integrity burst while retaining 20,372 KiB free. M6 storage,
-networking, and peripheral work is next.
+console integrity burst while retaining 20,372 KiB free. M6 is in progress:
+the physical board now boots the onboard microSD controller through a
+read-only, PIO-only Linux path, with the repeatable media-read gate pending a
+card in the slot. Its controller-only image passed three ROM-reset boots and
+the complete M5 regression with stable payload hashes. MIPI-DSI bring-up is
+planned as a separate staged sub-track.
 
 ## Design baseline
 
@@ -47,6 +51,7 @@ userspace image and workload.
 - [M3 ESP32-P4 Linux platform](docs/m3-platform.md)
 - [M4 ESP32-P4 hardware shell](docs/m4-shell.md)
 - [M5 NOMMU hardening and stress gate](docs/m5-hardening.md)
+- [M6 storage and peripheral bring-up](docs/m6-peripherals.md)
 
 ## Project policy
 

@@ -9,6 +9,8 @@ idf_component_register(
         esp_psram
         esp_timer
         esp_hw_support
+        esp_driver_gpio
+        esp_driver_sdmmc
         esp_rom
         esp_system
         freertos

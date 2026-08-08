@@ -1,0 +1,40 @@
+#!/bin/sh
+
+device=/dev/mmcblk0
+sample_bytes=1048576
+sample_blocks=256
+
+fail()
+{
+	echo "MICRONUX:M6:STORAGE:FAIL stage=$1"
+	exit 1
+}
+
+echo 'MICRONUX:M6:STORAGE begin mode=pio access=read-only'
+
+[ -b "$device" ] || fail no-card
+[ -r /sys/block/mmcblk0/size ] || fail no-size
+sectors=$(/bin/busybox cat /sys/block/mmcblk0/size) || fail read-size
+[ "$sectors" -gt 0 ] 2>/dev/null || fail empty-card
+
+hash_a=$(/bin/busybox dd if="$device" bs=4096 count="$sample_blocks" 2>/dev/null | \
+	/bin/busybox sha256sum | /bin/busybox cut -d' ' -f1) || fail read-a
+hash_b=$(/bin/busybox dd if="$device" bs=4096 count="$sample_blocks" 2>/dev/null | \
+	/bin/busybox sha256sum | /bin/busybox cut -d' ' -f1) || fail read-b
+[ "$hash_a" = "$hash_b" ] || fail unstable-read
+
+echo "MICRONUX:M6:STORAGE raw-pass sectors=$sectors bytes=$sample_bytes sha256=$hash_a"
+
+mount_result=no-partition
+if [ -b /dev/mmcblk0p1 ]; then
+	/bin/busybox mkdir -p /mnt/sd || fail mountpoint
+	if /bin/busybox mount -t vfat -o ro /dev/mmcblk0p1 /mnt/sd 2>/dev/null; then
+		mount_result=vfat-ro
+		/bin/busybox umount /mnt/sd || fail unmount
+	else
+		mount_result=not-vfat
+	fi
+fi
+
+echo "MICRONUX:M6:STORAGE mount=$mount_result"
+echo 'MICRONUX:M6:STORAGE:PASS mode=pio access=read-only'

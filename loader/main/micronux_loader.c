@@ -15,15 +15,19 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_ldo_regulator.h"
 #include "esp_mmu_map.h"
 #include "esp_partition.h"
 #include "esp_private/esp_clk.h"
+#include "esp_private/gpio.h"
 #include "esp_psram.h"
 #include "esp_rom_crc.h"
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/sd_host_sdmmc.h"
 #include "hal/mmu_types.h"
 #include "riscv/csr.h"
 #include "sha/sha_core.h"
@@ -74,9 +78,40 @@
 #define ESP32P4_INTERRUPT_MAP_MASK UINT32_C(0x3F)
 #define MICRONUX_USB_SERIAL_JTAG_CLIC_ID UINT32_C(16)
 
+/*
+ * Waveshare ESP32-P4-Module-DEV-KIT onboard microSD wiring.  Slot 0 uses
+ * the P4's dedicated IOMUX pins and SD1_VDD is supplied by LDO_VO4.
+ */
+#define MICRONUX_SD_LDO_CHANNEL 4
+#define MICRONUX_SD_LDO_MILLIVOLTS 3300
+#define MICRONUX_SD_CLK_GPIO GPIO_NUM_43
+#define MICRONUX_SD_CMD_GPIO GPIO_NUM_44
+#define MICRONUX_SD_D0_GPIO GPIO_NUM_39
+#define MICRONUX_SD_D1_GPIO GPIO_NUM_40
+#define MICRONUX_SD_D2_GPIO GPIO_NUM_41
+#define MICRONUX_SD_D3_GPIO GPIO_NUM_42
+#define MICRONUX_SD_IOMUX_FUNCTION 0
+#define MICRONUX_SD_DRIVE_CAPABILITY 3
+
+/* SDIO_HOST is peripheral interrupt source 23 on ESP32-P4. */
+#define ESP32P4_SDMMC_BASE UINT32_C(0x50083000)
+#define ESP32P4_SDMMC_CTRL (ESP32P4_SDMMC_BASE + UINT32_C(0x000))
+#define ESP32P4_SDMMC_INTMASK (ESP32P4_SDMMC_BASE + UINT32_C(0x024))
+#define ESP32P4_SDMMC_RINTSTS (ESP32P4_SDMMC_BASE + UINT32_C(0x044))
+#define ESP32P4_SDMMC_BMOD (ESP32P4_SDMMC_BASE + UINT32_C(0x080))
+#define ESP32P4_SDMMC_IDSTS (ESP32P4_SDMMC_BASE + UINT32_C(0x08C))
+#define ESP32P4_SDMMC_IDINTEN (ESP32P4_SDMMC_BASE + UINT32_C(0x090))
+#define ESP32P4_SDMMC_CTRL_INT_ENABLE (UINT32_C(1) << 4)
+#define ESP32P4_SDMMC_CTRL_DMA_ENABLE (UINT32_C(1) << 5)
+#define ESP32P4_SDMMC_CTRL_USE_IDMAC (UINT32_C(1) << 25)
+#define ESP32P4_CORE0_SDIO_HOST_INT_MAP UINT32_C(0x500D605C)
+#define MICRONUX_SDMMC_CLIC_ID UINT32_C(17)
+
 static const char *const TAG = "micronux_m3";
 static DRAM_ATTR micronux_handoff_v1_t s_handoff;
 static DRAM_ATTR micronux_payload_v1_t s_payload;
+static esp_ldo_channel_handle_t s_sd_ldo;
+static sd_host_ctlr_handle_t s_sd_controller;
 
 extern void micronux_handoff_jump(uint32_t boot_hart_id,
                                   const void *dtb,
@@ -279,6 +314,83 @@ static void prepare_usb_serial_jtag_for_linux(void)
     }
 }
 
+static void configure_sd_iomux_pin(gpio_num_t gpio, bool pull_up)
+{
+    gpio_pulldown_dis(gpio);
+    if (pull_up) {
+        gpio_pullup_en(gpio);
+    } else {
+        gpio_pullup_dis(gpio);
+    }
+    gpio_input_enable(gpio);
+    gpio_iomux_output(gpio, MICRONUX_SD_IOMUX_FUNCTION);
+    ESP_ERROR_CHECK(gpio_set_drive_capability(
+        gpio, MICRONUX_SD_DRIVE_CAPABILITY));
+}
+
+static void quiesce_sdmmc_controller(void)
+{
+    uint32_t control = read_reg32(ESP32P4_SDMMC_CTRL);
+
+    control &= ~(ESP32P4_SDMMC_CTRL_INT_ENABLE |
+                 ESP32P4_SDMMC_CTRL_DMA_ENABLE |
+                 ESP32P4_SDMMC_CTRL_USE_IDMAC);
+    write_reg32(ESP32P4_SDMMC_CTRL, control);
+    write_reg32(ESP32P4_SDMMC_INTMASK, 0);
+    write_reg32(ESP32P4_SDMMC_RINTSTS, UINT32_MAX);
+    write_reg32(ESP32P4_SDMMC_IDINTEN, 0);
+    write_reg32(ESP32P4_SDMMC_IDSTS, UINT32_MAX);
+    write_reg32(ESP32P4_SDMMC_BMOD, 0);
+}
+
+static void prepare_sdmmc_electrical_state(void)
+{
+    const esp_ldo_channel_config_t ldo_config = {
+        .chan_id = MICRONUX_SD_LDO_CHANNEL,
+        .voltage_mv = MICRONUX_SD_LDO_MILLIVOLTS,
+    };
+    const sd_host_sdmmc_cfg_t controller_config = {
+        .event_queue_items = 1,
+        .dma_desc_num = 1,
+    };
+
+    ESP_ERROR_CHECK(esp_ldo_acquire_channel(&ldo_config, &s_sd_ldo));
+    ESP_ERROR_CHECK(sd_host_create_sdmmc_controller(
+        &controller_config, &s_sd_controller));
+    /* No IDF slot is registered: silence its ISR before exposing the pins. */
+    quiesce_sdmmc_controller();
+
+    configure_sd_iomux_pin(MICRONUX_SD_CLK_GPIO, false);
+    configure_sd_iomux_pin(MICRONUX_SD_CMD_GPIO, true);
+    configure_sd_iomux_pin(MICRONUX_SD_D0_GPIO, true);
+    configure_sd_iomux_pin(MICRONUX_SD_D1_GPIO, true);
+    configure_sd_iomux_pin(MICRONUX_SD_D2_GPIO, true);
+    configure_sd_iomux_pin(MICRONUX_SD_D3_GPIO, true);
+
+    /* The IDF controller setup selects PLL160M / 2: Linux receives 80 MHz. */
+    esp_rom_delay_us(1000);
+    ESP_LOGI(TAG,
+             "MICRONUX:M6:SDMMC power=ldo4 voltage_mv=3300"
+             " slot=0 width=4 clock_hz=80000000 pins=43,44,39,40,41,42");
+}
+
+static void prepare_sdmmc_for_linux(void)
+{
+    /*
+     * M6 is deliberately PIO-only.  PSRAM is cached and Linux does not yet
+     * implement the ESP32-P4 cache maintenance needed by IDMAC descriptors.
+     */
+    quiesce_sdmmc_controller();
+
+    const uint32_t map = read_reg32(ESP32P4_CORE0_SDIO_HOST_INT_MAP);
+    write_reg32(ESP32P4_CORE0_SDIO_HOST_INT_MAP,
+        (map & ~ESP32P4_INTERRUPT_MAP_MASK) | MICRONUX_SDMMC_CLIC_ID);
+    if ((read_reg32(ESP32P4_CORE0_SDIO_HOST_INT_MAP) &
+         ESP32P4_INTERRUPT_MAP_MASK) != MICRONUX_SDMMC_CLIC_ID) {
+        fail("sdmmc-route");
+    }
+}
+
 static void prepare_pmp_for_linux(void)
 {
     /*
@@ -332,6 +444,7 @@ void app_main(void)
     }
 
     characterize_clint();
+    prepare_sdmmc_electrical_state();
 
     const size_t psram_size = esp_psram_get_size();
     const size_t psram_heap = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
@@ -515,6 +628,11 @@ void app_main(void)
              " clic=%" PRIu32 " handoff=armed",
              ESP32P4_CORE0_USB_SERIAL_JTAG_INT_MAP,
              MICRONUX_USB_SERIAL_JTAG_CLIC_ID);
+    ESP_LOGI(TAG,
+             "MICRONUX:M6:IRQ source=23 matrix=%08" PRIx32
+             " clic=%" PRIu32 " dma=off handoff=armed",
+             ESP32P4_CORE0_SDIO_HOST_INT_MAP,
+             MICRONUX_SDMMC_CLIC_ID);
 
     fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -528,6 +646,7 @@ void app_main(void)
     portDISABLE_INTERRUPTS();
     esp_cpu_intr_disable(UINT32_MAX);
     prepare_usb_serial_jtag_for_linux();
+    prepare_sdmmc_for_linux();
     prepare_clic_for_linux();
 
     micronux_handoff_jump(0, dtb, s_payload.kernel_load_vaddr);
