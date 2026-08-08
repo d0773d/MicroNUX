@@ -39,6 +39,7 @@
 #include "micronux_handoff.h"
 #include "micronux_mipi_dsi.h"
 #include "micronux_payload.h"
+#include "micronux_provisioning.h"
 
 #define MICRONUX_LINUX_PARTITION_SUBTYPE 0x40
 #define MICRONUX_DTB_PARTITION_SUBTYPE 0x41
@@ -547,6 +548,14 @@ void app_main(void)
     }
 
     characterize_clint();
+#if CONFIG_MICRONUX_C6_PROVISIONING
+    const esp_err_t provisioning_err = micronux_provisioning_run();
+    if (provisioning_err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "MICRONUX:M6:PROV result=error action=linux-handoff error=%s",
+                 esp_err_to_name(provisioning_err));
+    }
+#endif
     prepare_sdmmc_electrical_state();
     ESP_LOGI(TAG,
              "MICRONUX:M6:DMA reserved=[%08" PRIx32 ",%08" PRIx32

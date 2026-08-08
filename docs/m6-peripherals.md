@@ -209,6 +209,74 @@ the DTB SHA-256 was
 `08f814249e0c776d6bc26f92d3185d216220be2af1936599d78f97b15d2ced20`.
 The C6 factory flash was not rewritten.
 
+### P4-hosted phone provisioning
+
+The optional provisioning loader profile uses Espressif Unified Provisioning
+on the ESP32-P4. It does not build, replace, or flash ESP32-C6 firmware. The P4
+temporarily owns the existing SDIO link, runs the NimBLE host and provisioning
+manager, and uses the factory C6 as the Wi-Fi/Bluetooth controller through
+ESP-Hosted 2.11.5 and Wi-Fi Remote 1.3.1.
+
+The boot flow is deliberately bounded:
+
+1. The P4 asks the C6 whether station credentials already exist.
+2. A provisioned device tears ESP-Hosted down and continues to the ordinary
+   Linux handoff without advertising a provisioning service.
+3. An unprovisioned device advertises a Security 2 QR code over BLE for 120
+   idle seconds, then offers the same service over SoftAP for 120 idle seconds.
+   An attached phone keeps its window alive, with a five-minute hard limit per
+   transport. A BLE setup error falls back directly to SoftAP.
+4. The official Espressif provisioning app sends credentials inside an SRP6a
+   authenticated, AES-GCM protected session. MicroNUX never logs the SSID or
+   password.
+5. Wi-Fi Remote stores the station configuration in C6 NVS. MicroNUX stops the
+   provisioning manager, disables the remote Bluetooth controller, tears down
+   SDIO ownership, scrubs the in-memory proof, and restarts the P4.
+6. On the next boot the loader sees the C6 as provisioned and hands SDIO to
+   Linux. Linux can use `micronux-netctl up` without receiving the password.
+
+If both idle windows expire, the loader still boots Linux and retries
+provisioning on the next reset. This prevents an absent phone or network from
+holding the operating system indefinitely. A provisioning subsystem error is
+also logged and handed off to Linux after cleanup instead of trapping boot.
+The SoftAP itself has no WPA key so the Espressif app can join it directly;
+application credentials are still rejected unless the client completes
+mandatory Security 2 authentication.
+
+The onboarding proof is unique per board and is generated from the P4 hardware
+random source. This development profile stores that proof in ordinary P4 NVS
+so it remains stable across resets and can be rendered as a QR code on the USB
+console. That is intentionally not the production secret-storage contract.
+Production hardware should inject the Security 2 salt/verifier and a printed
+per-device QR code during manufacturing, then enable encrypted NVS or another
+protected store. MicroNUX still does not burn security eFuses during
+development.
+
+Build-only is the default:
+
+```powershell
+.\scripts\m6-provision.ps1
+```
+
+Flashing requires two explicit P4-only switches:
+
+```powershell
+.\scripts\m6-provision.ps1 -Port COM14 -Flash -ConfirmP4
+```
+
+The script verifies the C6 target, SDIO slot and pin contract, VHCI transport,
+and Security 2 configuration before compiling. Its flash path invokes only the
+ESP32-P4 project image; it contains no C6 binary or C6 flashing command. The
+profile compiles under ESP-IDF v6.0.1 and produces a `0xf7610`-byte loader,
+leaving `0xf89f0` bytes free in the existing `0x1f0000` factory partition.
+Physical phone provisioning remains an explicit hardware acceptance gate; the
+build was not flashed while adding this profile.
+
+API and protocol choices follow the official
+[ESP-IDF provisioning guide](https://docs.espressif.com/projects/esp-idf/en/v6.0/esp32p4/api-reference/provisioning/index.html),
+[Network Provisioning component](https://components.espressif.com/components/espressif/network_provisioning/versions/1.2.4/readme),
+and [ESP-IDF Provisioning Android app](https://github.com/espressif/esp-idf-provisioning-android).
+
 ## MIPI-DSI electrical-proof profile
 
 M6-D0 is implemented as a loader-owned, exact-controller diagnostic. It

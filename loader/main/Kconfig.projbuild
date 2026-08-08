@@ -9,6 +9,17 @@ menu "MicroNUX loader profile"
             GPIO matrix, and hands DesignWare MSHC slot 1 to Linux. The
             default storage profile remains slot 0 and does not reset the C6.
 
+    config MICRONUX_C6_PROVISIONING
+        bool "Provision Wi-Fi through the factory ESP32-C6 before Linux"
+        depends on MICRONUX_C6_SDIO_PROFILE
+        default n
+        help
+            Run Espressif Unified Provisioning on the ESP32-P4 host before
+            Linux. The factory ESP32-C6 remains the ESP-Hosted slave on SDIO.
+            An unprovisioned device advertises over BLE, falls back to SoftAP
+            while idle, stores Wi-Fi configuration in the C6, and reboots
+            before the Linux handoff. Protocomm Security 2 is mandatory.
+
     config MICRONUX_MIPI_DSI
         bool "Enable the MIPI-DSI electrical proof profile"
         default n
