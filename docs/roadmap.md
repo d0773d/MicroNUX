@@ -61,6 +61,8 @@ hashes and reached `/init` in approximately 0.281 seconds on every boot.
 
 ## M4 - First hardware shell
 
+Status: **complete**
+
 - Boot single-core Linux from the ESP-IDF loader.
 - Mount the read-only initramfs.
 - Start an interactive BusyBox shell on the native USB Serial/JTAG console.
@@ -68,6 +70,11 @@ hashes and reached `/init` in approximately 0.281 seconds on every boot.
 
 Exit criterion: repeatable hardware boots reach a usable shell without manual
 intervention after reset.
+
+Exit artifact: [M4 hardware shell and acceptance report](m4-shell.md). The
+final image passed three ROM-reset boots, reached the shell in 2.52-2.53
+seconds, reported 20,544 KiB free, and completed `cat`, `free`, and `uname`
+child commands over the native USB console.
 
 ## M5 - NOMMU hardening
 
