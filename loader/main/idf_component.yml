@@ -1,0 +1,5 @@
+dependencies:
+  waveshare/esp_lcd_jd9365: "2.0.0"
+  waveshare/esp_lcd_ili9881c: "2.0.0"
+  waveshare/esp_lcd_hx8394: "2.0.0"
+  espressif/esp_lcd_ek79007: "2.0.2~1"

@@ -1,13 +1,15 @@
 # M6 Storage and Peripheral Bring-up
 
-Status: **microSD storage slice complete; other M6 peripheral sub-tracks remain**
+Status: **microSD write gate and ESP32-C6 link complete; MIPI electrical proof
+implemented and awaiting exact-panel identification**
 
 M6 starts with the Waveshare board's onboard microSD interface. Storage can be
 isolated from the minimal USB console and from the ESP32-C6 wireless transport,
 so it is a useful first test of peripheral ownership under NOMMU Linux. The
-accepted M6 storage path is read-only at the userspace gate. It proves power,
-pin mux, controller ownership, block discovery, repeatable reads, and a
-read-only filesystem mount before enabling any card writes.
+default M6 storage path is read-only at the userspace gate. A separate opt-in
+write gate creates, verifies, and deletes one fixed test file without
+formatting the card. Together they prove power, pin mux, controller ownership,
+block discovery, repeatable reads, filesystem remounts, and bounded writes.
 
 ## Hardware contract
 
@@ -21,8 +23,10 @@ read-only filesystem mount before enabling any card writes.
 | Physical interrupt route | source 23, core-0 matrix `0x500d605c`, parked on disabled CLIC input 31 |
 | Linux IRQ placeholder | CLIC input 17, requested and disabled by the MMC driver |
 
-The ESP32-C6 SDIO link uses a different pin group and is not enabled or
-modified by this milestone.
+The ESP32-C6 SDIO link uses slot 1 and a different pin group. MicroNUX builds
+storage and networking as separate profiles because the current Linux port
+owns one DesignWare MSHC instance at a time. The networking profile resets the
+C6 into its factory SDIO service; the storage profile leaves the C6 alone.
 
 The ESP-IDF loader enables LDO4, establishes the SDMMC clock/reset state,
 installs the dedicated I/O mux, and quiesces the controller before Linux takes
@@ -64,8 +68,8 @@ M6 contains that problem inside the ESP32-P4 DesignWare MMC platform quirk:
 
 The loader and the stalled second-core stack both remain outside this
 interval. Linux's regular block buffers stay in PSRAM and never become DMA
-targets. The driver has bounce-copy handling for both transfer directions,
-but card writes are not part of the M6 acceptance contract and are not tested.
+targets. The driver has bounce-copy handling for both transfer directions.
+Writes are accepted only through the explicit, fixed-path gate below.
 
 This mode deliberately spends CPU time and caps each request at 4 KiB. It is a
 correctness-first storage path, not a throughput design. The unreliable CLIC
@@ -95,7 +99,7 @@ The first device-tree profile uses a 4-bit bus, an 80 MHz controller input
 clock, a 20 MHz card limit, polling card detection, and disables MMC/eMMC and
 SDIO card types. Only removable SD memory is in the M6 storage contract.
 
-## Read-only acceptance gate
+## Storage acceptance gates
 
 `scripts/m6.ps1` builds and flashes the loader and M6 image, then performs
 three independent ROM-reset boots. On every boot the target probe:
@@ -108,8 +112,8 @@ three independent ROM-reset boots. On every boot the target probe:
 5. runs the complete M5 NOMMU stress regression.
 
 The host requires stable card size, card sample hash, kernel hash, and DTB
-hash across all boots. The probe never formats the card, mounts it writable,
-or issues a block write.
+hash across all boots. The default probe never formats the card, mounts it
+writable, or issues a block write.
 
 The inserted 29.7 GiB `SK32G` card passed the clean-build, three-ROM-reset
 hardware gate with these native Linux markers on every boot:
@@ -139,8 +143,20 @@ storage slice passed with:
   and DTB SHA-256
   `12fd3a00b4774fbe8b1620c489b21b862396e7ca11ce179e1aa6a4d11ea8d926`.
 
-No acceptance step formats the card, mounts it writable, or issues a block
-write.
+The separate one-boot write gate is opt-in:
+
+```powershell
+.\scripts\m6.ps1 -Port COM14 -Boots 1 -WriteTest
+```
+
+It records the first 1 MiB card hash, mounts partition 1 read-write, creates
+only `/mnt/sd/MICNUXW.TST`, calls `sync`, remounts read-only, verifies the
+41-byte payload and SHA-256, remounts read-write to delete that file, then
+finishes read-only. It refuses multi-boot use. The inserted `SK32G` card passed
+with the same pre/post first-1-MiB hash:
+`6158c8c683a1c1a66950c4e6593af64b0356cc52702e76ca00af1bdff5978c49`.
+The test file was absent afterward. No gate formats, repartitions, or writes
+outside that one pathname.
 
 The controller-only diagnostic remains available when no card is inserted:
 
@@ -151,22 +167,89 @@ The controller-only diagnostic remains available when no card is inserted:
 Omitting `-ControllerOnly` restores the strict default and requires a stable
 card size and sample hash on every boot.
 
-## MIPI-DSI display sub-track
+## ESP32-C6 networking profile
 
-MIPI display support is feasible, but continuous scanout has the same DMA and
-cache-coherency risk as storage DMA and depends on the exact attached panel
-timing, reset, and backlight circuit. It is staged separately:
+The networking image uses Espressif's legacy ESP-Hosted-FG Linux driver,
+pinned at commit `1df17f74d62eede4127785ae9414e03e48e62ebd` and adapted to the
+factory ESP-Hosted-MCU wire protocol. Bluetooth is excluded. The loader resets
+the C6 and prepares SDIO slot 1 at 20 MHz; Linux discovers these two functions:
 
-1. **M6-D0: electrical proof.** Configure DSI PHY, DBI/DPI timing, reset, and
-   backlight for one named panel, then show a controller-generated color bar
-   or pattern. No Linux framebuffer claim is made at this stage.
-2. **M6-D1: scanout ownership.** Reserve a fixed framebuffer, define cache
-   maintenance and DW-GDMA ownership, and prove a stable loader-driven image
-   over resets without corrupting the Linux memory window.
-3. **M6-D2: Linux console.** Hand the frozen mode and framebuffer to Linux and
-   add a minimal simple-framebuffer console if continuous scanout is stable.
-4. **Later evaluation.** Consider a native DRM/KMS and DSI driver only after
-   the minimal path is reliable and its maintenance cost is understood.
+| Function | Vendor/device | Class | Purpose |
+| --- | --- | --- | --- |
+| `mmc0:0001:1` | `0x0092:0x6666` | `0x00` | ESP-Hosted data/RPC function |
+| `mmc0:0001:2` | `0x0092:0x7777` | `0x02` | non-data companion function |
 
-A compatible panel or adapter and its exact model are required before M6-D0
-can be implemented and verified.
+`micronux-netctl` is the deliberately small userspace control plane:
+
+```sh
+micronux-netctl mac
+micronux-netctl up
+micronux-netctl connect "SSID" "PASSWORD"
+```
+
+`up` initializes station mode through `/dev/esps0`, reads the C6 MAC, assigns
+it to `ethsta0`, starts Wi-Fi, and raises the Linux interface. `connect` also
+sends station credentials and requests association. Passwords are not stored
+in the initramfs, but an interactive command is echoed on the serial console;
+use a test network rather than a valuable credential. Association and DHCP
+remain unverified because no credentials were supplied; the milestone gate
+stops at the native C6 RPC/link boundary.
+
+Build, flash, and run the three-boot hardware gate with:
+
+```powershell
+.\scripts\m6-network.ps1 -Port COM14 -Boots 3
+```
+
+On the connected board, all three boots reported factory firmware `2.11.5`,
+the two identities above, stable MAC `b0:a6:04:8a:d3:78`, and final
+`UP,LOWER_UP`. The P4 kernel image SHA-256 was
+`4a584505f4fb2e9ef0beadd7b9d7075069d3bbc91a72416dfb5b35d19b26e375`;
+the DTB SHA-256 was
+`08f814249e0c776d6bc26f92d3185d216220be2af1936599d78f97b15d2ced20`.
+The C6 factory flash was not rewritten.
+
+## MIPI-DSI electrical-proof profile
+
+M6-D0 is implemented as a loader-owned, exact-controller diagnostic. It
+enables ESP32-P4 D-PHY LDO channel 3 at 2.5 V, configures two DSI lanes, uses
+the Waveshare backlight controller at I2C address `0x45`, and starts the
+hardware vertical-color-bar generator. Backlight stays off until panel init,
+pattern setup, and framebuffer ownership checks have succeeded.
+
+| Profile | Resolution | Lane rate | Intended Waveshare panel |
+| --- | ---: | ---: | --- |
+| `jd9365` | 800 x 1280 | 1500 Mbps/lane | 8/10.1-inch DSI Touch A |
+| `ili9881c` | 720 x 1280 | 1000 Mbps/lane | 7-inch DSI Touch A |
+| `hx8394` | 720 x 1280 at 30 Hz | 700 Mbps/lane | 5-inch DSI Touch A |
+| `ek79007` | 1024 x 600 | 1000 Mbps/lane | 7-inch DSI Touch C |
+
+The profiles use the official
+[Waveshare ESP32 components](https://github.com/waveshareteam/Waveshare-ESP32-components)
+and [Espressif LCD component](https://github.com/espressif/esp-iot-solution)
+implementations. All four selected branches and the unselected refusal branch
+compile with ESP-IDF v6.0.1 and pinned component versions. Build-only is the
+default:
+
+```powershell
+.\scripts\m6-mipi.ps1 -Panel jd9365
+```
+
+Flashing requires two explicit switches after verifying the controller on the
+panel or adapter label:
+
+```powershell
+.\scripts\m6-mipi.ps1 -Panel jd9365 -Port COM14 -Flash -ConfirmExactPanel
+```
+
+Normal storage and networking loaders compile with MIPI disabled and now must
+emit `MICRONUX:M6:DSI state=disabled reason=profile-off` at the hardware gate.
+Enabling DSI with the Kconfig `unselected` choice fails before any display rail,
+D-PHY, or backlight is powered. No selected profile has been flashed because
+the attached panel controller has not yet been identified.
+
+The framebuffer is RGB565 and must fit entirely in the loader-owned PSRAM
+reservation `[0x48000000,0x48400000)`, which Linux already excludes. This is
+an electrical and timing proof only: it is not an emulator, Linux framebuffer,
+terminal, or DRM/KMS driver. M6-D1 will prove persistent scanout ownership on
+the identified physical panel; M6-D2 can then evaluate a minimal Linux console.

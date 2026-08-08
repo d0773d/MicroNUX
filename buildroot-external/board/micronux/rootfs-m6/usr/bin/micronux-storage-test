@@ -3,6 +3,38 @@
 device=/dev/mmcblk0
 sample_bytes=1048576
 sample_blocks=256
+write_test=no
+mountpoint=/mnt/sd
+probe_file=$mountpoint/MICNUXW.TST
+probe_hash=af8bdcde36e9c208ab7d846d87bfe9dadb51fccdf240f1214af2f4db232e2a36
+mounted=no
+created=no
+
+case "${1-}" in
+	"") ;;
+	--write-test) write_test=yes ;;
+	*)
+		echo 'usage: micronux-storage-test [--write-test]' >&2
+		exit 2
+		;;
+esac
+
+cleanup()
+{
+	if [ "$mounted" = yes ]; then
+		/bin/busybox umount "$mountpoint" >/dev/null 2>&1 || true
+		mounted=no
+	fi
+	if [ "$created" = yes ]; then
+		if /bin/busybox mount -t vfat -o rw /dev/mmcblk0p1 "$mountpoint" >/dev/null 2>&1; then
+			/bin/busybox rm -f "$probe_file" >/dev/null 2>&1 || true
+			/bin/busybox sync
+			/bin/busybox umount "$mountpoint" >/dev/null 2>&1 || true
+		fi
+	fi
+}
+
+trap cleanup EXIT HUP INT TERM
 
 fail()
 {
@@ -10,7 +42,11 @@ fail()
 	exit 1
 }
 
-echo 'MICRONUX:M6:STORAGE begin mode=idmac-sram-poll access=read-only'
+if [ "$write_test" = yes ]; then
+	echo 'MICRONUX:M6:STORAGE begin mode=idmac-sram-poll access=write-test'
+else
+	echo 'MICRONUX:M6:STORAGE begin mode=idmac-sram-poll access=read-only'
+fi
 
 [ -b "$device" ] || fail no-card
 [ -r /sys/block/mmcblk0/size ] || fail no-size
@@ -27,14 +63,57 @@ echo "MICRONUX:M6:STORAGE raw-pass sectors=$sectors bytes=$sample_bytes sha256=$
 
 mount_result=no-partition
 if [ -b /dev/mmcblk0p1 ]; then
-	/bin/busybox mkdir -p /mnt/sd || fail mountpoint
-	if /bin/busybox mount -t vfat -o ro /dev/mmcblk0p1 /mnt/sd 2>/dev/null; then
+	/bin/busybox mkdir -p "$mountpoint" || fail mountpoint
+	if [ "$write_test" = yes ]; then
+		/bin/busybox mount -t vfat -o rw /dev/mmcblk0p1 "$mountpoint" 2>/dev/null || fail mount-rw
+		mounted=yes
+		[ ! -e "$probe_file" ] || fail filename-collision
+		/bin/busybox printf 'MicroNUX M6 controlled SD write probe v1\n' >"$probe_file" || fail write
+		created=yes
+		/bin/busybox sync || fail sync-write
+		written_hash=$(/bin/busybox sha256sum "$probe_file" | /bin/busybox cut -d' ' -f1) || fail hash-write
+		[ "$written_hash" = "$probe_hash" ] || fail content-write
+		/bin/busybox umount "$mountpoint" || fail unmount-write
+		mounted=no
+
+		/bin/busybox mount -t vfat -o ro /dev/mmcblk0p1 "$mountpoint" 2>/dev/null || fail remount-ro-verify
+		mounted=yes
+		verified_hash=$(/bin/busybox sha256sum "$probe_file" | /bin/busybox cut -d' ' -f1) || fail hash-remount
+		[ "$verified_hash" = "$probe_hash" ] || fail content-remount
+		/bin/busybox umount "$mountpoint" || fail unmount-verify
+		mounted=no
+
+		/bin/busybox mount -t vfat -o rw /dev/mmcblk0p1 "$mountpoint" 2>/dev/null || fail remount-rw-cleanup
+		mounted=yes
+		/bin/busybox rm "$probe_file" || fail delete
+		/bin/busybox sync || fail sync-delete
+		created=no
+		/bin/busybox umount "$mountpoint" || fail unmount-cleanup
+		mounted=no
+
+		/bin/busybox mount -t vfat -o ro /dev/mmcblk0p1 "$mountpoint" 2>/dev/null || fail remount-ro-cleanup
+		mounted=yes
+		[ ! -e "$probe_file" ] || fail cleanup-visible
+		/bin/busybox umount "$mountpoint" || fail unmount-final
+		mounted=no
+		mount_result=vfat-rw-remount-ro
+		echo "MICRONUX:M6:STORAGE write-pass bytes=41 sha256=$probe_hash cleanup=pass"
+	elif /bin/busybox mount -t vfat -o ro /dev/mmcblk0p1 "$mountpoint" 2>/dev/null; then
+		mounted=yes
 		mount_result=vfat-ro
-		/bin/busybox umount /mnt/sd || fail unmount
+		/bin/busybox umount "$mountpoint" || fail unmount
+		mounted=no
 	else
 		mount_result=not-vfat
 	fi
 fi
 
 echo "MICRONUX:M6:STORAGE mount=$mount_result"
-echo 'MICRONUX:M6:STORAGE:PASS mode=idmac-sram-poll access=read-only'
+if [ "$write_test" = yes ]; then
+	[ "$mount_result" = vfat-rw-remount-ro ] || fail no-vfat-partition
+	echo 'MICRONUX:M6:STORAGE:PASS mode=idmac-sram-poll access=write-tested cleanup=pass'
+else
+	echo 'MICRONUX:M6:STORAGE:PASS mode=idmac-sram-poll access=read-only'
+fi
+
+trap - EXIT HUP INT TERM

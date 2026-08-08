@@ -5,9 +5,7 @@ param(
     [int]$Boots = 3,
     [switch]$SkipLinuxBuild,
     [switch]$SkipLoaderBuild,
-    [switch]$SkipFlash,
-    [switch]$ControllerOnly,
-    [switch]$WriteTest
+    [switch]$SkipFlash
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,33 +18,31 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($wslRepoPath)) {
 }
 
 if (-not $SkipLinuxBuild) {
-    & wsl.exe -- env MICRONUX_JOBS=16 bash "$wslRepoPath/scripts/m6-build.sh"
+    & wsl.exe -- env MICRONUX_JOBS=16 bash "$wslRepoPath/scripts/m6-network-build.sh"
     if ($LASTEXITCODE -ne 0) {
-        throw "MicroNUX M6 Linux build failed."
+        throw "MicroNUX M6 network Linux build failed."
     }
 }
 
-$artifactPath = Join-Path $repoPath "out\m6"
+$artifactPath = Join-Path $repoPath "out\m6-network"
 $imagePath = Join-Path $artifactPath "Image"
 $dtbPath = Join-Path $artifactPath "esp32p4-micronux.dtb"
 $metadataPath = Join-Path $artifactPath "metadata.bin"
-$selftestPath = Join-Path $artifactPath "micronux-selftest"
-$storageTestPath = Join-Path $artifactPath "micronux-storage-test"
-foreach ($artifact in @($imagePath, $dtbPath, $metadataPath, $selftestPath, $storageTestPath)) {
+foreach ($artifact in @($imagePath, $dtbPath, $metadataPath)) {
     if (-not (Test-Path -LiteralPath $artifact)) {
-        throw "Missing M6 artifact: $artifact"
+        throw "Missing M6 network artifact: $artifact"
     }
 }
 if ((Get-Item -LiteralPath $imagePath).Length -gt 0x600000) {
-    throw "M6 Image exceeds the 6 MiB Linux partition."
+    throw "M6 network Image exceeds the 6 MiB Linux partition."
 }
 if ((Get-Item -LiteralPath $dtbPath).Length -gt 0x200000) {
-    throw "M6 DTB exceeds the 2 MiB DTB partition."
+    throw "M6 network DTB exceeds the 2 MiB DTB partition."
 }
 
 $idfPath = "C:\esp\v6.0.1\esp-idf"
 $loaderPath = Join-Path $repoPath "loader"
-$buildPath = Join-Path $repoPath "build\m6"
+$buildPath = Join-Path $repoPath "build\m6-network"
 $previousErrorPreference = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 & (Join-Path $idfPath "export.ps1") *> $null
@@ -66,20 +62,26 @@ if (-not $SkipLoaderBuild) {
     $env:CMAKE_GENERATOR = "Ninja"
     $env:IDF_CCACHE_ENABLE = "1"
     $sdkconfigPath = Join-Path $buildPath "sdkconfig"
-    & idf.py -C $loaderPath -B $buildPath -D "SDKCONFIG=$sdkconfigPath" reconfigure
+    $sdkconfigDefaults = @(
+        (Join-Path $loaderPath "sdkconfig.defaults"),
+        (Join-Path $loaderPath "sdkconfig.network.defaults")
+    ) -join ";"
+    & idf.py -C $loaderPath -B $buildPath `
+        -D "SDKCONFIG=$sdkconfigPath" `
+        -D "SDKCONFIG_DEFAULTS=$sdkconfigDefaults" reconfigure
     if ($LASTEXITCODE -ne 0) {
-        throw "M6 loader configure failed."
+        throw "M6 network loader configure failed."
     }
     & ninja -C $buildPath -j 16
     if ($LASTEXITCODE -ne 0) {
-        throw "M6 loader build failed."
+        throw "M6 network loader build failed."
     }
 }
 
 if (-not $SkipFlash) {
     & idf.py -C $loaderPath -B $buildPath -p $Port flash
     if ($LASTEXITCODE -ne 0) {
-        throw "M6 loader flash failed."
+        throw "M6 network loader flash failed."
     }
 
     & $idfPython -m esptool --chip esp32p4 -p $Port -b 921600 `
@@ -88,26 +90,12 @@ if (-not $SkipFlash) {
         0x800000 $dtbPath `
         0xA00000 $metadataPath
     if ($LASTEXITCODE -ne 0) {
-        throw "M6 Linux payload flash failed."
+        throw "M6 network Linux payload flash failed."
     }
 }
 
-$testArguments = @(
-    (Join-Path $PSScriptRoot "m6-test.py"),
-    "--port", $Port,
-    "--boots", $Boots,
-    "--artifact-dir", $artifactPath
-)
-if ($ControllerOnly) {
-    $testArguments += "--allow-no-card"
-}
-if ($WriteTest) {
-    if ($Boots -ne 1) {
-        throw "-WriteTest requires -Boots 1."
-    }
-    $testArguments += "--write-test"
-}
-& $idfPython @testArguments
+& $idfPython (Join-Path $PSScriptRoot "m6-network-test.py") `
+    --port $Port --boots $Boots --artifact-dir $artifactPath
 if ($LASTEXITCODE -ne 0) {
-    throw "MicroNUX M6 hardware test failed."
+    throw "MicroNUX M6 C6 SDIO enumeration test failed."
 }

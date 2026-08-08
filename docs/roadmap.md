@@ -107,13 +107,13 @@ Exit criterion: selected services work without destabilizing the minimal shell
 or violating reserved-memory boundaries.
 
 Current artifact: [M6 storage and peripheral bring-up](m6-peripherals.md). The
-onboard microSD storage slice is complete on physical hardware using a
-read-only, synchronous-polled IDMAC path with internal-SRAM descriptors and a
-4 KiB bounce buffer. A clean image passed three ROM-reset boots with identical
-card samples, read-only VFAT mounts, stable payload hashes, and the complete M5
-regression. Networking and display remain open. MIPI-DSI is split into
-electrical-pattern, scanout-ownership, and Linux-console gates so display DMA
-cannot bypass the PSRAM cache contract.
+onboard microSD path passed its three-boot read-only gate and a separate
+write/remount/verify/delete test with unchanged media sampling. The ESP32-C6
+factory firmware now exposes a stable ESP-Hosted SDIO/RPC link and `ethsta0`;
+association and DHCP still need a credentialed test. MIPI-D0 has four compiled
+exact-controller color-bar profiles behind a default-off power gate. Physical
+display verification waits for the attached panel label, after which scanout
+ownership and a Linux console remain separate acceptance gates.
 
 ## M7 - Isolation, SMP, and upstream evaluation
 

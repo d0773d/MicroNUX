@@ -22,13 +22,16 @@ passed three independent ROM-reset boots with identical hashes. Each boot
 completed 64 `posix_spawn()`/exec/wait lifecycles, signal and timer return
 tests, a checked 4 MiB allocation, explicit stack canaries, and a 64-record
 console integrity burst while retaining 20,372 KiB free. The M6 microSD slice
-is complete: a clean physical-board image passed three ROM-reset boots using a
-read-only, synchronous-polled IDMAC path with internal-SRAM descriptors and a
-4 KiB bounce buffer. Every boot produced the same first-1-MiB card hash,
-mounted VFAT read-only, and passed the complete M5 regression. On revision 1.3,
-USB status is serviced once per kernel tick and interrupted userspace returns
-through a two-stage CLIC `mret` sequence. Networking and the staged MIPI-DSI
-sub-track remain open.
+passed three ROM-reset read-only boots and an opt-in
+write/remount/verify/delete gate using a synchronous-polled IDMAC path with
+internal-SRAM bounce memory. ESP32-C6 networking is also live through the
+factory ESP-Hosted-MCU firmware: three boots produced stable SDIO function
+identities, C6 firmware `2.11.5`, MAC `b0:a6:04:8a:d3:78`, and an
+`UP,LOWER_UP` Linux interface. Four exact MIPI-DSI controller profiles compile
+behind a default-off power-safety gate; physical color-bar verification awaits
+the attached panel's controller label. On revision 1.3, USB status is serviced
+once per kernel tick and interrupted userspace returns through a two-stage
+CLIC `mret` sequence.
 
 ## Design baseline
 
@@ -38,7 +41,7 @@ sub-track remain open.
 - Linux image loaded into external PSRAM
 - BusyBox with uClibc-ng userspace
 - Native USB Serial/JTAG as the first hardware output path
-- ESP32-C6 networking treated as a later coprocessor-backed service
+- ESP32-C6 networking isolated as a coprocessor-backed SDIO profile
 
 NOMMU constraints are part of the platform contract: no demand paging, no
 copy-on-write `fork()`, limited process isolation, and a tightly controlled

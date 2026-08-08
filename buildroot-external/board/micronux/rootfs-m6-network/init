@@ -1,0 +1,31 @@
+#!/bin/sh
+
+if ! /bin/busybox mount -t devtmpfs devtmpfs /dev; then
+	echo 'MICRONUX:M6:NET:FAIL devtmpfs-mount'
+	exit 1
+fi
+if ! /bin/busybox mount -t proc proc /proc; then
+	echo 'MICRONUX:M6:NET:FAIL proc-mount'
+	exit 1
+fi
+if ! /bin/busybox mount -t sysfs sysfs /sys; then
+	echo 'MICRONUX:M6:NET:FAIL sysfs-mount'
+	exit 1
+fi
+
+export HOME=/root
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PS1='micronux-net# '
+
+echo 'MICRONUX:M6:NET:DRIVER stack=esp-hosted-fg mode=builtin transport=sdio bluetooth=off'
+/bin/busybox sleep 5
+if [ -d /sys/class/net/ethsta0 ]; then
+	echo 'MICRONUX:M6:NET:IFACE state=ready name=ethsta0'
+	/bin/busybox ip link show ethsta0
+else
+	echo 'MICRONUX:M6:NET:IFACE state=missing name=ethsta0'
+fi
+
+echo 'MICRONUX:M6:NET:SHELL ready console=ttyGS0 transport=c6-sdio-slot1'
+exec /bin/busybox setsid /bin/busybox cttyhack /bin/busybox sh -i \
+	</dev/ttyGS0 >/dev/ttyGS0 2>&1

@@ -1,0 +1,68 @@
+From 63de61d969a44e8fdffcc6394daeadffead05101 Mon Sep 17 00:00:00 2001
+From: MicroNUX contributors <micronux@users.noreply.github.com>
+Date: Sat, 8 Aug 2026 18:13:00 -0700
+Subject: [PATCH] host: bootstrap-poll when the host IRQ is parked
+
+MicroNUX deliberately parks the ESP32-P4 MMC CLIC source while that interrupt
+controller port is stabilized. The DesignWare fallback normally observes SDIO
+function interrupts, but the C6 can publish its FG boot event before that path
+sees a new edge. Poll the packet-length path for at most 500 ms during probe,
+stopping as soon as the FG boot event moves the adapter to READY.
+
+This is bounded to initial handshake state; normal packet processing remains
+on the standard SDIO IRQ/workqueue path after bring-up.
+
+Signed-off-by: MicroNUX contributors <micronux@users.noreply.github.com>
+---
+ .../host/linux/host_driver/esp32/Makefile     |  1 +
+ .../host_driver/esp32/sdio/esp_sdio.c         | 15 +++++++++++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/esp_hosted_fg/host/linux/host_driver/esp32/Makefile b/esp_hosted_fg/host/linux/host_driver/esp32/Makefile
+index 902a0f9..6c09a68 100644
+--- a/esp_hosted_fg/host/linux/host_driver/esp32/Makefile
++++ b/esp_hosted_fg/host/linux/host_driver/esp32/Makefile
+@@ -2,6 +2,7 @@
+ 
+ ccflags-y += -I$(src) -I$(src)/include -I$(src)/sdio
+ ccflags-y += -DCONFIG_INFO_LOGS -DCONFIG_ESP_HOSTED_USE_THREAD=1
++ccflags-y += -DCONFIG_ESP_HOSTED_FG_BOOTSTRAP_POLL=1
+ 
+ esp32_sdio-y := main.o esp_stats.o \
+ 	sdio/esp_sdio.o sdio/esp_sdio_api.o \
+diff --git a/esp_hosted_fg/host/linux/host_driver/esp32/sdio/esp_sdio.c b/esp_hosted_fg/host/linux/host_driver/esp32/sdio/esp_sdio.c
+index 30d8e17..d70a203 100644
+--- a/esp_hosted_fg/host/linux/host_driver/esp32/sdio/esp_sdio.c
++++ b/esp_hosted_fg/host/linux/host_driver/esp32/sdio/esp_sdio.c
+@@ -1320,6 +1320,9 @@ static int esp_probe(struct sdio_func *func,
+ {
+ 	struct esp_sdio_context *context = NULL;
+ 	int ret = 0;
++#ifdef CONFIG_ESP_HOSTED_FG_BOOTSTRAP_POLL
++	unsigned int attempt;
++#endif
+ 
+ 	if (func->num != 1) {
+ 		return -EINVAL;
+@@ -1390,6 +1393,18 @@ static int esp_probe(struct sdio_func *func,
+ 
+ 	generate_slave_intr(context, BIT(ESP_OPEN_DATA_PATH));
+ 
++#ifdef CONFIG_ESP_HOSTED_FG_BOOTSTRAP_POLL
++	for (attempt = 0; attempt < 25 &&
++	     atomic_read(&context->adapter->state) == ESP_CONTEXT_RX_READY;
++	     attempt++) {
++		msleep(20);
++		esp_process_new_packet_intr(context->adapter);
++		flush_workqueue(context->adapter->if_rx_workqueue);
++	}
++	if (atomic_read(&context->adapter->state) == ESP_CONTEXT_RX_READY)
++		esp_warn("FG boot event was not received during bootstrap poll\n");
++#endif
++
+ 
+ 	esp_dbg("ESP SDIO probe completed\n");
+ 
+-- 
+2.43.0
+

@@ -1,1 +1,3 @@
 source "$BR2_EXTERNAL_MICRONUX_PATH/package/micronux-selftest/Config.in"
+source "$BR2_EXTERNAL_MICRONUX_PATH/package/micronux-netctl/Config.in"
+source "$BR2_EXTERNAL_MICRONUX_PATH/package/esp-hosted-fg/Config.in"

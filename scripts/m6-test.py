@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reset the M6 board and run the read-only microSD plus M5 regression gate."""
+"""Reset the M6 board and run the microSD plus M5 regression gate."""
 
 from __future__ import annotations
 
@@ -22,9 +22,10 @@ STACK_DEPTH = 8
 CONSOLE_LINES = 64
 DEFAULT_MAX_MEMORY_LOSS_KIB = 512
 
-REQUIRED_MARKERS = (
+COMMON_REQUIRED_MARKERS = (
     "MICRONUX:M3:BOOT",
     "MICRONUX:M3:JUMP",
+    "MICRONUX:M6:DSI state=disabled reason=profile-off",
     "MICRONUX:M4:IRQ source=22 matrix=500d6058 clic=16 handoff=armed",
     "MICRONUX:M6:SDMMC power=ldo4 voltage_mv=3300 slot=0 width=4",
     "MICRONUX:M6:DMA reserved=[4ff80000,4ff82000) desc=4ff80000 data=4ff81000 uncached=8ff80000",
@@ -38,9 +39,7 @@ REQUIRED_MARKERS = (
     "console [ttyGS0] enabled",
     "USB Serial/JTAG ttyGS0",
     "MICRONUX:M6:SHELL ready console=ttyGS0 storage=microsd-idmac-sram-poll",
-    "MICRONUX:M6:STORAGE begin mode=idmac-sram-poll access=read-only",
     "MICRONUX:M6:STORAGE raw-pass",
-    "MICRONUX:M6:STORAGE:PASS mode=idmac-sram-poll access=read-only",
     "MICRONUX:M5:BASELINE",
     "MICRONUX:M5:RUN",
     f"MICRONUX:M5:SIGNALS pass count={SIGNAL_ITERATIONS}",
@@ -52,6 +51,20 @@ REQUIRED_MARKERS = (
     "MICRONUX:M5:PASS",
     "MICRONUX:M5:AFTER",
     "MICRONUX:M6:PROBE:DONE",
+)
+
+READ_REQUIRED_MARKERS = (
+    "MICRONUX:M6:STORAGE begin mode=idmac-sram-poll access=read-only",
+    "MICRONUX:M6:STORAGE:PASS mode=idmac-sram-poll access=read-only",
+)
+
+WRITE_REQUIRED_MARKERS = (
+    "MICRONUX:M6:STORAGE begin mode=idmac-sram-poll access=write-test",
+    "MICRONUX:M6:STORAGE write-pass bytes=41 "
+    "sha256=af8bdcde36e9c208ab7d846d87bfe9dadb51fccdf240f1214af2f4db232e2a36 "
+    "cleanup=pass",
+    "MICRONUX:M6:STORAGE:PASS mode=idmac-sram-poll "
+    "access=write-tested cleanup=pass",
 )
 
 FORBIDDEN_MARKERS = (
@@ -70,13 +83,10 @@ FORBIDDEN_MARKERS = (
     "can't open /dev/ttyGS0",
 )
 
-MEDIA_REQUIRED_MARKERS = (
+COMMON_MEDIA_REQUIRED_MARKERS = (
     "mmcblk0:",
     "MICRONUX:M6:STORAGE raw-pass",
-    "MICRONUX:M6:STORAGE:PASS mode=idmac-sram-poll access=read-only",
 )
-
-STORAGE_LINES = ("/usr/bin/micronux-storage-test\n",)
 
 M5_LINES = (
     "TAG=BASELINE; echo MICRONUX:M5:$TAG\n",
@@ -121,7 +131,10 @@ def write_lines(device: serial.Serial, lines: tuple[str, ...]) -> None:
 
 
 def reset_probe_and_capture(
-    port: str, timeout: float, allow_no_card: bool = False
+    port: str,
+    timeout: float,
+    allow_no_card: bool = False,
+    write_test: bool = False,
 ) -> str:
     rom_reset(port)
 
@@ -155,7 +168,10 @@ def reset_probe_and_capture(
             )
             if not storage_started and storage_ready:
                 time.sleep(0.2)
-                write_lines(device, STORAGE_LINES)
+                command = "/usr/bin/micronux-storage-test"
+                if write_test:
+                    command += " --write-test"
+                write_lines(device, (command + "\n",))
                 storage_started = True
 
             storage_passed = "MICRONUX:M6:STORAGE:PASS" in text
@@ -318,11 +334,24 @@ def main() -> int:
         action="store_true",
         help="run the M5 regression after proving the controller with an empty slot",
     )
+    parser.add_argument(
+        "--write-test",
+        action="store_true",
+        help="write, remount, verify, and delete one controlled file (one boot only)",
+    )
     args = parser.parse_args()
     if args.boots < 1:
         parser.error("--boots must be at least 1")
     if args.max_memory_loss_kib < 0:
         parser.error("--max-memory-loss-kib cannot be negative")
+    if args.write_test and args.boots != 1:
+        parser.error("--write-test requires --boots 1")
+    if args.write_test and args.allow_no_card:
+        parser.error("--write-test cannot be combined with --allow-no-card")
+
+    storage_required = WRITE_REQUIRED_MARKERS if args.write_test else READ_REQUIRED_MARKERS
+    required_markers = COMMON_REQUIRED_MARKERS + storage_required
+    media_required_markers = COMMON_MEDIA_REQUIRED_MARKERS + storage_required[-1:]
 
     try:
         artifacts = artifact_record(args.artifact_dir.resolve())
@@ -338,16 +367,20 @@ def main() -> int:
     media_state: str | None = None
 
     for boot in range(1, args.boots + 1):
-        log = reset_probe_and_capture(args.port, args.timeout, args.allow_no_card)
+        log = reset_probe_and_capture(
+            args.port, args.timeout, args.allow_no_card, args.write_test
+        )
         print(f"--- M6 boot {boot}/{args.boots} ---")
         lines = milestone_lines(log)
         print("\n".join(lines) if lines else "(no M6/Linux milestones captured)")
 
         no_card = "MICRONUX:M6:STORAGE:FAIL stage=no-card" in log
-        allowed_missing = MEDIA_REQUIRED_MARKERS if args.allow_no_card and no_card else ()
+        allowed_missing = (
+            media_required_markers if args.allow_no_card and no_card else ()
+        )
         missing = [
             marker
-            for marker in REQUIRED_MARKERS
+            for marker in required_markers
             if marker not in log and marker not in allowed_missing
         ]
         forbidden = [
@@ -425,8 +458,9 @@ def main() -> int:
         )
         return 0
 
+    access = "write-tested" if args.write_test else "read-only"
     print(
-        f"M6 hardware gate passed: boots={args.boots} mode=idmac-sram-poll access=read-only "
+        f"M6 hardware gate passed: boots={args.boots} mode=idmac-sram-poll access={access} "
         f"card_sectors={expected_card[0]} sample_sha256={expected_card[1]} "
         f"m5_exec_per_boot={EXEC_ITERATIONS} "
         f"m5_elapsed_ms={','.join(str(value) for value in elapsed_times)} "

@@ -1,0 +1,59 @@
+menu "MicroNUX loader profile"
+
+    config MICRONUX_C6_SDIO_PROFILE
+        bool "Prepare ESP32-C6 SDIO slot 1 instead of microSD slot 0"
+        default n
+        help
+            Select the independent M6 networking profile. The loader resets
+            the onboard ESP32-C6, routes its four-bit SDIO bus through the
+            GPIO matrix, and hands DesignWare MSHC slot 1 to Linux. The
+            default storage profile remains slot 0 and does not reset the C6.
+
+    config MICRONUX_MIPI_DSI
+        bool "Enable the MIPI-DSI electrical proof profile"
+        default n
+        help
+            Initialize one explicitly selected Waveshare MIPI-DSI panel and
+            show the ESP32-P4 hardware vertical color-bar pattern before the
+            Linux handoff. The scanout buffer stays in the loader-owned PSRAM
+            reservation; this option does not grant Linux framebuffer
+            ownership. Leave disabled until the attached panel label is known.
+
+    if MICRONUX_MIPI_DSI
+
+        choice MICRONUX_MIPI_PANEL
+            prompt "Attached Waveshare MIPI-DSI panel"
+            default MICRONUX_MIPI_PANEL_UNSELECTED
+            help
+                The controller, resolution, timing, and lane rate must match
+                the exact attached panel. The safe default refuses to power
+                the D-PHY, panel, or backlight.
+
+            config MICRONUX_MIPI_PANEL_UNSELECTED
+                bool "No panel selected (refuse to power display)"
+
+            config MICRONUX_MIPI_PANEL_JD9365_800_1280
+                bool "JD9365 800x1280 (8/10.1-inch DSI Touch A)"
+
+            config MICRONUX_MIPI_PANEL_ILI9881C_720_1280
+                bool "ILI9881C 720x1280 (7-inch DSI Touch A)"
+
+            config MICRONUX_MIPI_PANEL_HX8394_720_1280
+                bool "HX8394 720x1280 (5-inch DSI Touch A)"
+
+            config MICRONUX_MIPI_PANEL_EK79007_1024_600
+                bool "EK79007 1024x600 (7-inch DSI Touch C)"
+
+        endchoice
+
+        config MICRONUX_MIPI_BACKLIGHT_PERCENT
+            int "Diagnostic backlight brightness percent"
+            range 1 100
+            default 25
+            help
+                Backlight level applied only after panel initialization and
+                the hardware color-bar generator both succeed.
+
+    endif
+
+endmenu

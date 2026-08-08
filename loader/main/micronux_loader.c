@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "sdkconfig.h"
 #include "esp_attr.h"
 #include "esp_cache.h"
 #include "esp_chip_info.h"
@@ -23,6 +24,7 @@
 #include "esp_private/gpio.h"
 #include "esp_psram.h"
 #include "esp_rom_crc.h"
+#include "esp_rom_gpio.h"
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -30,10 +32,12 @@
 #include "driver/gpio.h"
 #include "driver/sd_host_sdmmc.h"
 #include "hal/mmu_types.h"
+#include "hal/sdmmc_periph.h"
 #include "riscv/csr.h"
 #include "sha/sha_core.h"
 
 #include "micronux_handoff.h"
+#include "micronux_mipi_dsi.h"
 #include "micronux_payload.h"
 
 #define MICRONUX_LINUX_PARTITION_SUBTYPE 0x40
@@ -93,6 +97,17 @@
 #define MICRONUX_SD_D3_GPIO GPIO_NUM_42
 #define MICRONUX_SD_IOMUX_FUNCTION 0
 #define MICRONUX_SD_DRIVE_CAPABILITY 3
+
+/* ESP32-C6 SDIO wiring used by the Waveshare/function-board layout. */
+#define MICRONUX_C6_SD_CLK_GPIO GPIO_NUM_18
+#define MICRONUX_C6_SD_CMD_GPIO GPIO_NUM_19
+#define MICRONUX_C6_SD_D0_GPIO GPIO_NUM_14
+#define MICRONUX_C6_SD_D1_GPIO GPIO_NUM_15
+#define MICRONUX_C6_SD_D2_GPIO GPIO_NUM_16
+#define MICRONUX_C6_SD_D3_GPIO GPIO_NUM_17
+#define MICRONUX_C6_RESET_GPIO GPIO_NUM_54
+#define MICRONUX_C6_RESET_PULSE_MS 10
+#define MICRONUX_C6_RESET_SETTLE_MS 3000
 
 /* SDIO_HOST is peripheral interrupt source 23 on ESP32-P4. */
 #define ESP32P4_SDMMC_BASE UINT32_C(0x50083000)
@@ -339,6 +354,73 @@ static void configure_sd_iomux_pin(gpio_num_t gpio, bool pull_up)
         gpio, MICRONUX_SD_DRIVE_CAPABILITY));
 }
 
+#if CONFIG_MICRONUX_C6_SDIO_PROFILE
+static void configure_c6_sdio_pin(gpio_num_t gpio, int signal,
+                                  gpio_mode_t mode, bool pull_up)
+{
+    ESP_ERROR_CHECK(gpio_reset_pin(gpio));
+    ESP_ERROR_CHECK(gpio_set_direction(gpio, mode));
+    ESP_ERROR_CHECK(gpio_pulldown_dis(gpio));
+    if (pull_up) {
+        ESP_ERROR_CHECK(gpio_pullup_en(gpio));
+    } else {
+        ESP_ERROR_CHECK(gpio_pullup_dis(gpio));
+    }
+    ESP_ERROR_CHECK(gpio_set_drive_capability(
+        gpio, MICRONUX_SD_DRIVE_CAPABILITY));
+
+    if (mode == GPIO_MODE_INPUT || mode == GPIO_MODE_INPUT_OUTPUT) {
+        esp_rom_gpio_connect_in_signal(gpio, signal, false);
+    }
+    if (mode == GPIO_MODE_OUTPUT || mode == GPIO_MODE_INPUT_OUTPUT) {
+        esp_rom_gpio_connect_out_signal(gpio, signal, false, false);
+    }
+}
+
+static void prepare_c6_sdio_electrical_state(void)
+{
+    const gpio_config_t reset_config = {
+        .pin_bit_mask = UINT64_C(1) << MICRONUX_C6_RESET_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    configure_c6_sdio_pin(MICRONUX_C6_SD_CLK_GPIO,
+                          sdmmc_slot_gpio_sig[1].clk,
+                          GPIO_MODE_OUTPUT, false);
+    configure_c6_sdio_pin(MICRONUX_C6_SD_CMD_GPIO,
+                          sdmmc_slot_gpio_sig[1].cmd,
+                          GPIO_MODE_INPUT_OUTPUT, true);
+    configure_c6_sdio_pin(MICRONUX_C6_SD_D0_GPIO,
+                          sdmmc_slot_gpio_sig[1].d0,
+                          GPIO_MODE_INPUT_OUTPUT, true);
+    configure_c6_sdio_pin(MICRONUX_C6_SD_D1_GPIO,
+                          sdmmc_slot_gpio_sig[1].d1,
+                          GPIO_MODE_INPUT_OUTPUT, true);
+    configure_c6_sdio_pin(MICRONUX_C6_SD_D2_GPIO,
+                          sdmmc_slot_gpio_sig[1].d2,
+                          GPIO_MODE_INPUT_OUTPUT, true);
+    configure_c6_sdio_pin(MICRONUX_C6_SD_D3_GPIO,
+                          sdmmc_slot_gpio_sig[1].d3,
+                          GPIO_MODE_INPUT_OUTPUT, true);
+
+    ESP_ERROR_CHECK(gpio_config(&reset_config));
+    /* GPIO54 is C6 CHIP_PU: low resets the coprocessor, high runs it. */
+    ESP_ERROR_CHECK(gpio_set_level(MICRONUX_C6_RESET_GPIO, 1));
+    vTaskDelay(pdMS_TO_TICKS(MICRONUX_C6_RESET_PULSE_MS));
+    ESP_ERROR_CHECK(gpio_set_level(MICRONUX_C6_RESET_GPIO, 0));
+    vTaskDelay(pdMS_TO_TICKS(MICRONUX_C6_RESET_PULSE_MS));
+    ESP_ERROR_CHECK(gpio_set_level(MICRONUX_C6_RESET_GPIO, 1));
+    vTaskDelay(pdMS_TO_TICKS(MICRONUX_C6_RESET_SETTLE_MS));
+
+    ESP_LOGI(TAG,
+             "MICRONUX:M6:NET transport=sdio slot=1 width=4"
+             " clock_max_hz=40000000 pins=18,19,14,15,16,17 reset=54");
+}
+#endif
+
 static void quiesce_sdmmc_controller(void)
 {
     uint32_t control = read_reg32(ESP32P4_SDMMC_CTRL);
@@ -356,21 +438,25 @@ static void quiesce_sdmmc_controller(void)
 
 static void prepare_sdmmc_electrical_state(void)
 {
-    const esp_ldo_channel_config_t ldo_config = {
-        .chan_id = MICRONUX_SD_LDO_CHANNEL,
-        .voltage_mv = MICRONUX_SD_LDO_MILLIVOLTS,
-    };
     const sd_host_sdmmc_cfg_t controller_config = {
         .event_queue_items = 1,
         .dma_desc_num = 1,
     };
 
-    ESP_ERROR_CHECK(esp_ldo_acquire_channel(&ldo_config, &s_sd_ldo));
     ESP_ERROR_CHECK(sd_host_create_sdmmc_controller(
         &controller_config, &s_sd_controller));
     /* No IDF slot is registered: silence its ISR before exposing the pins. */
     quiesce_sdmmc_controller();
 
+#if CONFIG_MICRONUX_C6_SDIO_PROFILE
+    prepare_c6_sdio_electrical_state();
+#else
+    const esp_ldo_channel_config_t ldo_config = {
+        .chan_id = MICRONUX_SD_LDO_CHANNEL,
+        .voltage_mv = MICRONUX_SD_LDO_MILLIVOLTS,
+    };
+
+    ESP_ERROR_CHECK(esp_ldo_acquire_channel(&ldo_config, &s_sd_ldo));
     configure_sd_iomux_pin(MICRONUX_SD_CLK_GPIO, false);
     configure_sd_iomux_pin(MICRONUX_SD_CMD_GPIO, true);
     configure_sd_iomux_pin(MICRONUX_SD_D0_GPIO, true);
@@ -383,6 +469,7 @@ static void prepare_sdmmc_electrical_state(void)
     ESP_LOGI(TAG,
              "MICRONUX:M6:SDMMC power=ldo4 voltage_mv=3300"
              " slot=0 width=4 clock_hz=80000000 pins=43,44,39,40,41,42");
+#endif
 }
 
 static void prepare_sdmmc_for_linux(void)
@@ -480,6 +567,10 @@ void app_main(void)
              psram_size, psram_heap, psram_free, psram_largest);
     if (psram_size != 32U * 1024U * 1024U) {
         fail("psram-capacity");
+    }
+
+    if (micronux_mipi_dsi_prepare() != ESP_OK) {
+        fail("mipi-dsi-prepare");
     }
 
     const esp_partition_t *metadata_partition = find_partition(

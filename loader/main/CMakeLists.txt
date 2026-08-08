@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "micronux_loader.c"
+        "micronux_mipi_dsi.c"
         "handoff_jump.S"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
@@ -10,7 +11,9 @@ idf_component_register(
         esp_timer
         esp_hw_support
         esp_driver_gpio
+        esp_driver_i2c
         esp_driver_sdmmc
+        esp_lcd
         heap
         esp_rom
         esp_system
