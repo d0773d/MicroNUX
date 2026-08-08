@@ -78,6 +78,8 @@ child commands over the native USB console.
 
 ## M5 - NOMMU hardening
 
+Status: **complete**
+
 - Audit programs for `vfork()`/`execve()` and NOMMU-safe allocation behavior.
 - Add memory-pressure, repeated-exec, timer, and console stress tests.
 - Detect stack exhaustion, memory corruption, and loader-region overlap.
@@ -85,6 +87,11 @@ child commands over the native USB console.
 
 Exit criterion: the baseline test suite survives repeated cold boots and an
 extended stress run within a fixed memory budget.
+
+Exit artifact: [M5 NOMMU hardening and hardware acceptance report](m5-hardening.md).
+The final image passed three ROM-reset boots with stable payload hashes. Each
+boot completed the fixed stress contract in 687 ms and retained 20,372 KiB
+free from a 20,400 KiB baseline.
 
 ## M6 - Storage, networking, and peripherals
 
