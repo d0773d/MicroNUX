@@ -28,9 +28,10 @@ REQUIRED_MARKERS = (
     "MICRONUX:M6:NET:SHELL ready",
     "MICRONUX:M6:NET:PROBE:DONE",
     "MICRONUX:M6:NET:UP name=ethsta0",
-    "MICRONUX:M6:NET:UP:RC=0",
     "MICRONUX:M6:NET:CONTROL:DONE",
 )
+
+CONTROL_REQUIRED_MARKERS = ("MICRONUX:M6:NET:UP:RC=0",)
 
 FORBIDDEN_MARKERS = (
     "MICRONUX:M3:FAIL",
@@ -43,14 +44,38 @@ FORBIDDEN_MARKERS = (
     "Drop invalid aggregate pkt",
 )
 
-CONTROL_LINE = (
+ONLINE_REQUIRED_MARKERS = (
+    "MICRONUX:M6:NET:ONLINE state=ready name=ethsta0",
+    "MICRONUX:M6:NET:ONLINE:RC=0",
+    "default via ",
+    "nameserver ",
+    "1.1.1.1 is alive!",
+    "MICRONUX:M6:NET:PING4:RC=0",
+    "example.com is alive!",
+    "MICRONUX:M6:NET:DNS:RC=0",
+    "MICRONUX:M6:NET:ONLINE:DONE",
+)
+
+CONTROL_PREFIX = (
     "for D in /sys/bus/sdio/devices/*; do "
     "echo MICRONUX:M6:NET:SDIO path=${D##*/}; "
     "for F in vendor device class modalias; do "
     "printf 'MICRONUX:M6:NET:SDIO %s=' $F; cat $D/$F; "
     "done; done; echo MICRONUX:M6:NET:PROBE:DONE; "
+)
+
+CONTROL_UP = (
     "micronux-netctl up; echo MICRONUX:M6:NET:UP:RC=$?; "
-    "ip link show ethsta0; echo MICRONUX:M6:NET:CONTROL:DONE\n"
+)
+
+ONLINE_CONTROL = (
+    "micronux-online; echo MICRONUX:M6:NET:ONLINE:RC=$?; "
+    "ip -4 addr show dev ethsta0; ip route; cat /etc/resolv.conf; "
+    "/bin/busybox timeout 6 /bin/busybox ping 1.1.1.1; "
+    "echo MICRONUX:M6:NET:PING4:RC=$?; "
+    "/bin/busybox timeout 6 /bin/busybox ping example.com; "
+    "echo MICRONUX:M6:NET:DNS:RC=$?; "
+    "echo MICRONUX:M6:NET:ONLINE:DONE; "
 )
 
 
@@ -75,7 +100,7 @@ def rom_reset(port: str) -> None:
     )
 
 
-def capture_boot(port: str, timeout: float) -> str:
+def capture_boot(port: str, timeout: float, online: bool) -> str:
     rom_reset(port)
     device = serial.Serial()
     device.port = port
@@ -107,7 +132,14 @@ def capture_boot(port: str, timeout: float) -> str:
                 )
             ):
                 time.sleep(0.2)
-                device.write(CONTROL_LINE.encode("ascii"))
+                control_line = CONTROL_PREFIX
+                if online:
+                    control_line += ONLINE_CONTROL
+                else:
+                    control_line += CONTROL_UP
+                control_line += "ip link show ethsta0; "
+                control_line += "echo MICRONUX:M6:NET:CONTROL:DONE\n"
+                device.write(control_line.encode("ascii"))
                 device.flush()
                 probe_sent = True
 
@@ -218,6 +250,11 @@ def main() -> int:
     parser.add_argument("--boots", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--artifact-dir", type=Path, required=True)
+    parser.add_argument(
+        "--online",
+        action="store_true",
+        help="also require C6 association, DHCP, routing, IPv4, and DNS",
+    )
     args = parser.parse_args()
     if args.boots < 1:
         parser.error("--boots must be at least 1")
@@ -233,12 +270,20 @@ def main() -> int:
     expected_mac: str | None = None
 
     for boot in range(1, args.boots + 1):
-        log = capture_boot(args.port, args.timeout)
+        log = capture_boot(args.port, args.timeout, args.online)
         print(f"--- M6 network boot {boot}/{args.boots} ---")
         lines = milestone_lines(log)
         print("\n".join(lines) if lines else "(no network/Linux milestones captured)")
 
         missing = [marker for marker in REQUIRED_MARKERS if marker not in log]
+        if args.online:
+            missing.extend(
+                marker for marker in ONLINE_REQUIRED_MARKERS if marker not in log
+            )
+        else:
+            missing.extend(
+                marker for marker in CONTROL_REQUIRED_MARKERS if marker not in log
+            )
         forbidden = [marker for marker in FORBIDDEN_MARKERS if marker in log]
         if missing or forbidden:
             print("--- complete serial log ---", file=sys.stderr)
@@ -285,6 +330,11 @@ def main() -> int:
         f"mac={expected_mac} "
         f"kernel_sha256={expected_payload[0]} dtb_sha256={expected_payload[1]}"
     )
+    if args.online:
+        print(
+            "M6 C6 association/DHCP/IPv4/DNS gate passed: "
+            f"boots={args.boots}"
+        )
     return 0
 
 

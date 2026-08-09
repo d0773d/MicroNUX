@@ -19,6 +19,8 @@ endef
 define MICRONUX_NETCTL_INSTALL_TARGET_CMDS
 	$(INSTALL) -D -m 0755 $(@D)/micronux-netctl \
 		$(TARGET_DIR)/usr/bin/micronux-netctl
+	$(INSTALL) -D -m 0755 $(@D)/micronux-online \
+		$(TARGET_DIR)/usr/bin/micronux-online
 endef
 
 $(eval $(generic-package))

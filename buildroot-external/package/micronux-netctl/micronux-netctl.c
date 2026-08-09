@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -19,9 +20,11 @@
 #define BUFFER_CAPACITY 768
 #define PSERIAL_ENDPOINT_CAPACITY 16
 #define RPC_TIMEOUT_MS 10000
+#define ASSOCIATION_STABLE_MS 2000
 
 #define RPC_TYPE_REQUEST 1
 #define RPC_TYPE_RESPONSE 2
+#define RPC_TYPE_EVENT 3
 #define RPC_RESPONSE_OFFSET 256
 #define RPC_GET_MAC_ADDRESS 257
 #define RPC_SET_WIFI_MODE 260
@@ -30,6 +33,11 @@
 #define RPC_WIFI_CONNECT 282
 #define RPC_WIFI_SET_CONFIG 284
 #define RPC_WIFI_RESTORE 291
+#define RPC_WIFI_STA_GET_AP_INFO 294
+#define RPC_EVENT_STA_DISCONNECTED 776
+
+#define ESP_ERR_WIFI_NOT_CONNECT 0x300fU
+#define ESP_ERR_WIFI_NOT_ASSOC 0x3015U
 
 #define WIFI_INTERFACE_STA 0
 #define WIFI_MODE_STA 1
@@ -48,7 +56,14 @@ struct pb_field {
 	size_t bytes_length;
 };
 
+struct station_disconnect_event {
+	bool seen;
+	uint32_t reason;
+	int32_t rssi;
+};
+
 static uint32_t next_uid = 1;
+static struct station_disconnect_event last_disconnect;
 
 static int buffer_append(struct buffer *buffer, const void *data, size_t length)
 {
@@ -295,10 +310,73 @@ bad:
 	return -1;
 }
 
+static int record_station_event(const struct buffer *message)
+{
+	const uint8_t *event_payload = NULL;
+	const uint8_t *disconnect_payload = NULL;
+	size_t event_payload_length = 0;
+	size_t disconnect_payload_length = 0;
+	size_t offset = 0;
+	uint64_t message_type = 0;
+	uint64_t message_id = 0;
+	struct pb_field field;
+
+	while (offset < message->length) {
+		if (pb_next(message->data, message->length, &offset, &field) < 0)
+			return -1;
+		if (field.number == 1 && field.wire_type == 0)
+			message_type = field.varint;
+		else if (field.number == 2 && field.wire_type == 0)
+			message_id = field.varint;
+		else if (field.number == RPC_EVENT_STA_DISCONNECTED &&
+			field.wire_type == 2) {
+			event_payload = field.bytes;
+			event_payload_length = field.bytes_length;
+		}
+	}
+	if (message_type != RPC_TYPE_EVENT ||
+		message_id != RPC_EVENT_STA_DISCONNECTED)
+		return 0;
+	if (event_payload == NULL) {
+		errno = EBADMSG;
+		return -1;
+	}
+
+	offset = 0;
+	while (offset < event_payload_length) {
+		if (pb_next(event_payload, event_payload_length, &offset, &field) < 0)
+			return -1;
+		if (field.number == 2 && field.wire_type == 2) {
+			disconnect_payload = field.bytes;
+			disconnect_payload_length = field.bytes_length;
+		}
+	}
+	if (disconnect_payload == NULL) {
+		errno = EBADMSG;
+		return -1;
+	}
+
+	last_disconnect.seen = true;
+	last_disconnect.reason = 0;
+	last_disconnect.rssi = 0;
+	offset = 0;
+	while (offset < disconnect_payload_length) {
+		if (pb_next(disconnect_payload, disconnect_payload_length, &offset,
+				&field) < 0)
+			return -1;
+		if (field.number == 4 && field.wire_type == 0)
+			last_disconnect.reason = (uint32_t)field.varint;
+		else if (field.number == 5 && field.wire_type == 0)
+			last_disconnect.rssi = (int32_t)(uint32_t)field.varint;
+	}
+	return 0;
+}
+
 static int rpc_exchange(int fd, uint32_t request_id,
 		const struct buffer *request_payload, struct buffer *response_payload)
 {
 	static const uint8_t response_endpoint[] = "RPCRsp";
+	static const uint8_t event_endpoint[] = "RPCEvt";
 	struct buffer protobuf = {0};
 	struct buffer pserial = {0};
 	struct buffer response = {0};
@@ -339,6 +417,12 @@ static int rpc_exchange(int fd, uint32_t request_id,
 		if (read_pserial_frame(fd, endpoint, sizeof(endpoint),
 				&endpoint_length, &response, deadline_ms) < 0)
 			return -1;
+		if (endpoint_length == sizeof(event_endpoint) - 1 &&
+			memcmp(endpoint, event_endpoint, endpoint_length) == 0) {
+			if (record_station_event(&response) < 0)
+				return -1;
+			continue;
+		}
 		if (endpoint_length != sizeof(response_endpoint) - 1 ||
 			memcmp(endpoint, response_endpoint, endpoint_length) != 0)
 			continue;
@@ -616,22 +700,176 @@ out:
 	return 0;
 }
 
+static int rpc_get_station_status(int fd, uint32_t *status)
+{
+	struct buffer empty = {0};
+	struct buffer response = {0};
+
+	if (rpc_exchange(fd, RPC_WIFI_STA_GET_AP_INFO, &empty, &response) < 0)
+		return -1;
+	return response_status(&response, 1, status);
+}
+
+static bool station_is_disconnected(uint32_t status)
+{
+	return status == ESP_ERR_WIFI_NOT_CONNECT ||
+		status == ESP_ERR_WIFI_NOT_ASSOC;
+}
+
+static void print_station_state(const char *operation, const char *state,
+		uint32_t status)
+{
+	if (last_disconnect.seen) {
+		printf("MICRONUX:M6:NET:%s state=%s name=%s code=0x%04x "
+			"reason=%u rssi=%d\n", operation, state, NETWORK_DEVICE,
+			status, last_disconnect.reason, last_disconnect.rssi);
+	} else {
+		printf("MICRONUX:M6:NET:%s state=%s name=%s code=0x%04x\n",
+			operation, state, NETWORK_DEVICE, status);
+	}
+}
+
+static int command_status(void)
+{
+	uint32_t status;
+	int fd = open(SERIAL_DEVICE, O_RDWR | O_NONBLOCK);
+
+	if (fd < 0)
+		goto fail;
+	if (rpc_get_station_status(fd, &status) < 0)
+		goto fail;
+	close(fd);
+
+	if (status == 0) {
+		printf("MICRONUX:M6:NET:STATUS state=connected name=%s\n",
+			NETWORK_DEVICE);
+		return 0;
+	}
+	if (station_is_disconnected(status)) {
+		print_station_state("STATUS", "disconnected", status);
+		return 1;
+	}
+	print_station_state("STATUS", "unavailable", status);
+	return 1;
+
+fail:
+	if (fd >= 0)
+		close(fd);
+	fprintf(stderr, "micronux-netctl: status: %s\n", strerror(errno));
+	return 1;
+}
+
+static int command_wait(unsigned int timeout_seconds)
+{
+	uint32_t status = ESP_ERR_WIFI_NOT_CONNECT;
+	int64_t deadline_ms;
+	int64_t connected_since_ms = -1;
+	int fd = open(SERIAL_DEVICE, O_RDWR | O_NONBLOCK);
+
+	if (fd < 0)
+		goto fail;
+	deadline_ms = monotonic_ms();
+	if (deadline_ms < 0)
+		goto fail;
+	deadline_ms += (int64_t)timeout_seconds * 1000;
+
+	for (;;) {
+		struct timespec delay = {.tv_nsec = 250000000};
+		int timeout_ms;
+
+		if (rpc_get_station_status(fd, &status) < 0)
+			goto fail;
+		if (status == 0) {
+			int64_t now_ms = monotonic_ms();
+
+			if (now_ms < 0)
+				goto fail;
+			if (connected_since_ms < 0)
+				connected_since_ms = now_ms;
+			if (now_ms - connected_since_ms >= ASSOCIATION_STABLE_MS) {
+				close(fd);
+				printf("MICRONUX:M6:NET:WAIT state=connected name=%s "
+					"stable_ms=%d\n", NETWORK_DEVICE,
+					ASSOCIATION_STABLE_MS);
+				return 0;
+			}
+		} else {
+			connected_since_ms = -1;
+		}
+		if (status != 0 && !station_is_disconnected(status)) {
+			close(fd);
+			print_station_state("WAIT", "unavailable", status);
+			return 1;
+		}
+		timeout_ms = remaining_timeout_ms(deadline_ms);
+		if (timeout_ms <= 0) {
+			close(fd);
+			print_station_state("WAIT", "timeout", status);
+			return 1;
+		}
+		if (timeout_ms < 250) {
+			delay.tv_sec = 0;
+			delay.tv_nsec = (long)timeout_ms * 1000000L;
+		}
+		while (nanosleep(&delay, &delay) < 0) {
+			if (errno != EINTR)
+				goto fail;
+		}
+	}
+
+fail:
+	if (fd >= 0)
+		close(fd);
+	fprintf(stderr, "micronux-netctl: wait: %s\n", strerror(errno));
+	return 1;
+}
+
+static int parse_wait_seconds(const char *text, unsigned int *seconds)
+{
+	char *end;
+	unsigned long value;
+
+	errno = 0;
+	value = strtoul(text, &end, 10);
+	if (errno != 0 || *text == '\0' || *end != '\0' ||
+		value == 0 || value > 300) {
+		errno = EINVAL;
+		return -1;
+	}
+	*seconds = (unsigned int)value;
+	return 0;
+}
+
 static void usage(const char *program)
 {
 	fprintf(stderr,
 		"usage: %s mac\n"
 		"       %s up\n"
+		"       %s status\n"
+		"       %s wait [SECONDS]\n"
 		"       %s forget\n"
 		"       %s connect SSID [PASSWORD]\n",
-		program, program, program, program);
+		program, program, program, program, program, program);
 }
 
 int main(int argc, char **argv)
 {
+	unsigned int wait_seconds = 20;
+
 	if (argc == 2 && strcmp(argv[1], "mac") == 0)
 		return command_mac_or_up(false);
 	if (argc == 2 && strcmp(argv[1], "up") == 0)
 		return command_mac_or_up(true);
+	if (argc == 2 && strcmp(argv[1], "status") == 0)
+		return command_status();
+	if ((argc == 2 || argc == 3) && strcmp(argv[1], "wait") == 0) {
+		if (argc == 3 && parse_wait_seconds(argv[2], &wait_seconds) < 0) {
+			fprintf(stderr, "micronux-netctl: wait: %s\n",
+				strerror(errno));
+			return 64;
+		}
+		return command_wait(wait_seconds);
+	}
 	if (argc == 2 && strcmp(argv[1], "forget") == 0)
 		return command_forget();
 	if ((argc == 3 || argc == 4) && strcmp(argv[1], "connect") == 0)

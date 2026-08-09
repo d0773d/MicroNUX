@@ -184,17 +184,25 @@ the C6 and prepares SDIO slot 1 at 20 MHz; Linux discovers these two functions:
 ```sh
 micronux-netctl mac
 micronux-netctl up
+micronux-netctl status
+micronux-netctl wait 20
 micronux-netctl forget
 micronux-netctl connect "SSID" "PASSWORD"
+micronux-online
 ```
 
 `up` initializes station mode through `/dev/esps0`, reads the C6 MAC, assigns
 it to `ethsta0`, starts Wi-Fi, requests association using the configuration
 already stored in C6 NVS, and raises the Linux interface. It never receives a
-password from the loader. The pserial reader consumes each TLV at its declared
-length and ignores asynchronous `RPCEvt` frames or unrelated responses while
-waiting for the matching RPC message ID and UID. One absolute 10-second
-deadline bounds the exchange even if events continue arriving. `forget`
+password from the loader, and it does not wait for association or DHCP.
+`status` queries the C6's station association directly through
+`esp_wifi_sta_get_ap_info()` rather than treating Linux `LOWER_UP` as evidence
+of connectivity. `wait` polls that state and requires two continuous seconds
+of association before succeeding. The pserial reader consumes each TLV at its
+declared length, decodes `StaDisconnected` events, and ignores unrelated event
+or response frames while waiting for the matching RPC message ID and UID. One
+absolute 10-second deadline bounds each exchange even if events continue
+arriving. `forget`
 invokes the factory firmware's
 `esp_wifi_restore()` RPC and requires a P4 reboot; this deliberately erases the
 C6's saved Wi-Fi configuration so the provisioning loader will advertise on
@@ -205,6 +213,19 @@ test network rather than a valuable credential.
 
 The start/connect separation and restore behavior follow the
 [ESP-IDF 6.0 ESP32-C6 Wi-Fi API](https://docs.espressif.com/projects/esp-idf/en/v6.0/esp32c6/api-reference/network/esp_wifi.html).
+After `up`, Linux obtains and applies a lease with:
+
+```sh
+udhcpc -f -q -n -i ethsta0 -s /usr/share/udhcpc/default.script -t 5 -T 2
+```
+
+The network profile enables Linux packet sockets for the DHCP raw-packet path
+and includes the five BusyBox applets used by Buildroot's lease hook: `touch`,
+`mktemp`, `rm`, `ifconfig`, and `route`. `micronux-online` combines these
+pieces into a foreground recovery command: it retries the full saved-credential
+association and DHCP sequence up to three times with a two-second delay. It is
+never launched automatically, so a missing access point cannot hold up the
+MicroNUX shell.
 
 Build, flash, and run the three-boot hardware gate with:
 
@@ -212,20 +233,47 @@ Build, flash, and run the three-boot hardware gate with:
 .\scripts\m6-network.ps1 -Port COM14 -Boots 3
 ```
 
+The stricter online gate uses the same flash artifact and reset harness, then
+also requires a lease, default route, external IPv4, and DNS on every boot:
+
+```powershell
+C:\Espressif\python_env\idf6.0_py3.11_env\Scripts\python.exe scripts\m6-network-test.py --port COM14 --boots 3 --timeout 180 --artifact-dir out\m6-network --online
+```
+
 On the connected board, all three boots reported factory firmware `2.11.5`,
 the two identities above, stable MAC `b0:a6:04:8a:d3:78`, and final
 `UP,LOWER_UP`. After the stream-parser correction, all three independent
 ROM-reset boots also returned `MICRONUX:M6:NET:UP:RC=0`; no asynchronous event
 was misidentified as the RPC response. The current P4 kernel image, including
-saved-credential connect and explicit forget support, has SHA-256
-`ce642d669f4f3b4cdf727ce984b8c69da68115382cbbd0f2c64638ecc014c8ac`;
+saved-credential connect, status/wait, and bounded recovery support, is
+5,325,288 bytes with SHA-256
+`5656d34d384b835f2340745da11cd27dd1f06eb78f352f970da1add39d7ccd95`;
 the DTB SHA-256 was
-`08f814249e0c776d6bc26f92d3185d216220be2af1936599d78f97b15d2ced20`.
+`08f814249e0c776d6bc26f92d3185d216220be2af1936599d78f97b15d2ced20`,
+the metadata SHA-256 was
+`5d470eb378f859cd294630b57a1337f8baf86f577d6d539867efa5d64139f074`,
+and the embedded rootfs SHA-256 was
+`a1afcf8c27286f7c594f7e0188b21cb68193c6e40c65585483429519238444e2`.
 On the first saved-credential test, the C6 contained a pre-existing
 `AP-5GHz` configuration. The loader correctly skipped onboarding and Linux
 successfully issued the connect RPC, but DHCP received no lease. That stored
 network is therefore not accepted as an association/DHCP result. The C6
-factory flash was not rewritten.
+configuration was then cleared through `micronux-netctl forget`. The
+Espressif Android app completed a BLE Security 2 session, the loader reported
+`credentials=received`, `credentials=accepted storage=c6-nvs`, and restarted
+the P4. The next boot reported `state=provisioned action=linux-handoff`.
+Linux requested association without receiving the password, obtained
+`192.168.0.47/24` from DHCP with default route `192.168.0.1`, reached
+`1.1.1.1`, installed the DHCP resolvers, and resolved and reached
+`example.com`.
+
+The final `--online` gate passed three more independent ROM-reset boots. Boot
+2 reached the network on its first attempt. Boots 1 and 3 exercised the retry
+path and recovered on attempt 3 after C6 disconnect events including reason
+201 (`NO_AP_FOUND`) and reason 205 (`CONNECTION_FAIL`). Every boot ended with
+an IPv4 lease, default route, successful `1.1.1.1` ping, and successful DNS and
+`example.com` ping. Only the P4 Linux, DTB, and metadata partitions were
+written; the provisioning loader, C6 firmware, and C6 NVS were not rewritten.
 
 ### P4-hosted phone provisioning
 
@@ -245,8 +293,8 @@ The boot flow is deliberately bounded:
    An attached phone keeps its window alive, with a five-minute hard limit per
    transport. A BLE setup error falls back directly to SoftAP.
 4. The official Espressif provisioning app sends credentials inside an SRP6a
-   authenticated, AES-GCM protected session. MicroNUX never logs the SSID or
-   password.
+   authenticated, AES-GCM protected session. MicroNUX provisioning markers
+   redact the SSID and password, and project code never prints the password.
 5. Wi-Fi Remote stores the station configuration in C6 NVS. MicroNUX stops the
    provisioning manager, disables the remote Bluetooth controller, tears down
    SDIO ownership, scrubs the in-memory proof, and restarts the P4.
@@ -288,11 +336,11 @@ ESP32-P4 project image; it contains no C6 binary or C6 flashing command. The
 profile compiles under ESP-IDF v6.0.1 and produces a `0xf7610`-byte loader,
 leaving `0xf89f0` bytes free in the existing `0x1f0000` factory partition.
 The profile was flashed to the connected ESP32-P4 revision 1.3 and booted with
-the factory C6 firmware `2.11.5`. It detected the pre-existing C6-NVS station
-configuration, emitted `state=provisioned action=linux-handoff`, released
-ESP-Hosted, and booted Linux without waiting for association or DHCP. Fresh
-phone provisioning remains an explicit hardware acceptance gate; executing
-`micronux-netctl forget` and rebooting will enter that path.
+the factory C6 firmware `2.11.5`. Both the bounded BLE-to-SoftAP idle-timeout
+path and fresh BLE phone onboarding were exercised physically. Successful
+onboarding stored the Wi-Fi configuration in C6 NVS, restarted the P4, and
+produced the provisioned Linux handoff described above without modifying C6
+firmware.
 
 API and protocol choices follow the official
 [ESP-IDF provisioning guide](https://docs.espressif.com/projects/esp-idf/en/v6.0/esp32p4/api-reference/provisioning/index.html),
