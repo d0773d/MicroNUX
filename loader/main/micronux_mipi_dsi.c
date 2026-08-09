@@ -80,7 +80,7 @@ static esp_err_t probe_display_adapter(void)
 #if !CONFIG_MICRONUX_MIPI_PANEL_UNSELECTED
 
 #if CONFIG_MICRONUX_MIPI_PANEL_JD9365_800_1280
-#include "esp_lcd_jd9365.h"
+#include "esp_lcd_jd9365_10_1.h"
 #elif CONFIG_MICRONUX_MIPI_PANEL_ILI9881C_720_1280
 #include "esp_lcd_ili9881c.h"
 #elif CONFIG_MICRONUX_MIPI_PANEL_HX8394_720_1280

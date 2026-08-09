@@ -1,5 +1,19 @@
 menu "MicroNUX loader profile"
 
+    config MICRONUX_M7_EARLY_UMODE_DENY
+        bool "Install the M7 pre-v3 U-mode deny PMP baseline"
+        depends on IDF_TARGET_ESP32P4
+        depends on ESP32P4_SELECTS_REV_LESS_V3
+        depends on !ESP_SYSTEM_MEMPROT
+        default n
+        help
+            Select only with the tracked MicroNUX ESP-IDF v6.0.1 patch.
+            Before app_main(), CPU-control, internal RAM, ROM/flash, LP-memory,
+            and peripheral regions become unlocked PMP deny entries. M-mode
+            remains able to access them, while entries 7-10 stay free for the
+            Linux U-return overlay. The loader audits all 16 entries and
+            refuses handoff on any mismatch.
+
     config MICRONUX_C6_SDIO_PROFILE
         bool "Prepare ESP32-C6 SDIO slot 1 instead of microSD slot 0"
         default n
@@ -38,7 +52,7 @@ menu "MicroNUX loader profile"
             show the ESP32-P4 hardware vertical color-bar pattern before the
             Linux handoff. The scanout buffer stays in the loader-owned PSRAM
             reservation; this option does not grant Linux framebuffer
-            ownership. Leave disabled until the attached panel label is known.
+            ownership. Select only the exact attached panel profile.
 
     config MICRONUX_MIPI_DSI_PROBE
         bool "Probe for a MIPI display adapter without powering the panel"
@@ -66,7 +80,7 @@ menu "MicroNUX loader profile"
                 bool "No panel selected (refuse to power display)"
 
             config MICRONUX_MIPI_PANEL_JD9365_800_1280
-                bool "JD9365 800x1280 (8/10.1-inch DSI Touch A)"
+                bool "JD9365 800x1280 (10.1-DSI-TOUCH-A, Kit C)"
 
             config MICRONUX_MIPI_PANEL_ILI9881C_720_1280
                 bool "ILI9881C 720x1280 (7-inch DSI Touch A)"

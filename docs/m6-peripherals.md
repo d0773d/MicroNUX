@@ -1,7 +1,7 @@
 # M6 Storage and Peripheral Bring-up
 
-Status: **simultaneous microSD and ESP32-C6 networking stable; MIPI electrical
-proof implemented and awaiting exact-panel identification**
+Status: **simultaneous microSD and ESP32-C6 networking stable; physical Kit C
+JD9365 loader scanout proven; Linux display ownership pending**
 
 M6 starts with the Waveshare board's onboard microSD interface. Storage can be
 isolated from the minimal USB console and from the ESP32-C6 wireless transport,
@@ -462,21 +462,30 @@ profile so the diagnostic does not replace the M6 baseline:
 .\scripts\m6-mipi.ps1 -Panel jd9365
 ```
 
-Flashing requires two explicit switches after verifying the controller on the
-panel or adapter label:
+Kit C fixes the attached profile to Waveshare's 10.1-inch JD9365 panel.
+Flashing still requires two explicit switches:
 
 ```powershell
 .\scripts\m6-mipi.ps1 -Panel jd9365 -Port COM14 -Flash -ConfirmExactPanel
+py -3 scripts\m6-combined-test.py --port COM14 --boots 3 --timeout 420 --artifact-dir out\m6-combined --expect-mipi-profile jd9365
 ```
 
-Normal storage and networking loaders compile with MIPI disabled and now must
-emit `MICRONUX:M6:DSI state=disabled reason=profile-off` at the hardware gate.
+The exact Kit C loader was flashed on revision-1.3 hardware. It read panel ID
+`93 65 04`, reported the stable marker below, and the physical panel visibly
+showed vertical color bars:
+
+```text
+MICRONUX:M6:DSI state=ready profile=jd9365-800x1280 resolution=800x1280 lanes=2 lane_mbps=1500 format=rgb565 pattern=vertical-bars
+```
+
+Normal storage and networking loaders compile with MIPI disabled and must emit
+`MICRONUX:M6:DSI state=disabled reason=profile-off` at the hardware gate.
 Enabling DSI with the Kconfig `unselected` choice fails before any display rail,
-D-PHY, or backlight is powered. No selected profile has been flashed because
-the attached panel controller has not yet been identified.
+D-PHY, or backlight is powered.
 
 The framebuffer is RGB565 and must fit entirely in the loader-owned PSRAM
 reservation `[0x48000000,0x48400000)`, which Linux already excludes. This is
 an electrical and timing proof only: it is not an emulator, Linux framebuffer,
-terminal, or DRM/KMS driver. M6-D1 will prove persistent scanout ownership on
-the identified physical panel; M6-D2 can then evaluate a minimal Linux console.
+terminal, or DRM/KMS driver. M6-D0 is now physically complete. M6-D1 will move
+persistent scanout and backlight ownership into Linux; M6-D2 can then evaluate
+a minimal Linux console.

@@ -95,7 +95,7 @@ free from a 20,400 KiB baseline.
 
 ## M6 - Storage, networking, and peripherals
 
-Status: **in progress**
+Status: **storage/network complete; loader display proof complete; Linux display pending**
 
 - Add storage only after its pin mux and DMA behavior are frozen.
 - Integrate ESP32-C6 networking through a narrow, documented transport.
@@ -125,12 +125,15 @@ factory C6's true association state, and the explicit `micronux-online` command
 retries association and DHCP up to ten times with a five-second inter-attempt
 cooldown without making shell boot wait on Wi-Fi. The combined gates
 reproduced the router's reconnect holdoff and recovered as late as attempt 7.
-MIPI-D0 has four compiled
-exact-controller color-bar profiles behind a default-off power gate. Physical
-display verification waits for the attached panel label, after which scanout
-ownership and a Linux console remain separate acceptance gates.
+MIPI-D0 has four compiled exact-controller color-bar profiles behind a
+default-off power gate. Kit C was identified as the 10.1-inch JD9365 panel;
+the exact profile read ID `93 65 04` and produced visible vertical bars at
+800x1280 over two 1500-Mbps lanes. Scanout is still loader-owned. Persistent
+Linux scanout, backlight ownership, and a Linux console remain separate gates.
 
 ## M7 - Isolation, SMP, and upstream evaluation
+
+Status: **in progress; early U-mode deny proven, kernel containment not yet claimed**
 
 - Use PMP to protect critical kernel, loader, and coprocessor regions where
   practical.
@@ -140,6 +143,14 @@ ownership and a Linux console remain separate acceptance gates.
 
 Exit criterion: decide, from measurements, which isolation, SMP, and upstream
 paths MicroNUX will support.
+
+Current artifact: [M7 user/kernel isolation results](m7-user-kernel-isolation.md).
+The version-pinned ESP-IDF v6.0.1 early-PMP patch and loader audit passed three
+independent hardware resets on revision 1.3 while the unchanged Linux image,
+bFLT 4 MiB stress, and device service remained operational. This removes
+unintended U-mode grants outside Linux RAM, but the broad Linux RWX handoff
+window still exposes the kernel until the dedicated user pool, lower-priority
+PMP overlay, and fail-closed `access_ok()` work pass their destructive gates.
 
 ## M8 - Linux device services and applications
 

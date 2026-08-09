@@ -11,7 +11,8 @@ desktop Linux compatibility or MMU-backed process isolation.
 ## Current status
 
 Milestones M0 through M5 and the M8 device-service ABI v1 slice are complete;
-M6 remains open for display work. The pinned `rv32imac`/`ilp32` NOMMU
+M6 now has a physical loader-owned display proof, while Linux-owned display
+scanout remains open. The pinned `rv32imac`/`ilp32` NOMMU
 image boots a reduced BusyBox bFLT shell with 32 MiB RAM under QEMU. On the
 physical ESP32-P4 revision 1.3, the M3 loader validates and loads Linux and its
 device tree from flash, installs an exact PMP memory window, and hands off to a
@@ -42,9 +43,11 @@ combined image runs microSD slot 0 and C6 SDIO slot 1 simultaneously under
 Linux-serialized controller ownership. Its clean candidate passed 20-cycle
 and 120-cycle concurrent storage/network soaks and three independent ROM-reset
 boots with an unchanged SD hash, recovering from router reconnect holdoff as
-late as attempt 7. No C6 firmware is built or flashed. Four exact MIPI-DSI
-controller profiles compile behind a default-off power-safety gate; physical
-color-bar verification awaits the attached panel's controller label. On
+late as attempt 7. No C6 firmware is built or flashed. The Kit C display is
+the Waveshare 10.1-inch JD9365 panel: its exact 800x1280, two-lane,
+1500-Mbps/lane profile read panel ID `93 65 04` and displayed vertical color
+bars on the physical panel at 25% backlight. That is a loader diagnostic, not
+yet a Linux framebuffer or console. On
 revision 1.3, USB status is serviced once per kernel tick and every userspace
 return uses a two-stage CLIC `mret` sequence so task switches cannot retain an
 active interrupt level. Linux now also exposes the local, versioned
@@ -82,6 +85,7 @@ userspace image and workload.
 - [M4 ESP32-P4 hardware shell](docs/m4-shell.md)
 - [M5 NOMMU hardening and stress gate](docs/m5-hardening.md)
 - [M6 storage and peripheral bring-up](docs/m6-peripherals.md)
+- [M7 user/kernel isolation results](docs/m7-user-kernel-isolation.md)
 - [M8 Linux device service and application ABI](docs/m8-device-services.md)
 
 ## Project policy

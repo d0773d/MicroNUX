@@ -27,5 +27,8 @@ idf_component_register(
 # backlight writes. MicroNUX wraps that legacy helper only while a constructor
 # runs, then owns the adapter power/backlight sequence itself.
 target_link_libraries(${COMPONENT_LIB} INTERFACE
+    "-Wl,--wrap=i2c_bus_create"
+    "-Wl,--wrap=i2c_bus_device_create"
+    "-Wl,--wrap=i2c_bus_device_delete"
     "-Wl,--wrap=i2c_bus_write_bytes"
 )

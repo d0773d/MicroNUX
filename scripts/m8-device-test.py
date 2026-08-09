@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import subprocess
 import sys
 import time
@@ -166,14 +167,28 @@ def capture(port: str, timeout: float) -> str:
         device.close()
 
 
-def artifact_digest(directory: Path) -> str:
+def artifact_digest(directory: Path) -> tuple[str, tuple[str, str]]:
     records = []
+    digests: dict[str, str] = {}
     for name in ("Image", "esp32p4-micronux.dtb", "metadata.bin", "rootfs.cpio"):
         path = directory / name
         if not path.is_file():
             raise FileNotFoundError(path)
-        records.append(f"{name}={path.stat().st_size}B:{hashlib.sha256(path.read_bytes()).hexdigest()}")
-    return " ".join(records)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        digests[name] = digest
+        records.append(f"{name}={path.stat().st_size}B:{digest}")
+    return " ".join(records), (
+        digests["Image"],
+        digests["esp32p4-micronux.dtb"],
+    )
+
+
+def payload_hashes(log: str) -> tuple[str, str]:
+    kernel = re.search(r"MICRONUX:M3:KERNEL .* sha256=([0-9a-f]{64})", log)
+    dtb = re.search(r"MICRONUX:M3:DTB .* sha256=([0-9a-f]{64})", log)
+    if kernel is None or dtb is None:
+        raise ValueError("boot did not report payload hashes")
+    return kernel.group(1), dtb.group(1)
 
 
 def main() -> int:
@@ -182,10 +197,16 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--artifact-dir", type=Path, required=True)
     parser.add_argument("--log", type=Path)
+    parser.add_argument("--expect-m7-early-deny", action="store_true")
+    parser.add_argument(
+        "--expect-mipi-profile",
+        choices=("jd9365",),
+        help="require the exact Kit C loader scanout profile",
+    )
     args = parser.parse_args()
 
     try:
-        artifacts = artifact_digest(args.artifact_dir.resolve())
+        artifacts, artifact_payload = artifact_digest(args.artifact_dir.resolve())
         log = capture(args.port, args.timeout)
     except (OSError, subprocess.CalledProcessError) as error:
         print(error, file=sys.stderr)
@@ -195,7 +216,33 @@ def main() -> int:
         args.log.write_text(log, encoding="utf-8")
 
     missing = [marker for marker in REQUIRED_MARKERS if not marker_seen(log, marker)]
+    if args.expect_m7_early_deny and not marker_seen(
+        log,
+        "MICRONUX:M7:PMP baseline=pass early-deny=pass overlay=7-10-free",
+    ):
+        missing.append(
+            "MICRONUX:M7:PMP baseline=pass early-deny=pass overlay=7-10-free"
+        )
+    if args.expect_mipi_profile == "jd9365" and not marker_seen(
+        log,
+        "MICRONUX:M6:DSI state=ready profile=jd9365-800x1280 "
+        "resolution=800x1280 lanes=2 lane_mbps=1500 format=rgb565 "
+        "pattern=vertical-bars",
+    ):
+        missing.append("MICRONUX:M6:DSI exact Kit C JD9365 profile")
     forbidden = [marker for marker in FORBIDDEN_MARKERS if marker_seen(log, marker)]
+    try:
+        booted_payload = payload_hashes(log)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 1
+    if booted_payload != artifact_payload:
+        print(
+            f"booted payload {booted_payload} does not match artifacts "
+            f"{artifact_payload}",
+            file=sys.stderr,
+        )
+        return 1
     print("\n".join(line for line in output_lines(log) if "MICRONUX:M8:" in line))
     if missing or forbidden:
         print("--- complete serial log ---", file=sys.stderr)

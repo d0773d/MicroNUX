@@ -65,9 +65,16 @@
 
 #define MICRONUX_PMP_LOWER_BOUND_ENTRY 13
 #define MICRONUX_PMP_LINUX_ENTRY 14
+#define MICRONUX_PMP_ENTRY_COUNT 16
 #define MICRONUX_PMP_LOWER_BOUND_CONFIG PMP_L
 #define MICRONUX_PMP_LINUX_CONFIG \
     (PMP_L | PMP_TOR | PMP_R | PMP_W | PMP_X)
+
+#if CONFIG_MICRONUX_M7_EARLY_UMODE_DENY
+#define MICRONUX_PMP_DENY_NAPOT_CONFIG PMP_NAPOT
+#define MICRONUX_PMP_DENY_TOR_CONFIG PMP_TOR
+#define MICRONUX_PMP_DENY_OFF_CONFIG UINT32_C(0)
+#endif
 
 #define ESP32P4_CLIC_CONFIG UINT32_C(0x20800000)
 #define ESP32P4_CLIC_THRESHOLD UINT32_C(0x20800008)
@@ -507,6 +514,92 @@ static void prepare_sdmmc_for_linux(void)
     }
 }
 
+#define MICRONUX_LOG_PMP_ENTRY(phase, entry)                              \
+    ESP_LOGI(TAG,                                                         \
+             "MICRONUX:M7:PMP phase=%s entry=%u addr=%08" PRIx32         \
+             " config=%02" PRIx32,                                      \
+             phase, (unsigned int)(entry), PMP_ENTRY_ADDR_READ(entry),    \
+             PMP_ENTRY_CFG_READ(entry))
+
+static void log_pmp_entries(const char *phase)
+{
+    /* PMP CSR numbers are instruction immediates, so the reads stay unrolled. */
+    MICRONUX_LOG_PMP_ENTRY(phase, 0);
+    MICRONUX_LOG_PMP_ENTRY(phase, 1);
+    MICRONUX_LOG_PMP_ENTRY(phase, 2);
+    MICRONUX_LOG_PMP_ENTRY(phase, 3);
+    MICRONUX_LOG_PMP_ENTRY(phase, 4);
+    MICRONUX_LOG_PMP_ENTRY(phase, 5);
+    MICRONUX_LOG_PMP_ENTRY(phase, 6);
+    MICRONUX_LOG_PMP_ENTRY(phase, 7);
+    MICRONUX_LOG_PMP_ENTRY(phase, 8);
+    MICRONUX_LOG_PMP_ENTRY(phase, 9);
+    MICRONUX_LOG_PMP_ENTRY(phase, 10);
+    MICRONUX_LOG_PMP_ENTRY(phase, 11);
+    MICRONUX_LOG_PMP_ENTRY(phase, 12);
+    MICRONUX_LOG_PMP_ENTRY(phase, 13);
+    MICRONUX_LOG_PMP_ENTRY(phase, 14);
+    MICRONUX_LOG_PMP_ENTRY(phase, 15);
+    ESP_LOGI(TAG, "MICRONUX:M7:PMP-DUMP phase=%s entries=%u",
+             phase, (unsigned int)MICRONUX_PMP_ENTRY_COUNT);
+}
+
+#if CONFIG_MICRONUX_M7_EARLY_UMODE_DENY
+#define MICRONUX_AUDIT_PMP_ENTRY(entry, address, config)                  \
+    do {                                                                 \
+        if (PMP_ENTRY_ADDR_READ(entry) != (address) ||                    \
+            PMP_ENTRY_CFG_READ(entry) != (config)) {                     \
+            ESP_LOGE(TAG,                                                 \
+                     "MICRONUX:M7:PMP-AUDIT state=fail entry=%u"         \
+                     " expected_addr=%08" PRIx32                         \
+                     " actual_addr=%08" PRIx32                           \
+                     " expected_config=%02" PRIx32                       \
+                     " actual_config=%02" PRIx32,                        \
+                     (unsigned int)(entry), (uint32_t)(address),          \
+                     PMP_ENTRY_ADDR_READ(entry), (uint32_t)(config),      \
+                     PMP_ENTRY_CFG_READ(entry));                          \
+            fail("m7-pmp-audit");                                       \
+        }                                                                \
+    } while (0)
+
+static void audit_m7_early_pmp(bool linux_window_installed)
+{
+    MICRONUX_AUDIT_PMP_ENTRY(0, UINT32_C(0x27fffffc),
+                             MICRONUX_PMP_DENY_NAPOT_CONFIG);
+    MICRONUX_AUDIT_PMP_ENTRY(1, UINT32_C(0x3ff0fffc),
+                             MICRONUX_PMP_DENY_NAPOT_CONFIG);
+    MICRONUX_AUDIT_PMP_ENTRY(2, UINT32_C(0x4fc0fffc),
+                             MICRONUX_PMP_DENY_NAPOT_CONFIG);
+    MICRONUX_AUDIT_PMP_ENTRY(3, UINT32_C(0x4ff00000),
+                             MICRONUX_PMP_DENY_OFF_CONFIG);
+    MICRONUX_AUDIT_PMP_ENTRY(4, UINT32_C(0x4ffc0000),
+                             MICRONUX_PMP_DENY_TOR_CONFIG);
+    MICRONUX_AUDIT_PMP_ENTRY(5, UINT32_C(0), UINT32_C(0));
+    MICRONUX_AUDIT_PMP_ENTRY(6, UINT32_C(0x41fffffc),
+                             MICRONUX_PMP_DENY_NAPOT_CONFIG);
+    MICRONUX_AUDIT_PMP_ENTRY(7, UINT32_C(0), UINT32_C(0));
+    MICRONUX_AUDIT_PMP_ENTRY(8, UINT32_C(0), UINT32_C(0));
+    MICRONUX_AUDIT_PMP_ENTRY(9, UINT32_C(0), UINT32_C(0));
+    MICRONUX_AUDIT_PMP_ENTRY(10, UINT32_C(0), UINT32_C(0));
+    MICRONUX_AUDIT_PMP_ENTRY(11, UINT32_C(0x5010bffc),
+                             MICRONUX_PMP_DENY_NAPOT_CONFIG);
+    MICRONUX_AUDIT_PMP_ENTRY(12, UINT32_C(0), UINT32_C(0));
+    MICRONUX_AUDIT_PMP_ENTRY(13,
+                             linux_window_installed ?
+                                 MICRONUX_KERNEL_VADDR : UINT32_C(0),
+                             linux_window_installed ?
+                                 MICRONUX_PMP_LOWER_BOUND_CONFIG :
+                                 UINT32_C(0));
+    MICRONUX_AUDIT_PMP_ENTRY(14,
+                             linux_window_installed ?
+                                 MICRONUX_COMMS_VADDR : UINT32_C(0),
+                             linux_window_installed ?
+                                 MICRONUX_PMP_LINUX_CONFIG : UINT32_C(0));
+    MICRONUX_AUDIT_PMP_ENTRY(15, UINT32_C(0x5007fffc),
+                             MICRONUX_PMP_DENY_NAPOT_CONFIG);
+}
+#endif
+
 static void prepare_pmp_for_linux(void)
 {
     /*
@@ -516,6 +609,11 @@ static void prepare_pmp_for_linux(void)
      * U-mode contract deterministic: loader and comms reserves remain out of
      * reach while NOMMU Linux receives the RWX memory it requires.
      */
+    log_pmp_entries("pre");
+#if CONFIG_MICRONUX_M7_EARLY_UMODE_DENY
+    audit_m7_early_pmp(false);
+#endif
+
     PMP_RESET_AND_ENTRY_SET(MICRONUX_PMP_LOWER_BOUND_ENTRY,
                             MICRONUX_KERNEL_VADDR,
                             MICRONUX_PMP_LOWER_BOUND_CONFIG);
@@ -544,6 +642,14 @@ static void prepare_pmp_for_linux(void)
              ",%08" PRIx32 ") config=%02" PRIx32,
              MICRONUX_PMP_LOWER_BOUND_ENTRY, MICRONUX_PMP_LINUX_ENTRY,
              lower_address, linux_address, linux_config);
+#if CONFIG_MICRONUX_M7_EARLY_UMODE_DENY
+    audit_m7_early_pmp(true);
+    ESP_LOGI(TAG,
+             "MICRONUX:M7:PMP baseline=pass early-deny=pass"
+             " overlay=7-10-free linux=[%08" PRIx32 ",%08" PRIx32 ")",
+             MICRONUX_KERNEL_VADDR, MICRONUX_COMMS_VADDR);
+#endif
+    log_pmp_entries("post");
 }
 
 void app_main(void)

@@ -208,15 +208,20 @@ def capture_boot(port: str, timeout: float, write_test: bool, soak_cycles: int) 
         device.close()
 
 
-def artifact_record(directory: Path) -> str:
+def artifact_record(directory: Path) -> tuple[str, tuple[str, str]]:
     entries = []
+    digests: dict[str, str] = {}
     for name in ("Image", "esp32p4-micronux.dtb", "metadata.bin", "rootfs.cpio"):
         path = directory / name
         if not path.is_file():
             raise FileNotFoundError(f"missing M6 combined artifact: {path}")
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        digests[name] = digest
         entries.append(f"{name}={path.stat().st_size}B:{digest}")
-    return " ".join(entries)
+    return " ".join(entries), (
+        digests["Image"],
+        digests["esp32p4-micronux.dtb"],
+    )
 
 
 def payload_hashes(log: str) -> tuple[str, str]:
@@ -285,10 +290,16 @@ def main() -> int:
     parser.add_argument("--artifact-dir", type=Path, required=True)
     parser.add_argument("--write-test", action="store_true")
     parser.add_argument("--soak-cycles", type=int, default=0)
-    parser.add_argument(
+    mipi_expectation = parser.add_mutually_exclusive_group()
+    mipi_expectation.add_argument(
         "--expect-mipi-adapter",
         choices=("present", "absent"),
         help="accept the read-only MIPI attachment-probe loader and require this result",
+    )
+    mipi_expectation.add_argument(
+        "--expect-mipi-profile",
+        choices=("jd9365",),
+        help="require the exact Kit C JD9365 scanout profile",
     )
     args = parser.parse_args()
     if args.boots < 1:
@@ -301,7 +312,7 @@ def main() -> int:
         parser.error("--soak-cycles requires --boots 1")
 
     try:
-        artifacts = artifact_record(args.artifact_dir.resolve())
+        artifacts, artifact_payload = artifact_record(args.artifact_dir.resolve())
     except OSError as error:
         print(error, file=sys.stderr)
         return 1
@@ -315,14 +326,19 @@ def main() -> int:
         print(f"--- M6 combined boot {boot}/{args.boots} ---")
         print("\n".join(milestone_lines(log)) or "(no combined milestones captured)")
 
-        display_marker = (
-            "MICRONUX:M6:DSI state=disabled reason=profile-off"
-            if args.expect_mipi_adapter is None
-            else (
+        if args.expect_mipi_profile == "jd9365":
+            display_marker = (
+                "MICRONUX:M6:DSI state=ready profile=jd9365-800x1280 "
+                "resolution=800x1280 lanes=2 lane_mbps=1500 format=rgb565 "
+                "pattern=vertical-bars"
+            )
+        elif args.expect_mipi_adapter is not None:
+            display_marker = (
                 "MICRONUX:M6:DSI state=probe "
                 f"adapter={args.expect_mipi_adapter} address=0x45"
             )
-        )
+        else:
+            display_marker = "MICRONUX:M6:DSI state=disabled reason=profile-off"
         missing = [marker for marker in REQUIRED_MARKERS if not marker_seen(log, marker)]
         if not marker_seen(log, display_marker):
             missing.append(display_marker)
@@ -352,6 +368,14 @@ def main() -> int:
             sample, _, _ = sample_hashes(log)
         except ValueError as error:
             print(f"combined boot {boot}: {error}", file=sys.stderr)
+            return 1
+
+        if payload != artifact_payload:
+            print(
+                f"combined boot {boot}: booted payload {payload} does not match "
+                f"artifacts {artifact_payload}",
+                file=sys.stderr,
+            )
             return 1
 
         if expected_payload is None:

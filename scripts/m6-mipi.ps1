@@ -88,7 +88,10 @@ if ($symbols -notmatch "micronux_panel_guard_begin" -or
     throw "MIPI safety guard is missing from the linked image."
 }
 if ($profile -ne "ek79007" -and
-    $symbols -notmatch "__wrap_i2c_bus_write_bytes") {
+    ($symbols -notmatch "__wrap_i2c_bus_create" -or
+     $symbols -notmatch "__wrap_i2c_bus_device_create" -or
+     $symbols -notmatch "__wrap_i2c_bus_device_delete" -or
+     $symbols -notmatch "__wrap_i2c_bus_write_bytes")) {
     throw "Vendor backlight writes are not redirected through the safety guard."
 }
 $image = Get-Item -LiteralPath $imagePath
