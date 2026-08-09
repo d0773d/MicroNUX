@@ -1,0 +1,36 @@
+#!/bin/sh
+
+if ! /bin/busybox mount -t devtmpfs devtmpfs /dev; then
+	echo 'MICRONUX:M6:COMBINED:FAIL devtmpfs-mount'
+	exit 1
+fi
+if ! /bin/busybox mount -t proc proc /proc; then
+	echo 'MICRONUX:M6:COMBINED:FAIL proc-mount'
+	exit 1
+fi
+if ! /bin/busybox mount -t sysfs sysfs /sys; then
+	echo 'MICRONUX:M6:COMBINED:FAIL sysfs-mount'
+	exit 1
+fi
+
+export HOME=/root
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PS1='micronux# '
+
+echo 'MICRONUX:M6:COMBINED:DRIVER storage=microsd-slot0 network=c6-sdio-slot1 arbitration=serialized'
+/bin/busybox sleep 5
+if [ -b /dev/mmcblk0 ]; then
+	echo 'MICRONUX:M6:COMBINED:STORAGE state=ready name=mmcblk0'
+else
+	echo 'MICRONUX:M6:COMBINED:STORAGE state=missing name=mmcblk0'
+fi
+if [ -d /sys/class/net/ethsta0 ]; then
+	echo 'MICRONUX:M6:COMBINED:IFACE state=ready name=ethsta0'
+	/bin/busybox ip link show ethsta0
+else
+	echo 'MICRONUX:M6:COMBINED:IFACE state=missing name=ethsta0'
+fi
+
+echo 'MICRONUX:M6:COMBINED:SHELL ready console=ttyGS0 network=nonblocking'
+exec /bin/busybox setsid /bin/busybox cttyhack /bin/busybox sh -i \
+	</dev/ttyGS0 >/dev/ttyGS0 2>&1

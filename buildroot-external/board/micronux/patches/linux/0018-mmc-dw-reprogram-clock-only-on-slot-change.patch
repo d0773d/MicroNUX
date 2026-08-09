@@ -1,0 +1,47 @@
+From bdd1276f3958b17dd40c036e60d476383c7e08b2 Mon Sep 17 00:00:00 2001
+From: MicroNUX contributors <micronux@users.noreply.github.com>
+Date: Sun, 9 Aug 2026 05:20:00 -0700
+Subject: [PATCH] mmc: dw: reprogram clock only on slot change
+
+Dual-slot arbitration forced a full clock reinitialization before every
+request.  The ESP32-P4 sequence disables the card clock and sends three
+update-clock commands, so a 4 KiB block workload repeated that sequence tens
+of thousands of times even while consecutive requests remained on the same
+slot.  Under concurrent SD and SDIO traffic the controller eventually wedged
+inside a later slot-0 request.
+
+Remember whether arbitration actually selected a different slot.  Continue
+calling the common setup helper for every request so it can maintain the bus
+width, but force the clock command sequence only when the physical slot
+changes.  A frequency change on the same slot is still handled by the
+helper's normal clock comparison.
+
+Signed-off-by: MicroNUX contributors <micronux@users.noreply.github.com>
+---
+ drivers/mmc/host/dw_mmc.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -1460,6 +1460,7 @@ static void __dw_mci_start_request(struct dw_mci *host,
+ 	struct mmc_request *mrq;
+ 	struct mmc_data	*data;
+ 	u32 cmdflags;
++	bool slot_changed;
+ 
+ 	if (host->multi_slot) {
+ 		host->request_seq++;
+@@ -1467,8 +1468,9 @@ static void __dw_mci_start_request(struct dw_mci *host,
+ 		host->request_started = jiffies;
+ 	}
++	slot_changed = host->slot != slot;
+ 	host->slot = slot;
+ 	if (host->multi_slot)
+-		dw_mci_setup_bus(slot, true);
++		dw_mci_setup_bus(slot, slot_changed);
+ 
+ 	mrq = slot->mrq;
+ 
+-- 
+2.50.1

@@ -31,6 +31,7 @@
 #define RPC_WIFI_INIT 278
 #define RPC_WIFI_START 280
 #define RPC_WIFI_CONNECT 282
+#define RPC_WIFI_DISCONNECT 283
 #define RPC_WIFI_SET_CONFIG 284
 #define RPC_WIFI_RESTORE 291
 #define RPC_WIFI_STA_GET_AP_INFO 294
@@ -591,7 +592,7 @@ static int set_linux_mac(const uint8_t mac[6])
 	return rc;
 }
 
-static int set_linux_interface_up(void)
+static int set_linux_interface_state(bool up)
 {
 	struct ifreq request;
 	int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -602,7 +603,10 @@ static int set_linux_interface_up(void)
 	memset(&request, 0, sizeof(request));
 	strncpy(request.ifr_name, NETWORK_DEVICE, sizeof(request.ifr_name) - 1);
 	if (ioctl(fd, SIOCGIFFLAGS, &request) == 0) {
-		request.ifr_flags |= IFF_UP;
+		if (up)
+			request.ifr_flags |= IFF_UP;
+		else
+			request.ifr_flags &= ~IFF_UP;
 		rc = ioctl(fd, SIOCSIFFLAGS, &request);
 	}
 	close(fd);
@@ -618,7 +622,7 @@ static int initialize_station(int fd, uint8_t mac[6], bool start)
 		return -1;
 	if (start && (rpc_status_call(fd, RPC_WIFI_START, &empty) < 0 ||
 		rpc_status_call(fd, RPC_WIFI_CONNECT, &empty) < 0 ||
-		set_linux_interface_up() < 0))
+		set_linux_interface_state(true) < 0))
 		return -1;
 	return 0;
 }
@@ -658,7 +662,7 @@ static int command_connect(const char *ssid, const char *password)
 		rpc_set_station_config(fd, ssid, password) < 0 ||
 		rpc_status_call(fd, RPC_WIFI_START, &empty) < 0 ||
 		rpc_status_call(fd, RPC_WIFI_CONNECT, &empty) < 0 ||
-		set_linux_interface_up() < 0)
+		set_linux_interface_state(true) < 0)
 		goto out;
 	rc = 0;
 
@@ -673,6 +677,31 @@ out:
 		"mac=%02x:%02x:%02x:%02x:%02x:%02x ssid=%s\n",
 		NETWORK_DEVICE, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
 		ssid);
+	return 0;
+}
+
+static int command_down(void)
+{
+	struct buffer empty = {0};
+	int fd = open(SERIAL_DEVICE, O_RDWR | O_NONBLOCK);
+	int rc = -1;
+
+	if (fd < 0)
+		goto out;
+	if (rpc_status_call(fd, RPC_WIFI_DISCONNECT, &empty) < 0 ||
+		set_linux_interface_state(false) < 0)
+		goto out;
+	rc = 0;
+
+out:
+	if (fd >= 0)
+		close(fd);
+	if (rc < 0) {
+		fprintf(stderr, "micronux-netctl: down: %s\n", strerror(errno));
+		return 1;
+	}
+	printf("MICRONUX:M6:NET:DOWN state=disconnected name=%s\n",
+		NETWORK_DEVICE);
 	return 0;
 }
 
@@ -845,11 +874,12 @@ static void usage(const char *program)
 	fprintf(stderr,
 		"usage: %s mac\n"
 		"       %s up\n"
+		"       %s down\n"
 		"       %s status\n"
 		"       %s wait [SECONDS]\n"
 		"       %s forget\n"
 		"       %s connect SSID [PASSWORD]\n",
-		program, program, program, program, program, program);
+		program, program, program, program, program, program, program);
 }
 
 int main(int argc, char **argv)
@@ -860,6 +890,8 @@ int main(int argc, char **argv)
 		return command_mac_or_up(false);
 	if (argc == 2 && strcmp(argv[1], "up") == 0)
 		return command_mac_or_up(true);
+	if (argc == 2 && strcmp(argv[1], "down") == 0)
+		return command_down();
 	if (argc == 2 && strcmp(argv[1], "status") == 0)
 		return command_status();
 	if ((argc == 2 || argc == 3) && strcmp(argv[1], "wait") == 0) {

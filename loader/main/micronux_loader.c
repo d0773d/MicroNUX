@@ -355,6 +355,28 @@ static void configure_sd_iomux_pin(gpio_num_t gpio, bool pull_up)
         gpio, MICRONUX_SD_DRIVE_CAPABILITY));
 }
 
+static void prepare_microsd_electrical_state(void)
+{
+    const esp_ldo_channel_config_t ldo_config = {
+        .chan_id = MICRONUX_SD_LDO_CHANNEL,
+        .voltage_mv = MICRONUX_SD_LDO_MILLIVOLTS,
+    };
+
+    ESP_ERROR_CHECK(esp_ldo_acquire_channel(&ldo_config, &s_sd_ldo));
+    configure_sd_iomux_pin(MICRONUX_SD_CLK_GPIO, false);
+    configure_sd_iomux_pin(MICRONUX_SD_CMD_GPIO, true);
+    configure_sd_iomux_pin(MICRONUX_SD_D0_GPIO, true);
+    configure_sd_iomux_pin(MICRONUX_SD_D1_GPIO, true);
+    configure_sd_iomux_pin(MICRONUX_SD_D2_GPIO, true);
+    configure_sd_iomux_pin(MICRONUX_SD_D3_GPIO, true);
+
+    /* The IDF controller setup selects PLL160M / 2: Linux receives 80 MHz. */
+    esp_rom_delay_us(1000);
+    ESP_LOGI(TAG,
+             "MICRONUX:M6:SDMMC power=ldo4 voltage_mv=3300"
+             " slot=0 width=4 clock_hz=80000000 pins=43,44,39,40,41,42");
+}
+
 #if CONFIG_MICRONUX_C6_SDIO_PROFILE
 static void configure_c6_sdio_pin(gpio_num_t gpio, int signal,
                                   gpio_mode_t mode, bool pull_up)
@@ -449,27 +471,17 @@ static void prepare_sdmmc_electrical_state(void)
     /* No IDF slot is registered: silence its ISR before exposing the pins. */
     quiesce_sdmmc_controller();
 
+#if !CONFIG_MICRONUX_C6_SDIO_PROFILE || \
+    CONFIG_MICRONUX_SDMMC_DUAL_SLOT_PROFILE
+    prepare_microsd_electrical_state();
+#endif
 #if CONFIG_MICRONUX_C6_SDIO_PROFILE
     prepare_c6_sdio_electrical_state();
-#else
-    const esp_ldo_channel_config_t ldo_config = {
-        .chan_id = MICRONUX_SD_LDO_CHANNEL,
-        .voltage_mv = MICRONUX_SD_LDO_MILLIVOLTS,
-    };
-
-    ESP_ERROR_CHECK(esp_ldo_acquire_channel(&ldo_config, &s_sd_ldo));
-    configure_sd_iomux_pin(MICRONUX_SD_CLK_GPIO, false);
-    configure_sd_iomux_pin(MICRONUX_SD_CMD_GPIO, true);
-    configure_sd_iomux_pin(MICRONUX_SD_D0_GPIO, true);
-    configure_sd_iomux_pin(MICRONUX_SD_D1_GPIO, true);
-    configure_sd_iomux_pin(MICRONUX_SD_D2_GPIO, true);
-    configure_sd_iomux_pin(MICRONUX_SD_D3_GPIO, true);
-
-    /* The IDF controller setup selects PLL160M / 2: Linux receives 80 MHz. */
-    esp_rom_delay_us(1000);
+#endif
+#if CONFIG_MICRONUX_SDMMC_DUAL_SLOT_PROFILE
     ESP_LOGI(TAG,
-             "MICRONUX:M6:SDMMC power=ldo4 voltage_mv=3300"
-             " slot=0 width=4 clock_hz=80000000 pins=43,44,39,40,41,42");
+             "MICRONUX:M6:SDMMC profile=dual slots=0,1"
+             " arbitration=linux-serialized");
 #endif
 }
 

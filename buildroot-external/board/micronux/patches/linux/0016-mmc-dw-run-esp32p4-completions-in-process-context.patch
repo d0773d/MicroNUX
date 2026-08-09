@@ -1,0 +1,167 @@
+From 8d7e30e478eb7f4a76b5d9cf9f58cb10831c20ee Mon Sep 17 00:00:00 2001
+From: MicroNUX contributors <micronux@users.noreply.github.com>
+Date: Sat, 8 Aug 2026 23:58:00 -0700
+Subject: [PATCH] mmc: dw: run ESP32-P4 completions in process context
+
+The ESP32-P4 integration polls command and data status synchronously because
+the external interrupt route is not yet reliable.  Running the completion
+state machine on system_bh_wq can consequently keep the only CPU in bottom
+half context across request handoffs.  Under concurrent SD and SDIO traffic
+this eventually strands a block request and also prevents timer and console
+progress.
+
+Queue only the ESP32-P4 polled completion worker on system_wq.  All other
+DesignWare platforms retain the upstream bottom-half workqueue.  Also record
+one bounded register snapshot if a dual-slot request remains active for more
+than one second, so a future soak failure remains diagnosable without flooding
+the console.
+
+Signed-off-by: MicroNUX contributors <micronux@users.noreply.github.com>
+---
+ drivers/mmc/host/dw_mmc.c | 46 +++++++++++++++++++++++++++++++++-----
+ drivers/mmc/host/dw_mmc.h |  3 +++
+ 2 files changed, 40 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+index 70e9d72493c0..d11f834ef15a 100644
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -69,6 +69,14 @@
+ 
+ static irqreturn_t dw_mci_interrupt(int irq, void *dev_id);
+ 
++static bool dw_mci_queue_work(struct dw_mci *host)
++{
++	if (host->quirks & DW_MMC_QUIRK_ESP32P4_POLLED_IDMAC)
++		return queue_work(system_wq, &host->bh_work);
++
++	return queue_work(system_bh_wq, &host->bh_work);
++}
++
+ static void dw_mci_esp32p4_poll_timer(struct timer_list *timer)
+ {
+ 	struct dw_mci *host = from_timer(host, timer,
+@@ -77,7 +85,23 @@
+ 	dw_mci_interrupt(host->irq, host);
+ 	if (host->multi_slot && READ_ONCE(host->state) != STATE_IDLE &&
+ 	    READ_ONCE(host->pending_events))
+-		queue_work(system_bh_wq, &host->bh_work);
++		dw_mci_queue_work(host);
++
++	if (host->multi_slot && READ_ONCE(host->state) != STATE_IDLE &&
++	    READ_ONCE(host->request_started) &&
++	    time_after(jiffies, READ_ONCE(host->request_started) + HZ) &&
++	    READ_ONCE(host->stall_reported_seq) !=
++		READ_ONCE(host->request_seq)) {
++		WRITE_ONCE(host->stall_reported_seq,
++			   READ_ONCE(host->request_seq));
++		dev_err(host->dev,
++			"dual-slot stall seq=%u slot=%u state=%u pending=%lx completed=%lx cmd=%08x mintsts=%08x rintsts=%08x status=%08x idsts=%08x\n",
++			READ_ONCE(host->request_seq), host->slot->id,
++			READ_ONCE(host->state), READ_ONCE(host->pending_events),
++			READ_ONCE(host->completed_events), mci_readl(host, CMD),
++			mci_readl(host, MINTSTS), mci_readl(host, RINTSTS),
++			mci_readl(host, STATUS), mci_readl(host, IDSTS));
++	}
+ 	mod_timer(&host->esp32p4_poll_timer, jiffies + 1);
+ }
+ 
+@@ -591,7 +615,7 @@
+ 	 */
+ 	if (data) {
+ 		set_bit(EVENT_XFER_COMPLETE, &host->pending_events);
+-		queue_work(system_bh_wq, &host->bh_work);
++		dw_mci_queue_work(host);
+ 	}
+ }
+ 
+@@ -1435,6 +1459,10 @@
+ 	struct mmc_data	*data;
+ 	u32 cmdflags;
+ 
++	if (host->multi_slot) {
++		host->request_seq++;
++		host->request_started = jiffies;
++	}
+ 	host->slot = slot;
+ 	if (host->multi_slot)
+ 		dw_mci_setup_bus(slot, true);
+@@ -1978,7 +2006,7 @@
+ 	if (!host->data_status) {
+ 		host->data_status = SDMMC_INT_DCRC;
+ 		set_bit(EVENT_DATA_ERROR, &host->pending_events);
+-		queue_work(system_bh_wq, &host->bh_work);
++		dw_mci_queue_work(host);
+ 	}
+ 
+ 	spin_unlock_irqrestore(&host->irq_lock, flags);
+@@ -2935,7 +2963,7 @@
+ 	smp_wmb(); /* drain writebuffer */
+ 
+ 	set_bit(EVENT_CMD_COMPLETE, &host->pending_events);
+-	queue_work(system_bh_wq, &host->bh_work);
++	dw_mci_queue_work(host);
+ 
+ 	dw_mci_start_fault_timer(host);
+ }
+@@ -3008,7 +3036,7 @@
+ 				set_bit(EVENT_DATA_COMPLETE,
+ 					&host->pending_events);
+ 
+-			queue_work(system_bh_wq, &host->bh_work);
++			dw_mci_queue_work(host);
+ 
+ 			spin_unlock(&host->irq_lock);
+ 		}
+@@ -3027,7 +3055,7 @@
+ 					dw_mci_read_data_pio(host, true);
+ 			}
+ 			set_bit(EVENT_DATA_COMPLETE, &host->pending_events);
+-			queue_work(system_bh_wq, &host->bh_work);
++			dw_mci_queue_work(host);
+ 
+ 			spin_unlock(&host->irq_lock);
+ 		}
+@@ -3480,7 +3508,7 @@
+ 
+ 	host->cmd_status = SDMMC_INT_RTO;
+ 	set_bit(EVENT_CMD_COMPLETE, &host->pending_events);
+-	queue_work(system_bh_wq, &host->bh_work);
++	dw_mci_queue_work(host);
+ }
+ 
+ static void dw_mci_cto_timer(struct timer_list *t)
+@@ -3526,7 +3554,7 @@
+ 		 */
+ 		host->cmd_status = SDMMC_INT_RTO;
+ 		set_bit(EVENT_CMD_COMPLETE, &host->pending_events);
+-		queue_work(system_bh_wq, &host->bh_work);
++		dw_mci_queue_work(host);
+ 		break;
+ 	default:
+ 		dev_warn(host->dev, "Unexpected command timeout, state %d\n",
+@@ -3577,7 +3605,7 @@
+ 		host->data_status = SDMMC_INT_DRTO;
+ 		set_bit(EVENT_DATA_ERROR, &host->pending_events);
+ 		set_bit(EVENT_DATA_COMPLETE, &host->pending_events);
+-		queue_work(system_bh_wq, &host->bh_work);
++		dw_mci_queue_work(host);
+ 		break;
+ 	default:
+ 		dev_warn(host->dev, "Unexpected data timeout, state %d\n",
+diff --git a/drivers/mmc/host/dw_mmc.h b/drivers/mmc/host/dw_mmc.h
+index 40e4c80af19c..f3a5bce2b956 100644
+--- a/drivers/mmc/host/dw_mmc.h
++++ b/drivers/mmc/host/dw_mmc.h
+@@ -216,6 +216,9 @@
+ 	struct dw_mci_slot	*slots[2];
+ 	unsigned int		num_slots;
+ 	bool			multi_slot;
++	unsigned long		request_started;
++	u32			request_seq;
++	u32			stall_reported_seq;
+ 
+ 	/* FIFO push and pull */
+ 	int			fifo_depth;
+-- 
+2.50.1

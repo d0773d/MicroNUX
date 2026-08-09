@@ -36,17 +36,17 @@ Linux then obtained a DHCP lease and default route and reached both `1.1.1.1`
 and `example.com`. `micronux-netctl status` and `wait` now query the C6's
 actual station association, while `micronux-online` provides a bounded
 ten-attempt association-and-DHCP recovery path with a five-second cooldown
-between attempts, without delaying the normal
-shell boot. That complete online gate passed across three ROM resets, including
-recovery from C6 `NO_AP_FOUND` and `CONNECTION_FAIL` events. No C6 firmware is
-built or flashed. The ten-attempt policy also passed a fresh three-reset gate:
-one boot connected immediately and two recovered on attempt 3 after the
-router rejected earlier reconnects. Four exact MIPI-DSI
+between attempts, without delaying the normal shell boot. The accepted
+combined image runs microSD slot 0 and C6 SDIO slot 1 simultaneously under
+Linux-serialized controller ownership. Its clean candidate passed 20-cycle
+and 120-cycle concurrent storage/network soaks and three independent ROM-reset
+boots with an unchanged SD hash, recovering from router reconnect holdoff as
+late as attempt 7. No C6 firmware is built or flashed. Four exact MIPI-DSI
 controller profiles compile behind a default-off power-safety gate; physical
 color-bar verification awaits the attached panel's controller label. On
-revision 1.3, USB status is serviced once per kernel tick and interrupted
-userspace returns through a two-stage
-CLIC `mret` sequence.
+revision 1.3, USB status is serviced once per kernel tick and every userspace
+return uses a two-stage CLIC `mret` sequence so task switches cannot retain an
+active interrupt level.
 
 ## Design baseline
 

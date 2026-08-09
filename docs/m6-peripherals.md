@@ -1,7 +1,7 @@
 # M6 Storage and Peripheral Bring-up
 
-Status: **microSD write gate and ESP32-C6 link complete; MIPI electrical proof
-implemented and awaiting exact-panel identification**
+Status: **simultaneous microSD and ESP32-C6 networking stable; MIPI electrical
+proof implemented and awaiting exact-panel identification**
 
 M6 starts with the Waveshare board's onboard microSD interface. Storage can be
 isolated from the minimal USB console and from the ESP32-C6 wireless transport,
@@ -23,10 +23,11 @@ block discovery, repeatable reads, filesystem remounts, and bounded writes.
 | Physical interrupt route | source 23, core-0 matrix `0x500d605c`, parked on disabled CLIC input 31 |
 | Linux IRQ placeholder | CLIC input 17, requested and disabled by the MMC driver |
 
-The ESP32-C6 SDIO link uses slot 1 and a different pin group. MicroNUX builds
-storage and networking as separate profiles because the current Linux port
-owns one DesignWare MSHC instance at a time. The networking profile resets the
-C6 into its factory SDIO service; the storage profile leaves the C6 alone.
+The ESP32-C6 SDIO link uses slot 1 and a different pin group. Isolated storage
+and networking profiles remain available for diagnosis. The accepted combined
+profile prepares both slots, then one Linux DesignWare MSHC driver owns the
+controller and serializes microSD and C6 requests. The C6 remains on its
+factory firmware.
 
 The ESP-IDF loader enables LDO4, establishes the SDMMC clock/reset state,
 installs the dedicated I/O mux, and quiesces the controller before Linux takes
@@ -82,12 +83,14 @@ hardware gate and a real architecture-wide cache-maintenance contract.
 
 The physical gate also exposed a return-path interaction on the connected
 ESP32-P4 revision 1.3. An interrupt-form `mret` restores the CLIC level, but a
-direct interrupt-form return to userspace re-enters in machine mode. MicroNUX
-therefore performs a two-stage return for userspace interrupted by the timer:
-the first `mret` restores the CLIC level into a machine-mode trampoline with
-interrupts disabled, and the trampoline performs the normal exception-form
-return to userspace. Kernel returns and userspace exception returns remain
-direct.
+direct interrupt-form return to userspace re-enters in machine mode. A task
+switch during interrupt exit made the original frame-based test insufficient:
+the newly selected task could carry an exception-form frame even though the
+hart still had an active CLIC level. MicroNUX therefore performs a two-stage
+return for every U-mode return. The first synthetic interrupt-form `mret`
+restores MPIL 0 into a machine-mode trampoline with interrupts disabled, and
+the trampoline performs the normal exception-form return to userspace.
+Machine-mode returns continue restoring their saved context directly.
 
 The USB Serial/JTAG peripheral source also does not re-arm reliably through
 the current Linux CLIC IRQ path. Its driver checks the peripheral interrupt
@@ -283,6 +286,60 @@ the first DHCP association dropped, attempt 2 reported reason 205
 default routing, external IPv4, and DNS. Only the P4 Linux, DTB, and metadata
 partitions were written; the provisioning loader, C6 firmware, and C6 NVS were
 not rewritten.
+
+## Simultaneous microSD and ESP32-C6 acceptance
+
+The combined profile is the accepted M6 storage/network baseline. The loader
+prepares microSD slot 0 and C6 SDIO slot 1, but Linux takes sole persistent
+ownership of the shared controller. The ESP32-P4 DesignWare driver keeps one
+controller-wide request lock, switches slot-specific clock and bus state only
+when ownership changes, completes polled transfers in process context, and
+reloads the internal-SRAM IDMAC descriptor before each transfer. Neither the
+loader nor a second runtime services storage or networking after handoff.
+
+The combined target boots to the shell without waiting for Wi-Fi. Its explicit
+test sequence performs a bounded microSD write/remount/verify/delete operation,
+brings the saved C6 network online, runs storage and network traffic
+concurrently, disconnects and reconnects Wi-Fi, and hashes the same raw card
+sample before and after every phase. The reconnect command allows ten attempts
+with five seconds between attempts.
+
+Build the combined image with:
+
+```powershell
+wsl -d Ubuntu -- env MICRONUX_JOBS=16 bash /mnt/c/Users/d0773/Documents/ChatGPT/MicroNUX/scripts/m6-combined-build.sh
+```
+
+The final clean candidate, with temporary diagnostic watchdogs removed, has:
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `Image` | 5,433,232 | `a0a59c1ba4162b2da1ade21e28d5c65f4fd22be6109aed674ae00c73b265160b` |
+| `esp32p4-micronux.dtb` | 2,047 | `4b694fd169a84bd5ac157415bc2c14e918b54a9ee3dbfb96760afe7bb6f34f16` |
+| `metadata.bin` | 128 | `b7c1e76498e39eb89e211315fe3268023d5be68297a355a146fb381eff3633a3` |
+| `rootfs.cpio` | 881,664 | `300416f418cc5495854637ee5be16ad3dd7e05a234ad2d4f15f3525f413c7aa8` |
+
+That exact candidate passed all final physical gates on ESP32-P4 revision 1.3:
+
+- one 20-cycle simultaneous storage/network soak;
+- one 120-cycle simultaneous storage/network endurance soak; and
+- three independent ROM-reset boots with storage, SDIO discovery, online,
+  concurrent traffic, disconnect, and reconnect checks on every boot.
+
+Every phase retained the first-1-MiB microSD SHA-256
+`6158c8c683a1c1a66950c4e6593af64b0356cc52702e76ca00af1bdff5978c49`.
+The router's reconnect holdoff was exercised rather than hidden: clean-candidate
+tests recovered as late as attempt 7, within the configured ten-attempt bound.
+The C6 continued reporting factory firmware 2.11.5 and MAC
+`b0:a6:04:8a:d3:78`; no C6 firmware or C6 NVS partition was flashed.
+
+The three acceptance commands are:
+
+```powershell
+py -3 scripts\m6-combined-test.py --port COM14 --boots 1 --timeout 600 --artifact-dir out\m6-combined --write-test --soak-cycles 20
+py -3 scripts\m6-combined-test.py --port COM14 --boots 1 --timeout 1800 --artifact-dir out\m6-combined --write-test --soak-cycles 120
+py -3 scripts\m6-combined-test.py --port COM14 --boots 3 --timeout 420 --artifact-dir out\m6-combined
+```
 
 ### P4-hosted phone provisioning
 

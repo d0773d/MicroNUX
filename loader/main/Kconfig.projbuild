@@ -9,6 +9,16 @@ menu "MicroNUX loader profile"
             GPIO matrix, and hands DesignWare MSHC slot 1 to Linux. The
             default storage profile remains slot 0 and does not reset the C6.
 
+    config MICRONUX_SDMMC_DUAL_SLOT_PROFILE
+        bool "Prepare both microSD slot 0 and ESP32-C6 SDIO slot 1"
+        depends on MICRONUX_C6_SDIO_PROFILE
+        default n
+        help
+            Extend the C6 profile with the onboard microSD connector. The
+            loader powers and routes both physical slots, then Linux owns the
+            shared controller and serializes requests between storage and
+            networking. Leave disabled for the isolated C6 regression profile.
+
     config MICRONUX_C6_PROVISIONING
         bool "Provision Wi-Fi through the factory ESP32-C6 before Linux"
         depends on MICRONUX_C6_SDIO_PROFILE

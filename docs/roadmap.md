@@ -107,9 +107,12 @@ Exit criterion: selected services work without destabilizing the minimal shell
 or violating reserved-memory boundaries.
 
 Current artifact: [M6 storage and peripheral bring-up](m6-peripherals.md). The
-onboard microSD path passed its three-boot read-only gate and a separate
-write/remount/verify/delete test with unchanged media sampling. The ESP32-C6
-factory firmware now exposes a stable ESP-Hosted SDIO/RPC link and `ethsta0`;
+onboard microSD and factory ESP32-C6 now run simultaneously under one
+Linux-owned DesignWare controller with serialized dual-slot arbitration. The
+clean combined candidate passed 20-cycle and 120-cycle concurrent storage and
+network soaks plus three independent ROM-reset boots, retaining the same raw
+SD sample hash throughout. The ESP32-C6 factory firmware exposes a stable
+ESP-Hosted SDIO/RPC link and `ethsta0`;
 the optional P4-hosted provisioning loader has been flashed and physically
 validated through its stored-credential/Linux-handoff path. BLE and SoftAP
 onboarding use mandatory Security 2 and keep Wi-Fi credentials in C6 NVS.
@@ -120,10 +123,9 @@ saved-credential association, DHCP, default routing, external IPv4, and DNS
 all passed on hardware. `micronux-netctl status` and `wait` now expose the
 factory C6's true association state, and the explicit `micronux-online` command
 retries association and DHCP up to ten times with a five-second inter-attempt
-cooldown without making shell boot wait on Wi-Fi. Its
-updated three-reset online gate passed; two boots reproduced the router's
-reconnect holdoff and recovered on attempt 3 after `CONNECTION_FAIL`. MIPI-D0
-has four compiled
+cooldown without making shell boot wait on Wi-Fi. The combined gates
+reproduced the router's reconnect holdoff and recovered as late as attempt 7.
+MIPI-D0 has four compiled
 exact-controller color-bar profiles behind a default-off power gate. Physical
 display verification waits for the attached panel label, after which scanout
 ownership and a Linux console remain separate acceptance gates.
