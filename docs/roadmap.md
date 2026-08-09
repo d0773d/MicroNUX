@@ -128,3 +128,24 @@ ownership and a Linux console remain separate acceptance gates.
 
 Exit criterion: decide, from measurements, which isolation, SMP, and upstream
 paths MicroNUX will support.
+
+## M8 - Linux device services and applications
+
+- Make Linux the sole persistent owner of every peripheral after loader
+  handoff.
+- Define one versioned device/service API shared by shell commands, IgniteVM,
+  and native C applications.
+- Add nonblocking file-descriptor and event-wait behavior for long-running
+  device operations.
+- Package bounded IgniteVM device bindings with explicit capabilities.
+- Provide a NOMMU native C SDK that links applications to the userspace ABI,
+  not to kernel internals.
+- Reject raw MMIO, kernel hooks, unrestricted device mappings, and alternate
+  post-handoff hardware runtimes.
+
+Exit criterion: one representative storage, networking, display, or GPIO
+workflow runs through a shell command, an Ignite package, and a native C
+program using the same permission checks and Linux-owned device path while
+unrelated tasks remain schedulable.
+
+Architecture contract: [Linux device ownership and application model](device-ownership-and-applications.md).

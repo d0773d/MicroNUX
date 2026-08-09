@@ -46,6 +46,8 @@ CLIC `mret` sequence.
 - BusyBox with uClibc-ng userspace
 - Native USB Serial/JTAG as the first hardware output path
 - ESP32-C6 networking isolated as a coprocessor-backed SDIO profile
+- Linux as the sole post-handoff device controller, with shell, IgniteVM, and
+  native C applications sharing versioned Linux device/service APIs
 
 NOMMU constraints are part of the platform contract: no demand paging, no
 copy-on-write `fork()`, limited process isolation, and a tightly controlled
@@ -54,6 +56,7 @@ userspace image and workload.
 ## Documentation
 
 - [Hardware contract](docs/hardware.md)
+- [Linux device ownership and application model](docs/device-ownership-and-applications.md)
 - [Milestone roadmap](docs/roadmap.md)
 - [M1 QEMU build and test](docs/m1-qemu.md)
 - [M2 ESP32-P4 loader and handoff](docs/m2-loader.md)
