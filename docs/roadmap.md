@@ -133,7 +133,7 @@ Linux scanout, backlight ownership, and a Linux console remain separate gates.
 
 ## M7 - Isolation, SMP, and upstream evaluation
 
-Status: **in progress; early U-mode deny proven, kernel containment not yet claimed**
+Status: **in progress; dedicated user pool proven, kernel containment not yet claimed**
 
 - Use PMP to protect critical kernel, loader, and coprocessor regions where
   practical.
@@ -146,11 +146,14 @@ paths MicroNUX will support.
 
 Current artifact: [M7 user/kernel isolation results](m7-user-kernel-isolation.md).
 The version-pinned ESP-IDF v6.0.1 early-PMP patch and loader audit passed three
-independent hardware resets on revision 1.3 while the unchanged Linux image,
-bFLT 4 MiB stress, and device service remained operational. This removes
-unintended U-mode grants outside Linux RAM, but the broad Linux RWX handoff
-window still exposes the kernel until the dedicated user pool, lower-priority
-PMP overlay, and fail-closed `access_ok()` work pass their destructive gates.
+independent hardware resets on revision 1.3. A separate M7 Linux profile now
+reserves an 8 MiB user pool and routes bFLT images and anonymous NOMMU mappings
+through its zero-on-allocation, no-fallback allocator. Three reset boots kept
+pool accounting exactly stable through the isolation probe, M5 selftests, and
+repeated process teardown; the same payload then passed three combined
+microSD/C6/network/display boots. The broad Linux RWX handoff window still
+exposes the kernel until the lower-priority return overlay and fail-closed
+`access_ok()` gates pass destructive hardware tests.
 
 ## M8 - Linux device services and applications
 

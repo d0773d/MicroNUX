@@ -1,7 +1,7 @@
 # M7 User/Kernel Isolation Results
 
-Status: **WP0 and the early-deny portion of WP1 proven on hardware; no kernel
-containment claim yet**
+Status: **WP0, the early-deny portion of WP1, and WP2 proven on hardware; no
+kernel containment claim yet**
 
 M7 is converting the ESP32-P4 revision-1.3, machine-mode, single-core NOMMU
 baseline into a system where a faulty bFLT child can be terminated without
@@ -19,14 +19,14 @@ results below prove the loader-side PMP prerequisite, not final isolation.
 | Candidate kernel RAM | `[0x48400000,0x49700000)`, 19 MiB |
 | Loader reserve | `[0x48000000,0x48400000)`, 4 MiB |
 | Comms reserve | `[0x49f00000,0x4a000000)`, 1 MiB |
-| Kernel payload SHA-256 | `58addbe9410ba137860f6ee4877b0e7431b882a052b595feb7751b0ebbaa86e4` |
-| DTB payload SHA-256 | `4b694fd169a84bd5ac157415bc2c14e918b54a9ee3dbfb96760afe7bb6f34f16` |
+| M7 Image | 5,679,712 bytes, SHA-256 `5dc444a13fe899cd144d5949b897eb00beba24305c0732f5468423c384a2f4fd` |
+| M7 DTB | 2,147 bytes, SHA-256 `a820ab4da5722a71457adae47e25934c863f34f16fcbced747ef13d6390647db` |
+| M7 rootfs | 1,321,984 bytes, SHA-256 `2675898ec0d859b70c87b5fb83a6eae9c03c6467b28e0a739652c6fa1d050e3f` |
 
-The existing combined networking/storage image reported approximately
-15,484 KiB free before the 4 MiB bFLT allocation. Reserving 8 MiB therefore
-leaves an estimated 7 MiB of general kernel headroom while moving user
-allocations out of that allocator. The M7 build must measure this estimate on
-hardware before the boundary becomes final.
+The dedicated reservation leaves 19 MiB in the general Linux allocator. The
+M7 kernel reported 13,156 KiB available during boot and a repeatable 9,036 KiB
+`MemFree` after the shell and device service were ready. The pool baseline was
+394 pages used and 1,654 pages free on every measured boot.
 
 The automated baseline executes three independent ROM-reset boots, records all
 16 PMP address/configuration entries before and after the loader handoff setup,
@@ -80,6 +80,56 @@ ten-attempt/five-second policy. A final M8 gate under the same loader passed
 the shell, native C, real IgniteVM bytecode, peer-credential policy,
 nonblocking wait, killed-client, killed-service, and raw-MMIO-denial checks.
 
+## Dedicated NOMMU user pool
+
+The M7 Buildroot profile now reserves `[0x49700000,0x49f00000)` with a
+`micronux,esp32p4-user-pool` device-tree contract. A kernel configuration gate
+requires ESP32-P4 M-mode, NOMMU, one core, reserved memory, and bFLT. Its
+page-granularity first-fit allocator has no fallback to the kernel buddy
+allocator, zeroes allocations before use, rejects invalid and double frees,
+and exposes root-only accounting through `/proc/micronux_user_pool`.
+
+The NOMMU mapping path sends copied private mappings and anonymous libc heap
+mappings to that allocator. File-backed shared/direct mappings are rejected.
+The one apparent exception is uClibc's `MAP_SHARED | MAP_ANONYMOUS` convention:
+the NOMMU kernel already implements that no-`fork()` case as a private copied
+mapping, so it is accepted and still allocated from the pool. Rejecting it
+would prevent BusyBox from allocating its first heap block.
+
+The bFLT loader requires uncompressed v4 `FLAT_FLAG_RAM` executables and checks
+monotonic header fields, relocation file extent, overflow-safe data/BSS/stack
+math, and the complete initial mapping against the 8 MiB budget before
+`begin_new_exec()`. The M7 probe verifies its stack and every `/proc/self/maps`
+VMA lie inside the pool, allocates and checks one MiB of zero-filled anonymous
+memory, and reports allocator accounting.
+
+Three independent ROM-reset boots produced identical results:
+
+```text
+M7 pool boot 1/3 passed: used=394 free=1654 mem_kib=9036->9028
+M7 pool boot 2/3 passed: used=394 free=1654 mem_kib=9036->9028
+M7 pool boot 3/3 passed: used=394 free=1654 mem_kib=9036->9028
+```
+
+Each boot ran the probe, the M5 process/fault/stress gate, and eight additional
+probe executions. Pool accounting returned exactly to baseline after every
+run and was identical after every reset. The general allocator delta remained
+8 KiB, below the 16 KiB gate.
+
+The same payload then passed the three-boot combined microSD/C6 regression.
+The 1 MiB card sample remained
+`6158c8c683a1c1a66950c4e6593af64b0356cc52702e76ca00af1bdff5978c49` while
+storage and network traffic overlapped. Router reconnects completed on
+attempts 5, 1, and 7, within the ten-attempt/five-second policy. Every boot
+also retained the exact Kit C JD9365 scanout marker.
+
+Reproduce the complete build, loader/payload flash, and pool gate with:
+
+```powershell
+.\scripts\m7.ps1 -Port COM14 -Boots 3 -Flash -Test `
+    -ConfirmExactKitC -ConfirmPmpChange
+```
+
 ## Exact guarantee and remaining work
 
 The early deny map removes unintended U-mode access to CPU control, internal
@@ -91,15 +141,13 @@ for arbitrary uploaded programs.
 
 The next required gates are:
 
-1. Reserve the measured 8 MiB pool and route every U-visible mapping through
-   its deterministic allocator.
-2. Program unlocked PMP entries 7-10 before every M-to-U return so only valid
+1. Program unlocked PMP entries 7-10 before every M-to-U return so only valid
    user bounds override the broad Linux window.
-3. Make RISC-V NOMMU `access_ok()` reject every complete or crossing range
+2. Make RISC-V NOMMU `access_ok()` reject every complete or crossing range
    outside those bounds.
-4. Prove read, write, execute, MMIO, malformed-syscall-pointer, teardown, and
+3. Prove read, write, execute, MMIO, malformed-syscall-pointer, teardown, and
    repeated-fault behavior on the physical P4.
-5. Narrow the shared pool to one zeroed arena per `mm_struct`, then add job
+4. Narrow the shared pool to one zeroed arena per `mm_struct`, then add job
    privilege/resource policy, DMA audits, and the documented W^X limitation.
 
 Only those destructive hardware gates can advance the documented guarantee

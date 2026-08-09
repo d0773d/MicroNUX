@@ -12,7 +12,11 @@ desktop Linux compatibility or MMU-backed process isolation.
 
 Milestones M0 through M5 and the M8 device-service ABI v1 slice are complete;
 M6 now has a physical loader-owned display proof, while Linux-owned display
-scanout remains open. The pinned `rv32imac`/`ilp32` NOMMU
+scanout remains open. M7 WP0-WP2 are proven: the loader has a version-pinned
+early U-mode deny map and Linux routes userspace mappings through a dedicated,
+zero-on-allocation 8 MiB pool. Kernel containment is not yet claimed because
+the per-return PMP overlay and bounded `access_ok()` work remain open. The
+pinned `rv32imac`/`ilp32` NOMMU
 image boots a reduced BusyBox bFLT shell with 32 MiB RAM under QEMU. On the
 physical ESP32-P4 revision 1.3, the M3 loader validates and loads Linux and its
 device tree from flash, installs an exact PMP memory window, and hands off to a

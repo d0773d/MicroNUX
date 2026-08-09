@@ -2,6 +2,7 @@
 param(
     [string]$Port = "COM14",
     [int]$Boots = 3,
+    [switch]$SkipLinuxBuild,
     [switch]$Flash,
     [switch]$Test,
     [switch]$ConfirmExactKitC,
@@ -21,11 +22,39 @@ if ($Flash -and (-not $ConfirmExactKitC -or -not $ConfirmPmpChange)) {
 }
 
 $repoPath = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$repoPathArgument = $repoPath.Replace("\", "/")
+$wslRepoPath = (& wsl.exe -- wslpath -a -u $repoPathArgument | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($wslRepoPath)) {
+    throw "Could not map the MicroNUX repository into WSL."
+}
+if (-not $SkipLinuxBuild) {
+    & wsl.exe -- env MICRONUX_JOBS=16 bash "$wslRepoPath/scripts/m7-build.sh"
+    if ($LASTEXITCODE -ne 0) {
+        throw "MicroNUX M7 isolated Linux build failed."
+    }
+}
+
 $loaderPath = Join-Path $repoPath "loader"
 $idfPath = Join-Path $repoPath "build\idf-v6.0.1-m7"
 $buildPath = Join-Path $repoPath "build\loader-m7-early-deny-patched"
-$artifactPath = Join-Path $repoPath "out\m8"
-$logPath = Join-Path $artifactPath "m7-early-deny-three-boot.log"
+$artifactPath = Join-Path $repoPath "out\m7"
+$logPath = Join-Path $artifactPath "m7-pool-three-boot.log"
+
+$linuxImagePath = Join-Path $artifactPath "Image"
+$dtbPath = Join-Path $artifactPath "esp32p4-micronux.dtb"
+$metadataPath = Join-Path $artifactPath "metadata.bin"
+$probePath = Join-Path $artifactPath "micronux-isolation-probe"
+foreach ($artifact in @($linuxImagePath, $dtbPath, $metadataPath, $probePath)) {
+    if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
+        throw "Missing M7 artifact: $artifact"
+    }
+}
+if ((Get-Item -LiteralPath $linuxImagePath).Length -gt 0x600000) {
+    throw "M7 Image exceeds the 6 MiB Linux partition."
+}
+if ((Get-Item -LiteralPath $dtbPath).Length -gt 0x200000) {
+    throw "M7 DTB exceeds the 2 MiB DTB partition."
+}
 
 & (Join-Path $PSScriptRoot "m7-prepare-idf.ps1") -WorktreePath $idfPath
 
@@ -88,7 +117,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "M7 loader build failed."
 }
 
-$imagePath = Join-Path $buildPath "micronux_m3_loader.bin"
+$loaderImagePath = Join-Path $buildPath "micronux_m3_loader.bin"
 $elfPath = Join-Path $buildPath "micronux_m3_loader.elf"
 $patchedSourcePath = [System.IO.Path]::GetFullPath(
     (Join-Path $idfPath "components\esp_hw_support\port\esp32p4\cpu_region_protect.c")
@@ -109,8 +138,8 @@ foreach ($compileDatabasePath in @(
         throw "Compile database '$compileDatabasePath' does not reference the verified patched ESP-IDF source."
     }
 }
-$image = Get-Item -LiteralPath $imagePath
-$digest = (Get-FileHash -LiteralPath $imagePath -Algorithm SHA256).Hash.ToLowerInvariant()
+$image = Get-Item -LiteralPath $loaderImagePath
+$digest = (Get-FileHash -LiteralPath $loaderImagePath -Algorithm SHA256).Hash.ToLowerInvariant()
 $strings = (& riscv32-esp-elf-strings $elfPath | Out-String)
 if ($strings -notmatch "MICRONUX:M7:PMP baseline=pass early-deny=pass" -or
     $strings -notmatch "MICRONUX:M7:PMP-AUDIT state=fail") {
@@ -127,14 +156,23 @@ if (-not $Flash) {
 if ($LASTEXITCODE -ne 0) {
     throw "M7 loader flash failed."
 }
-Write-Host "M7 loader flashed: port=$Port pmp=early-deny kit-c=confirmed"
+
+& $idfPython -m esptool --chip esp32p4 -p $Port -b 921600 `
+    --before default-reset --after hard-reset write-flash `
+    0x200000 $linuxImagePath `
+    0x800000 $dtbPath `
+    0xA00000 $metadataPath
+if ($LASTEXITCODE -ne 0) {
+    throw "M7 isolated Linux payload flash failed."
+}
+Write-Host "M7 loader and isolated Linux payload flashed: port=$Port pmp=early-deny pool=8MiB kit-c=confirmed"
 
 if ($Test) {
-    & $idfPython (Join-Path $PSScriptRoot "m7-baseline-test.py") `
-        --port $Port --boots $Boots --timeout 180 `
-        --pmp-profile early-deny --artifact-dir $artifactPath `
-        --loader-image $imagePath --log $logPath
+    & $idfPython (Join-Path $PSScriptRoot "m7-test.py") `
+        --port $Port --boots $Boots --timeout 300 `
+        --artifact-dir $artifactPath --expect-mipi-profile jd9365 `
+        --log $logPath
     if ($LASTEXITCODE -ne 0) {
-        throw "M7 early-deny hardware gate failed."
+        throw "M7 reserved-user-pool hardware gate failed."
     }
 }

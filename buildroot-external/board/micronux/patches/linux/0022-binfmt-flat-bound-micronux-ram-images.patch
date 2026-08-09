@@ -1,0 +1,119 @@
+From 74b49dcde3ccf48a3cdf8428c22ef1dcc2d63be4 Mon Sep 17 00:00:00 2001
+From: MicroNUX Project <micronux@example.invalid>
+Date: Sun, 9 Aug 2026 09:10:00 -0700
+Subject: [PATCH] binfmt_flat: bound MicroNUX RAM images
+
+The isolation profile must not create a split direct-file text mapping or let
+unchecked bFLT header arithmetic select memory beyond the dedicated pool.
+Require bFLT v4 all-in-RAM images, validate monotonic offsets and the complete
+relocation extent against the file, and reject a checked initial mapping larger
+than the eight MiB user-pool contract before begin_new_exec().
+
+Signed-off-by: MicroNUX Project <micronux@example.invalid>
+---
+ fs/binfmt_flat.c | 68 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 68 insertions(+)
+
+diff --git a/fs/binfmt_flat.c b/fs/binfmt_flat.c
+index a8fdea452a77..ecf67a51385f 100644
+--- a/fs/binfmt_flat.c
++++ b/fs/binfmt_flat.c
+@@ -35,6 +35,8 @@
+ #include <linux/flat.h>
+ #include <linux/uaccess.h>
+ #include <linux/vmalloc.h>
++#include <linux/overflow.h>
++#include <linux/sizes.h>
+ 
+ #include <asm/byteorder.h>
+ #include <linux/unaligned.h>
+@@ -421,6 +423,11 @@ static int load_flat_file(struct linux_binprm *bprm,
+ 	unsigned long start_code, end_code;
+ 	ssize_t result;
+ 	int ret;
++#ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++	unsigned long reloc_bytes, file_extent, data_bss, data_stack;
++	unsigned long initial_mapping, initial_extra;
++	u32 entry, data_end, bss_end, reloc_start;
++#endif
+ 
+ 	hdr = ((struct flat_hdr *) bprm->buf);		/* exec-header */
+ 
+@@ -431,7 +438,14 @@ static int load_flat_file(struct linux_binprm *bprm,
+ 	bss_len   = ntohl(hdr->bss_end) - ntohl(hdr->data_end);
+ 	stack_len = ntohl(hdr->stack_size);
+ 	if (extra_stack) {
++#ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++		if (check_add_overflow(stack_len, *extra_stack, &stack_len)) {
++			ret = -ENOEXEC;
++			goto err;
++		}
++#else
+ 		stack_len += *extra_stack;
++#endif
+ 		*extra_stack = stack_len;
+ 	}
+ 	relocs    = ntohl(hdr->reloc_count);
+@@ -478,6 +493,60 @@ static int load_flat_file(struct linux_binprm *bprm,
+ 	}
+ #endif /* !CONFIG_BINFMT_FLAT_OLD */
+ 
++#ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++	entry = ntohl(hdr->entry);
++	data_end = ntohl(hdr->data_end);
++	bss_end = ntohl(hdr->bss_end);
++	reloc_start = ntohl(hdr->reloc_start);
++
++	if (!(flags & FLAT_FLAG_RAM) ||
++	    (flags & (FLAT_FLAG_GZIP | FLAT_FLAG_GZDATA))) {
++		pr_err("MicroNUX requires an uncompressed FLAT_FLAG_RAM image\n");
++		ret = -ENOEXEC;
++		goto err;
++	}
++
++	if (entry < sizeof(*hdr) || entry >= text_len ||
++	    text_len < sizeof(*hdr) || data_end < text_len ||
++	    bss_end < data_end || reloc_start != data_end) {
++		pr_err("MicroNUX rejected non-monotonic bFLT bounds\n");
++		ret = -ENOEXEC;
++		goto err;
++	}
++
++	if (check_mul_overflow((unsigned long)relocs,
++			       sizeof(unsigned long), &reloc_bytes) ||
++	    check_add_overflow((unsigned long)reloc_start, reloc_bytes,
++			       &file_extent) ||
++	    file_extent > i_size_read(file_inode(bprm->file)) ||
++	    check_add_overflow((unsigned long)data_len,
++			       (unsigned long)bss_len, &data_bss)) {
++		pr_err("MicroNUX rejected overflowing bFLT bounds\n");
++		ret = -ENOEXEC;
++		goto err;
++	}
++
++	if (check_add_overflow(data_bss, (unsigned long)stack_len,
++			       &data_stack)) {
++		pr_err("MicroNUX rejected overflowing bFLT stack bounds\n");
++		ret = -ENOEXEC;
++		goto err;
++	}
++	initial_extra = max(data_stack, reloc_bytes);
++	if (check_add_overflow((unsigned long)text_len,
++			       (unsigned long)data_len, &initial_mapping) ||
++	    check_add_overflow(initial_mapping, initial_extra,
++			       &initial_mapping) ||
++	    check_add_overflow(initial_mapping,
++			       DATA_START_OFFSET_WORDS * sizeof(u32),
++			       &initial_mapping) ||
++	    initial_mapping > SZ_8M) {
++		pr_err("MicroNUX bFLT image exceeds the user-pool budget\n");
++		ret = -ENOMEM;
++		goto err;
++	}
++#endif
++
+ 	/*
+ 	 * Make sure the header params are sane.
+ 	 * 28 bits (256 MB) is way more than reasonable in this case.
+-- 
+2.50.1
