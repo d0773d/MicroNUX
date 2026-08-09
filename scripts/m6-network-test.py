@@ -248,7 +248,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", required=True)
     parser.add_argument("--boots", type=int, default=3)
-    parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--timeout", type=float)
     parser.add_argument("--artifact-dir", type=Path, required=True)
     parser.add_argument(
         "--online",
@@ -258,6 +258,11 @@ def main() -> int:
     args = parser.parse_args()
     if args.boots < 1:
         parser.error("--boots must be at least 1")
+    timeout = args.timeout
+    if timeout is None:
+        timeout = 420.0 if args.online else 120.0
+    if timeout <= 0:
+        parser.error("--timeout must be greater than zero")
 
     try:
         artifacts = artifact_record(args.artifact_dir.resolve())
@@ -270,7 +275,7 @@ def main() -> int:
     expected_mac: str | None = None
 
     for boot in range(1, args.boots + 1):
-        log = capture_boot(args.port, args.timeout, args.online)
+        log = capture_boot(args.port, timeout, args.online)
         print(f"--- M6 network boot {boot}/{args.boots} ---")
         lines = milestone_lines(log)
         print("\n".join(lines) if lines else "(no network/Linux milestones captured)")

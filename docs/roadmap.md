@@ -119,9 +119,11 @@ Security 2 phone provisioning, C6-NVS persistence, the automatic P4 restart,
 saved-credential association, DHCP, default routing, external IPv4, and DNS
 all passed on hardware. `micronux-netctl status` and `wait` now expose the
 factory C6's true association state, and the explicit `micronux-online` command
-recovers association and DHCP without making shell boot wait on Wi-Fi. Its
-three-reset online gate passed, including recovery from `NO_AP_FOUND` and
-`CONNECTION_FAIL`. MIPI-D0 has four compiled
+retries association and DHCP up to ten times with a five-second inter-attempt
+cooldown without making shell boot wait on Wi-Fi. Its
+updated three-reset online gate passed; two boots reproduced the router's
+reconnect holdoff and recovered on attempt 3 after `CONNECTION_FAIL`. MIPI-D0
+has four compiled
 exact-controller color-bar profiles behind a default-off power gate. Physical
 display verification waits for the attached panel label, after which scanout
 ownership and a Linux console remain separate acceptance gates.

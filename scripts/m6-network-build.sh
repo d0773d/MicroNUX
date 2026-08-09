@@ -63,6 +63,12 @@ make -C "${SOURCE_DIR}" \
 	O="${OUTPUT_DIR}" \
 	BR2_EXTERNAL="${EXTERNAL_DIR}" \
 	BR2_DL_DIR="${DOWNLOAD_DIR}/buildroot-dl" \
+	micronux-netctl-rebuild
+
+make -C "${SOURCE_DIR}" \
+	O="${OUTPUT_DIR}" \
+	BR2_EXTERNAL="${EXTERNAL_DIR}" \
+	BR2_DL_DIR="${DOWNLOAD_DIR}/buildroot-dl" \
 	-j"${JOBS}"
 
 readonly IMAGE_DIR="${OUTPUT_DIR}/images"

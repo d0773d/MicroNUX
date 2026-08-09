@@ -223,7 +223,8 @@ The network profile enables Linux packet sockets for the DHCP raw-packet path
 and includes the five BusyBox applets used by Buildroot's lease hook: `touch`,
 `mktemp`, `rm`, `ifconfig`, and `route`. `micronux-online` combines these
 pieces into a foreground recovery command: it retries the full saved-credential
-association and DHCP sequence up to three times with a two-second delay. It is
+association and DHCP sequence up to ten times with a five-second delay between
+attempts. It is
 never launched automatically, so a missing access point cannot hold up the
 MicroNUX shell.
 
@@ -237,7 +238,7 @@ The stricter online gate uses the same flash artifact and reset harness, then
 also requires a lease, default route, external IPv4, and DNS on every boot:
 
 ```powershell
-C:\Espressif\python_env\idf6.0_py3.11_env\Scripts\python.exe scripts\m6-network-test.py --port COM14 --boots 3 --timeout 180 --artifact-dir out\m6-network --online
+C:\Espressif\python_env\idf6.0_py3.11_env\Scripts\python.exe scripts\m6-network-test.py --port COM14 --boots 3 --timeout 420 --artifact-dir out\m6-network --online
 ```
 
 On the connected board, all three boots reported factory firmware `2.11.5`,
@@ -247,13 +248,13 @@ ROM-reset boots also returned `MICRONUX:M6:NET:UP:RC=0`; no asynchronous event
 was misidentified as the RPC response. The current P4 kernel image, including
 saved-credential connect, status/wait, and bounded recovery support, is
 5,325,288 bytes with SHA-256
-`5656d34d384b835f2340745da11cd27dd1f06eb78f352f970da1add39d7ccd95`;
+`2d6a10eb4aa7b976a77e82985e1079727b983cb47efd2c661d670a14c3a87611`;
 the DTB SHA-256 was
 `08f814249e0c776d6bc26f92d3185d216220be2af1936599d78f97b15d2ced20`,
 the metadata SHA-256 was
-`5d470eb378f859cd294630b57a1337f8baf86f577d6d539867efa5d64139f074`,
+`d28bea963e9111db0214e03d1e185147ca12884f6eeb5fb15a50abdd697f3d98`,
 and the embedded rootfs SHA-256 was
-`a1afcf8c27286f7c594f7e0188b21cb68193c6e40c65585483429519238444e2`.
+`d91d00fa9e5f44896b5d4ab73a741be2fb4a9869cf1e8fa62d4fdac961d652b3`.
 On the first saved-credential test, the C6 contained a pre-existing
 `AP-5GHz` configuration. The loader correctly skipped onboarding and Linux
 successfully issued the connect RPC, but DHCP received no lease. That stored
@@ -272,8 +273,16 @@ The final `--online` gate passed three more independent ROM-reset boots. Boot
 path and recovered on attempt 3 after C6 disconnect events including reason
 201 (`NO_AP_FOUND`) and reason 205 (`CONNECTION_FAIL`). Every boot ended with
 an IPv4 lease, default route, successful `1.1.1.1` ping, and successful DNS and
-`example.com` ping. Only the P4 Linux, DTB, and metadata partitions were
-written; the provisioning loader, C6 firmware, and C6 NVS were not rewritten.
+`example.com` ping.
+
+After extending the policy to ten attempts with five seconds between retries,
+a fresh three-reset `--online` gate passed on the updated image. Boot 1
+connected on attempt 1. Boots 2 and 3 reproduced the router reconnect holdoff:
+the first DHCP association dropped, attempt 2 reported reason 205
+(`CONNECTION_FAIL`), and attempt 3 recovered. All three again passed DHCP,
+default routing, external IPv4, and DNS. Only the P4 Linux, DTB, and metadata
+partitions were written; the provisioning loader, C6 firmware, and C6 NVS were
+not rewritten.
 
 ### P4-hosted phone provisioning
 
