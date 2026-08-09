@@ -66,14 +66,18 @@
 #define MICRONUX_PMP_LOWER_BOUND_ENTRY 13
 #define MICRONUX_PMP_LINUX_ENTRY 14
 #define MICRONUX_PMP_ENTRY_COUNT 16
-#define MICRONUX_PMP_LOWER_BOUND_CONFIG PMP_L
-#define MICRONUX_PMP_LINUX_CONFIG \
-    (PMP_L | PMP_TOR | PMP_R | PMP_W | PMP_X)
-
 #if CONFIG_MICRONUX_M7_EARLY_UMODE_DENY
+#define MICRONUX_PMP_LOWER_BOUND_CONFIG UINT32_C(0)
+#define MICRONUX_PMP_LINUX_CONFIG (PMP_TOR | PMP_R | PMP_W | PMP_X)
+#define MICRONUX_PMP_LOCK_STATE "off"
 #define MICRONUX_PMP_DENY_NAPOT_CONFIG PMP_NAPOT
 #define MICRONUX_PMP_DENY_TOR_CONFIG PMP_TOR
 #define MICRONUX_PMP_DENY_OFF_CONFIG UINT32_C(0)
+#else
+#define MICRONUX_PMP_LOWER_BOUND_CONFIG PMP_L
+#define MICRONUX_PMP_LINUX_CONFIG \
+    (PMP_L | PMP_TOR | PMP_R | PMP_W | PMP_X)
+#define MICRONUX_PMP_LOCK_STATE "on"
 #endif
 
 #define ESP32P4_CLIC_CONFIG UINT32_C(0x20800000)
@@ -603,11 +607,10 @@ static void audit_m7_early_pmp(bool linux_window_installed)
 static void prepare_pmp_for_linux(void)
 {
     /*
-     * ESP-IDF locks its platform PMP entries before app_main().  Entries 13
-     * and 14 are unused on ESP32-P4 revision 1.3, so use them as a TOR pair
-     * for the exact Linux-owned PSRAM interval.  Locking the pair makes the
-     * U-mode contract deterministic: loader and comms reserves remain out of
-     * reach while NOMMU Linux receives the RWX memory it requires.
+     * Entries 13 and 14 are unused on ESP32-P4 revision 1.3.  The M7 profile
+     * hands Linux an unlocked TOR pair for its complete PSRAM interval; Linux
+     * replaces this pair before its first U-mode return.  Earlier profiles
+     * retain their locked, static handoff window.
      */
     log_pmp_entries("pre");
 #if CONFIG_MICRONUX_M7_EARLY_UMODE_DENY
@@ -639,14 +642,16 @@ static void prepare_pmp_for_linux(void)
 
     ESP_LOGI(TAG,
              "MICRONUX:M3:PMP entries=%u,%u linux=[%08" PRIx32
-             ",%08" PRIx32 ") config=%02" PRIx32,
+             ",%08" PRIx32 ") config=%02" PRIx32 " lock=%s",
              MICRONUX_PMP_LOWER_BOUND_ENTRY, MICRONUX_PMP_LINUX_ENTRY,
-             lower_address, linux_address, linux_config);
+             lower_address, linux_address, linux_config,
+             MICRONUX_PMP_LOCK_STATE);
 #if CONFIG_MICRONUX_M7_EARLY_UMODE_DENY
     audit_m7_early_pmp(true);
     ESP_LOGI(TAG,
              "MICRONUX:M7:PMP baseline=pass early-deny=pass"
-             " overlay=7-10-free linux=[%08" PRIx32 ",%08" PRIx32 ")",
+             " handoff=13-14-unlocked overlay=13-14"
+             " linux=[%08" PRIx32 ",%08" PRIx32 ")",
              MICRONUX_KERNEL_VADDR, MICRONUX_COMMS_VADDR);
 #endif
     log_pmp_entries("post");

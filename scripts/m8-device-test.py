@@ -218,10 +218,12 @@ def main() -> int:
     missing = [marker for marker in REQUIRED_MARKERS if not marker_seen(log, marker)]
     if args.expect_m7_early_deny and not marker_seen(
         log,
-        "MICRONUX:M7:PMP baseline=pass early-deny=pass overlay=7-10-free",
+        "MICRONUX:M7:PMP baseline=pass early-deny=pass "
+        "handoff=13-14-unlocked overlay=13-14",
     ):
         missing.append(
-            "MICRONUX:M7:PMP baseline=pass early-deny=pass overlay=7-10-free"
+            "MICRONUX:M7:PMP baseline=pass early-deny=pass "
+            "handoff=13-14-unlocked overlay=13-14"
         )
     if args.expect_mipi_profile == "jd9365" and not marker_seen(
         log,

@@ -18,13 +18,20 @@ import serial
 REQUIRED_MARKERS = (
     "MICRONUX:M3:BOOT",
     "MICRONUX:M3:JUMP",
-    "MICRONUX:M7:PMP baseline=pass early-deny=pass overlay=7-10-free",
+    "MICRONUX:M7:PMP baseline=pass early-deny=pass "
+    "handoff=13-14-unlocked overlay=13-14",
+    "MICRONUX:M7:PMP cached=7-9 direct=12-13 mode=tor+napot state=ready "
+    "range=[49700000,49f00000) config=08,0f,08,08,18 lock=off",
     "MICRONUX:M7:POOL state=ready range=[49700000,49f00000) pages=2048",
     "Linux version 6.12.27",
     "MICRONUX:M6:COMBINED:SHELL ready console=ttyGS0 network=nonblocking",
     "MICRONUX:M8:SERVICE state=ready abi=1.0",
     "MICRONUX:M7:POOL-PROBE:PASS",
     "MICRONUX:M7:POOL-TEST:PROBE:RC=0",
+    "MICRONUX:M7:FAULTS pass count=16 privilege=U memory_signal=11",
+    "MICRONUX:M7:UACCESS:PASS",
+    "MICRONUX:M7:ISOLATION-FAULT:PASS",
+    "MICRONUX:M7:POOL-TEST:FAULT:RC=0",
     "MICRONUX:M5:PASS",
     "MICRONUX:M7:POOL-TEST:SELFTEST:RC=0",
     "MICRONUX:M7:POOL-TEST:REPEAT:RC=0",
@@ -35,9 +42,11 @@ FORBIDDEN_MARKERS = (
     "MICRONUX:M3:FAIL",
     "MICRONUX:M6:FAIL",
     "MICRONUX:M7:PMP-AUDIT state=fail",
+    "MICRONUX:M7:PMP-OVERLAY state=fail",
     "MICRONUX:M7:POOL state=fail",
     "MICRONUX:M7:POOL state=exhausted",
     "MICRONUX:M7:POOL-PROBE:FAIL",
+    "MICRONUX:M7:ISOLATION-FAULT:FAIL",
     "Kernel panic",
     "Oops:",
     "BUG:",
@@ -88,6 +97,8 @@ def test_command() -> str:
         "cat /proc/micronux_user_pool; "
         "/usr/bin/micronux-isolation-probe; "
         "echo MICRONUX:M7:POOL-TEST:PROBE:RC=$?; "
+        "/usr/bin/micronux-isolation-fault; "
+        "echo MICRONUX:M7:POOL-TEST:FAULT:RC=$?; "
         "/usr/bin/micronux-selftest; "
         "echo MICRONUX:M7:POOL-TEST:SELFTEST:RC=$?; "
         "RC=0; for I in "
@@ -155,16 +166,20 @@ def artifact_hashes(directory: Path) -> tuple[str, str]:
     image = directory / "Image"
     dtb = directory / "esp32p4-micronux.dtb"
     probe = directory / "micronux-isolation-probe"
-    for path in (image, dtb, probe):
+    fault = directory / "micronux-isolation-fault"
+    for path in (image, dtb, probe, fault):
         if not path.is_file():
             raise FileNotFoundError(path)
 
-    header = probe.read_bytes()[:44]
-    if len(header) != 44 or header[:4] != b"bFLT":
-        raise ValueError("micronux-isolation-probe is not bFLT")
-    fields = struct.unpack(">10I", header[4:])
-    if fields[0] != 4 or fields[8] & 0x1 == 0:
-        raise ValueError("micronux-isolation-probe must be bFLT v4 FLAT_FLAG_RAM")
+    for binary in (probe, fault):
+        header = binary.read_bytes()[:44]
+        if len(header) != 44 or header[:4] != b"bFLT":
+            raise ValueError(f"{binary.name} is not bFLT")
+        fields = struct.unpack(">10I", header[4:])
+        if fields[0] != 4 or fields[8] & 0x1 == 0:
+            raise ValueError(
+                f"{binary.name} must be bFLT v4 FLAT_FLAG_RAM"
+            )
     return (
         hashlib.sha256(image.read_bytes()).hexdigest(),
         hashlib.sha256(dtb.read_bytes()).hexdigest(),

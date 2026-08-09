@@ -1,12 +1,12 @@
 # M7 User/Kernel Isolation Results
 
-Status: **WP0, the early-deny portion of WP1, and WP2 proven on hardware; no
-kernel containment claim yet**
+Status: **WP0-WP3 proven on hardware; shared-pool kernel containment active**
 
 M7 is converting the ESP32-P4 revision-1.3, machine-mode, single-core NOMMU
 baseline into a system where a faulty bFLT child can be terminated without
-being able to corrupt Linux. The work is deliberately gated in layers. The
-results below prove the loader-side PMP prerequisite, not final isolation.
+being able to corrupt Linux. The work is deliberately gated in layers. WP3
+proves that boundary for the shared user pool; WP4 must still separate one
+userspace process from another.
 
 ## Frozen baseline
 
@@ -19,12 +19,12 @@ results below prove the loader-side PMP prerequisite, not final isolation.
 | Candidate kernel RAM | `[0x48400000,0x49700000)`, 19 MiB |
 | Loader reserve | `[0x48000000,0x48400000)`, 4 MiB |
 | Comms reserve | `[0x49f00000,0x4a000000)`, 1 MiB |
-| M7 Image | 5,679,712 bytes, SHA-256 `5dc444a13fe899cd144d5949b897eb00beba24305c0732f5468423c384a2f4fd` |
+| M7 Image | 5,753,528 bytes, SHA-256 `a0569c353b51ee805d008406d941767e2b8d5980706584a47c8992583fc9ef1f` |
 | M7 DTB | 2,147 bytes, SHA-256 `a820ab4da5722a71457adae47e25934c863f34f16fcbced747ef13d6390647db` |
-| M7 rootfs | 1,321,984 bytes, SHA-256 `2675898ec0d859b70c87b5fb83a6eae9c03c6467b28e0a739652c6fa1d050e3f` |
+| M7 rootfs | 1,410,048 bytes, SHA-256 `5cc9a696a11b7d23caee9075dc1147edde901bc4d1cd99b7225523f1a62f2650` |
 
 The dedicated reservation leaves 19 MiB in the general Linux allocator. The
-M7 kernel reported 13,156 KiB available during boot and a repeatable 9,036 KiB
+M7 kernel reported 13,084 KiB available during boot and a repeatable 8,916 KiB
 `MemFree` after the shell and device service were ready. The pool baseline was
 394 pages used and 1,654 pages free on every measured boot.
 
@@ -53,18 +53,18 @@ across three resets:
 | 3, 4 | `4ff00000/00`, `4ffc0000/08` | internal RAM denied |
 | 5 | `00000000/00` | free |
 | 6 | `41fffffc/18` | cached flash denied |
-| 7-10 | `00000000/00` | free for the dynamic Linux overlay |
+| 7-10 | `00000000/00` | free for Linux return rules |
 | 11 | `5010bffc/18` | LP memory denied |
-| 12 | `00000000/00` | spare |
-| 13, 14 | added as `48400000/80`, `49f00000/8f` | broad Linux handoff window |
+| 12 | `00000000/00` | free for Linux direct-alias denial |
+| 13, 14 | added as `48400000/00`, `49f00000/0f` | unlocked broad Linux handoff window |
 | 15 | `5007fffc/18` | peripheral MMIO denied |
 
-The accepted loader is 273,104 bytes with SHA-256
-`ad8e8227f404afa6c208a2f42c0b2718287f6e782d729875e3f48238fd7b0e53`.
+The accepted loader is 273,008 bytes with SHA-256
+`0e7bd2b22f857fbb23cdba38e3ca64a36041969d9e3409d7dc7cc558d7de85d4`.
 It emits:
 
 ```text
-MICRONUX:M7:PMP baseline=pass early-deny=pass overlay=7-10-free linux=[48400000,49f00000)
+MICRONUX:M7:PMP baseline=pass early-deny=pass handoff=13-14-unlocked overlay=13-14 linux=[48400000,49f00000)
 ```
 
 The unchanged Linux payload then booted on all three resets, retained its
@@ -103,7 +103,8 @@ math, and the complete initial mapping against the 8 MiB budget before
 VMA lie inside the pool, allocates and checks one MiB of zero-filled anonymous
 memory, and reports allocator accounting.
 
-Three independent ROM-reset boots produced identical results:
+The WP2 acceptance run produced identical results across three ROM-reset
+boots:
 
 ```text
 M7 pool boot 1/3 passed: used=394 free=1654 mem_kib=9036->9028
@@ -130,26 +131,56 @@ Reproduce the complete build, loader/payload flash, and pool gate with:
     -ConfirmExactKitC -ConfirmPmpChange
 ```
 
+## Per-return PMP and bounded uaccess
+
+The generic RISC-V startup path normally installs entry 0 as an all-address
+RWX NAPOT region. Entry 0 has highest priority on ESP32-P4, so that grant
+silently shadowed both the loader baseline and every later rule. The M7 kernel
+now omits that bootstrap grant when isolation is selected and preserves the
+audited loader map.
+
+Before every CLIC first-stage return to U-mode, Linux revokes the previous
+grant, writes the current `mm_struct` bounds, and reads every changed CSR back.
+Entries 7-9 form a cached-address TOR ladder that denies below the authorized
+interval, grants the interval RWX, and denies above it through `0x4fc00000`.
+Entry 12 TOR-denies the upper/direct-address half through `0xffffff80`, and
+entry 13 NAPOT-denies its final 128-byte granule. Missing, malformed, or
+unverifiable bounds trigger a best-effort deny-all transition and kernel panic
+instead of a U-mode return.
+
+NOMMU `access_ok()` uses the same bounds and overflow-safe subtraction. It
+rejects complete and crossing kernel, loader, CLINT, MMIO, below-pool, and
+overflowing ranges, while retaining the standard zero-length operation at the
+exclusive upper bound.
+
+The clean payload passed three independent ROM resets on ESP32-P4 revision
+1.3:
+
+```text
+M7 pool boot 1/3 passed: used=394 free=1654 mem_kib=8916->8908
+M7 pool boot 2/3 passed: used=394 free=1654 mem_kib=8916->8912
+M7 pool boot 3/3 passed: used=394 free=1654 mem_kib=8916->8908
+```
+
+Each boot proved an illegal M-mode CSR read raises `SIGILL`; cached loader and
+kernel read/write/execute attempts raise `SIGSEGV`; direct-alias loader
+read/write/execute attempts raise `SIGSEGV`; and CLINT/MMIO read/write/execute
+attempts raise `SIGSEGV`. Seven invalid syscall-pointer classes were rejected
+in both copy directions with `EFAULT`. The suite then reran the M5 process,
+signal, timer, allocation, and console gate plus repeated process teardown.
+Pool accounting returned to `394/1654` every time.
+
 ## Exact guarantee and remaining work
 
-The early deny map removes unintended U-mode access to CPU control, internal
-RAM, ROM/flash, LP memory, and peripheral MMIO. It deliberately leaves the
-locked entry-14 Linux interval in place so the M-mode NOMMU kernel can boot.
-That entry currently grants U-mode RWX over all Linux RAM, including the
-kernel. Therefore MicroNUX does **not** yet claim kernel containment or safety
-for arbitrary uploaded programs.
+WP3 establishes **shared-pool kernel containment** for CPU accesses: U-mode
+code can execute only in `[0x49700000,0x49f00000)` and cannot directly read,
+write, or execute kernel RAM, loader RAM, direct aliases, or protected platform
+regions. The M-mode kernel remains fully trusted and is not constrained by
+these unlocked PMP permissions.
 
-The next required gates are:
-
-1. Program unlocked PMP entries 7-10 before every M-to-U return so only valid
-   user bounds override the broad Linux window.
-2. Make RISC-V NOMMU `access_ok()` reject every complete or crossing range
-   outside those bounds.
-3. Prove read, write, execute, MMIO, malformed-syscall-pointer, teardown, and
-   repeated-fault behavior on the physical P4.
-4. Narrow the shared pool to one zeroed arena per `mm_struct`, then add job
-   privilege/resource policy, DMA audits, and the documented W^X limitation.
-
-Only those destructive hardware gates can advance the documented guarantee
-from an early-loader prerequisite to shared-pool kernel containment and then
-per-process containment.
+This is not yet full application isolation. Every `mm_struct` currently
+receives the whole 8 MiB pool, so one malicious userspace process could access
+another process's live memory. The interval is also RWX, and PMP does not act
+as an IOMMU for peripheral DMA. WP4 must assign one zeroed arena per process;
+WP5 adds job privilege and resource policy; WP6 audits DMA ownership and
+enforces the documented W^X design.

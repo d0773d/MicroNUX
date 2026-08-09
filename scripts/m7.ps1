@@ -44,7 +44,14 @@ $linuxImagePath = Join-Path $artifactPath "Image"
 $dtbPath = Join-Path $artifactPath "esp32p4-micronux.dtb"
 $metadataPath = Join-Path $artifactPath "metadata.bin"
 $probePath = Join-Path $artifactPath "micronux-isolation-probe"
-foreach ($artifact in @($linuxImagePath, $dtbPath, $metadataPath, $probePath)) {
+$faultPath = Join-Path $artifactPath "micronux-isolation-fault"
+foreach ($artifact in @(
+    $linuxImagePath,
+    $dtbPath,
+    $metadataPath,
+    $probePath,
+    $faultPath
+)) {
     if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
         throw "Missing M7 artifact: $artifact"
     }

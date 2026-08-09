@@ -10,9 +10,10 @@ menu "MicroNUX loader profile"
             Select only with the tracked MicroNUX ESP-IDF v6.0.1 patch.
             Before app_main(), CPU-control, internal RAM, ROM/flash, LP-memory,
             and peripheral regions become unlocked PMP deny entries. M-mode
-            remains able to access them, while entries 7-10 stay free for the
-            Linux U-return overlay. The loader audits all 16 entries and
-            refuses handoff on any mismatch.
+            remains able to access them. Entries 7-10 and 12 stay free, and
+            the Linux handoff pair at 13-14 stays unlocked, so Linux can
+            install its verified U-return rules. The loader audits all 16
+            entries and refuses handoff on any mismatch.
 
     config MICRONUX_C6_SDIO_PROFILE
         bool "Prepare ESP32-C6 SDIO slot 1 instead of microSD slot 0"

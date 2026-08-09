@@ -46,8 +46,8 @@ EXPECTED_EARLY_DENY_PRE_PMP[3] = (0x4FF00000, 0x00)
 EXPECTED_EARLY_DENY_PRE_PMP[4] = (0x4FFC0000, 0x08)
 
 EXPECTED_EARLY_DENY_POST_PMP = dict(EXPECTED_EARLY_DENY_PRE_PMP)
-EXPECTED_EARLY_DENY_POST_PMP[13] = (0x48400000, 0x80)
-EXPECTED_EARLY_DENY_POST_PMP[14] = (0x49F00000, 0x8F)
+EXPECTED_EARLY_DENY_POST_PMP[13] = (0x48400000, 0x00)
+EXPECTED_EARLY_DENY_POST_PMP[14] = (0x49F00000, 0x0F)
 
 PMP_PROFILES = {
     "baseline": (EXPECTED_PRE_PMP, EXPECTED_POST_PMP),
@@ -57,7 +57,6 @@ PMP_PROFILES = {
 REQUIRED_MARKERS = (
     "MICRONUX:M3:BOOT target=esp32p4 revision=103 cores=2",
     "MICRONUX:M7:PMP-DUMP phase=pre entries=16",
-    "MICRONUX:M3:PMP entries=13,14 linux=[48400000,49f00000) config=8f",
     "MICRONUX:M7:PMP-DUMP phase=post entries=16",
     "MICRONUX:M6:COMBINED:SHELL ready",
     "MICRONUX:M8:SERVICE state=ready abi=1.0",
@@ -242,10 +241,18 @@ def verify_boot(
     pmp = parse_pmp(log)
     missing = [marker for marker in REQUIRED_MARKERS if not marker_seen(log, marker)]
     forbidden = [marker for marker in FORBIDDEN_MARKERS if marker_seen(log, marker)]
+    handoff_config = "0f lock=off" if pmp_profile == "early-deny" else "8f lock=on"
+    handoff_marker = (
+        "MICRONUX:M3:PMP entries=13,14 linux=[48400000,49f00000) "
+        f"config={handoff_config}"
+    )
+    if not marker_seen(log, handoff_marker):
+        missing.append(f"exact {pmp_profile} Linux handoff marker")
     if pmp_profile == "early-deny" and not marker_seen(
         log,
         "MICRONUX:M7:PMP baseline=pass early-deny=pass "
-        "overlay=7-10-free linux=[48400000,49f00000)",
+        "handoff=13-14-unlocked overlay=13-14 "
+        "linux=[48400000,49f00000)",
     ):
         missing.append("early U-mode deny audit marker")
     if pmp["pre"] != expected_pre_pmp:
@@ -376,7 +383,7 @@ def main() -> int:
     print(
         f"M7 baseline passed: boots={args.boots} silicon=rev1.3 pmp=16 "
         f"profile={args.pmp_profile} "
-        f"entries=7-10-free stress=4MiB service=recovered "
+        f"return-space=7-10,12 handoff=13-14 stress=4MiB service=recovered "
         f"kernel_sha256={expected_hashes[0]} dtb_sha256={expected_hashes[1]}"
     )
     return 0

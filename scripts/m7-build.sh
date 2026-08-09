@@ -71,6 +71,11 @@ make -C "${SOURCE_DIR}" \
 	BR2_EXTERNAL="${EXTERNAL_DIR}" \
 	BR2_DL_DIR="${DOWNLOAD_DIR}/buildroot-dl" \
 	micronux-device-service-rebuild
+make -C "${SOURCE_DIR}" \
+	O="${OUTPUT_DIR}" \
+	BR2_EXTERNAL="${EXTERNAL_DIR}" \
+	BR2_DL_DIR="${DOWNLOAD_DIR}/buildroot-dl" \
+	micronux-isolation-test-rebuild
 
 make -C "${SOURCE_DIR}" \
 	O="${OUTPUT_DIR}" \
@@ -126,6 +131,8 @@ install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-storage-test" \
 	"${ARTIFACT_DIR}/micronux-storage-test"
 install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-isolation-probe" \
 	"${ARTIFACT_DIR}/micronux-isolation-probe"
+install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-isolation-fault" \
+	"${ARTIFACT_DIR}/micronux-isolation-fault"
 
 (
 	cd "${ARTIFACT_DIR}"
@@ -133,6 +140,7 @@ install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-isolation-probe" \
 		micronux-selftest micronux-exec-child micronux-netctl \
 		micronux-device micronux-device-native micronux-device-selftest \
 		micronux-deviced micronux-storage-test micronux-isolation-probe \
+		micronux-isolation-fault \
 		> SHA256SUMS
 )
 

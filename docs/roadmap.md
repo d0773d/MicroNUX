@@ -133,7 +133,7 @@ Linux scanout, backlight ownership, and a Linux console remain separate gates.
 
 ## M7 - Isolation, SMP, and upstream evaluation
 
-Status: **in progress; dedicated user pool proven, kernel containment not yet claimed**
+Status: **in progress; WP3 shared-pool kernel containment proven**
 
 - Use PMP to protect critical kernel, loader, and coprocessor regions where
   practical.
@@ -148,12 +148,13 @@ Current artifact: [M7 user/kernel isolation results](m7-user-kernel-isolation.md
 The version-pinned ESP-IDF v6.0.1 early-PMP patch and loader audit passed three
 independent hardware resets on revision 1.3. A separate M7 Linux profile now
 reserves an 8 MiB user pool and routes bFLT images and anonymous NOMMU mappings
-through its zero-on-allocation, no-fallback allocator. Three reset boots kept
-pool accounting exactly stable through the isolation probe, M5 selftests, and
-repeated process teardown; the same payload then passed three combined
-microSD/C6/network/display boots. The broad Linux RWX handoff window still
-exposes the kernel until the lower-priority return overlay and fail-closed
-`access_ok()` gates pass destructive hardware tests.
+through its zero-on-allocation, no-fallback allocator. Linux now replaces the
+unlocked loader handoff before every U-mode return with a read-back-verified
+PMP boundary around that pool, and NOMMU `access_ok()` enforces the same bounds.
+Three reset boots passed 16 privilege/read/write/execute fault cases, malformed
+syscall-pointer checks, M5 selftests, and repeated teardown with stable pool
+accounting. This proves kernel containment for the shared pool. Per-process
+arenas, job policy, DMA isolation, and W^X remain open.
 
 ## M8 - Linux device services and applications
 

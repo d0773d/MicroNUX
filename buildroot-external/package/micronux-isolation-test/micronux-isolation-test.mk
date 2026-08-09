@@ -15,11 +15,17 @@ define MICRONUX_ISOLATION_TEST_BUILD_CMDS
 		-Wall -Wextra -Werror \
 		$(@D)/micronux-isolation-probe.c \
 		-o $(@D)/micronux-isolation-probe $(TARGET_LDFLAGS)
+	$(TARGET_CC) $(TARGET_CFLAGS) -D_GNU_SOURCE -std=c11 -Os \
+		-Wall -Wextra -Werror \
+		$(@D)/micronux-isolation-fault.c \
+		-o $(@D)/micronux-isolation-fault $(TARGET_LDFLAGS)
 endef
 
 define MICRONUX_ISOLATION_TEST_INSTALL_TARGET_CMDS
 	$(INSTALL) -D -m 0755 $(@D)/micronux-isolation-probe \
 		$(TARGET_DIR)/usr/bin/micronux-isolation-probe
+	$(INSTALL) -D -m 0755 $(@D)/micronux-isolation-fault \
+		$(TARGET_DIR)/usr/bin/micronux-isolation-fault
 endef
 
 $(eval $(generic-package))

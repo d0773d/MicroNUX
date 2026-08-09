@@ -12,8 +12,8 @@ U-mode cannot use the platform grants that ESP-IDF normally locks.
 Reset every affected entry before installing it so permissions inherited from
 the bootloader cannot survive. Applying this patch to the verified M7
 worktree is the early-boot opt-in; the project Kconfig symbol separately makes
-the loader audit mandatory. Leave entries 7-10 unused for MicroNUX's dynamic
-Linux overlay.
+the loader audit mandatory. Leave entries 7-10 and 12 unused so Linux can
+install its dynamic return rules, including the direct-address-space deny.
 ---
  .../port/esp32p4/cpu_region_protect.c         | 38 +++++++++++++++------
  1 file changed, 28 insertions(+), 10 deletions(-)
