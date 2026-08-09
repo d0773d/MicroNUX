@@ -14,8 +14,26 @@ readonly SOURCE_DIR="${WORK_DIR}/src/buildroot-${BUILDROOT_VERSION}"
 readonly EXTERNAL_DIR="${REPO_DIR}/buildroot-external"
 readonly DEFCONFIG="micronux_esp32p4_combined_defconfig"
 readonly JOBS="${MICRONUX_JOBS:-$(nproc)}"
-readonly OUTPUT_DIR="${WORK_DIR}/output-${BUILDROOT_VERSION}"
-readonly ARTIFACT_DIR="${REPO_DIR}/out/m6-combined"
+
+with_ignitevm=0
+if [[ -n "${MICRONUX_IGNITEVM_SOURCE_DIR:-}" ]]; then
+	MICRONUX_IGNITEVM_SOURCE_DIR="$(realpath "${MICRONUX_IGNITEVM_SOURCE_DIR}")"
+	if [[ ! -f "${MICRONUX_IGNITEVM_SOURCE_DIR}/tools/ignite_native_compile.py" ]] ||
+		[[ ! -f "${MICRONUX_IGNITEVM_SOURCE_DIR}/firmware/components/ignite_vm/ignite_vm.c" ]]; then
+		printf 'Invalid IgniteVM source checkout: %s\n' \
+			"${MICRONUX_IGNITEVM_SOURCE_DIR}" >&2
+		exit 1
+	fi
+	export MICRONUX_IGNITEVM_SOURCE_DIR
+	with_ignitevm=1
+fi
+if ((with_ignitevm)); then
+	readonly OUTPUT_DIR="${WORK_DIR}/output-${BUILDROOT_VERSION}-ignite"
+	readonly ARTIFACT_DIR="${REPO_DIR}/out/m8"
+else
+	readonly OUTPUT_DIR="${WORK_DIR}/output-${BUILDROOT_VERSION}"
+	readonly ARTIFACT_DIR="${REPO_DIR}/out/m6-combined"
+fi
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -59,13 +77,35 @@ make -C "${SOURCE_DIR}" \
 	BR2_DL_DIR="${DOWNLOAD_DIR}/buildroot-dl" \
 	"${DEFCONFIG}"
 
+if ((with_ignitevm)); then
+	"${SOURCE_DIR}/utils/config" --file "${OUTPUT_DIR}/.config" \
+		--enable BR2_PACKAGE_MICRONUX_IGNITEVM
+	make -C "${SOURCE_DIR}" \
+		O="${OUTPUT_DIR}" \
+		BR2_EXTERNAL="${EXTERNAL_DIR}" \
+		BR2_DL_DIR="${DOWNLOAD_DIR}/buildroot-dl" \
+		olddefconfig
+fi
+
 # Local packages do not carry a source hash that invalidates an existing
-# output tree, so explicitly refresh the network control binary and scripts.
+# output tree, so explicitly refresh local userspace packages and scripts.
 make -C "${SOURCE_DIR}" \
 	O="${OUTPUT_DIR}" \
 	BR2_EXTERNAL="${EXTERNAL_DIR}" \
 	BR2_DL_DIR="${DOWNLOAD_DIR}/buildroot-dl" \
 	micronux-netctl-rebuild
+make -C "${SOURCE_DIR}" \
+	O="${OUTPUT_DIR}" \
+	BR2_EXTERNAL="${EXTERNAL_DIR}" \
+	BR2_DL_DIR="${DOWNLOAD_DIR}/buildroot-dl" \
+	micronux-device-service-rebuild
+if ((with_ignitevm)); then
+	make -C "${SOURCE_DIR}" \
+		O="${OUTPUT_DIR}" \
+		BR2_EXTERNAL="${EXTERNAL_DIR}" \
+		BR2_DL_DIR="${DOWNLOAD_DIR}/buildroot-dl" \
+		micronux-ignitevm-rebuild
+fi
 
 make -C "${SOURCE_DIR}" \
 	O="${OUTPUT_DIR}" \
@@ -98,13 +138,47 @@ install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-exec-child" \
 	"${ARTIFACT_DIR}/micronux-exec-child"
 install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-netctl" \
 	"${ARTIFACT_DIR}/micronux-netctl"
+install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-device" \
+	"${ARTIFACT_DIR}/micronux-device"
+install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-device-native" \
+	"${ARTIFACT_DIR}/micronux-device-native"
+install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-device-selftest" \
+	"${ARTIFACT_DIR}/micronux-device-selftest"
+install -m 0755 "${OUTPUT_DIR}/target/usr/sbin/micronux-deviced" \
+	"${ARTIFACT_DIR}/micronux-deviced"
 install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-storage-test" \
 	"${ARTIFACT_DIR}/micronux-storage-test"
+artifact_names=(
+	Image esp32p4-micronux.dtb metadata.bin rootfs.cpio
+	micronux-selftest micronux-exec-child micronux-netctl
+	micronux-device micronux-device-native micronux-device-selftest
+	micronux-deviced micronux-storage-test
+)
+if ((with_ignitevm)); then
+	install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-ignite" \
+		"${ARTIFACT_DIR}/micronux-ignite"
+	install -m 0644 \
+		"${OUTPUT_DIR}/target/usr/share/micronux/ignite/device-status.igpk" \
+		"${ARTIFACT_DIR}/device-status.igpk"
+	install -m 0644 \
+		"${OUTPUT_DIR}/target/usr/share/micronux/ignite/device-fault.igpk" \
+		"${ARTIFACT_DIR}/device-fault.igpk"
+	git -C "${MICRONUX_IGNITEVM_SOURCE_DIR}" rev-parse HEAD \
+		> "${ARTIFACT_DIR}/ignitevm-source.txt"
+	if git -C "${MICRONUX_IGNITEVM_SOURCE_DIR}" \
+			diff --ignore-space-at-eol --quiet &&
+		git -C "${MICRONUX_IGNITEVM_SOURCE_DIR}" diff --cached --quiet &&
+		[[ -z "$(git -C "${MICRONUX_IGNITEVM_SOURCE_DIR}" \
+			ls-files --others --exclude-standard)" ]]; then
+		printf '%s\n' clean >> "${ARTIFACT_DIR}/ignitevm-source.txt"
+	else
+		printf '%s\n' dirty >> "${ARTIFACT_DIR}/ignitevm-source.txt"
+	fi
+	artifact_names+=(micronux-ignite device-status.igpk device-fault.igpk ignitevm-source.txt)
+fi
 (
 	cd "${ARTIFACT_DIR}"
-	sha256sum Image esp32p4-micronux.dtb metadata.bin rootfs.cpio \
-		micronux-selftest micronux-exec-child micronux-netctl \
-		micronux-storage-test > SHA256SUMS
+	sha256sum "${artifact_names[@]}" > SHA256SUMS
 )
 
 printf 'M6 combined build complete: %s\n' "${ARTIFACT_DIR}"

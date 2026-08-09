@@ -163,3 +163,21 @@ This architecture is realized when:
    closed.
 6. An application crash or IgniteVM fault cannot leave device ownership outside
    Linux or prevent the driver/service from recovering the resource.
+
+## ABI v1 realization
+
+The M8 hardware gate on 2026-08-09 satisfied these criteria for the first
+representative workflow, Linux-owned microSD/C6 device-status observation:
+
+| Criterion | Physical evidence |
+| --- | --- |
+| Linux ownership | Linux enumerated `mmcblk0` and C6-backed `ethsta0`; the loader attachment probe left MIPI D-PHY off and performed zero target writes. |
+| Three surfaces | Shell, native C, and direct-compiled Ignite bytecode returned the same ABI 1.0 device state. |
+| One API and policy | All three used `libmicronux` and `/run/micronux/device-v1.sock`; `SO_PEERCRED` granted the Ignite runner only `observe`. |
+| Caller-only blocking | A two-second device wait timed out while an unrelated ABI query completed successfully. |
+| Fail closed | UID 65534 was denied `ADMIN_PROBE`; `/dev/mem`, `/dev/kmem`, and loadable modules were absent. |
+| Fault recovery | A killed waiting client, an intentional IgniteVM fault, and a killed daemon all left or returned the service to a responsive state. |
+
+This closes the application-boundary acceptance gate, not the remaining MIPI
+or M7 work. New device-control operations must repeat the same checks rather
+than inheriting acceptance from this read-only workflow.

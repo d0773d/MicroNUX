@@ -143,6 +143,8 @@ paths MicroNUX will support.
 
 ## M8 - Linux device services and applications
 
+Status: **ABI v1 representative workflow complete**
+
 - Make Linux the sole persistent owner of every peripheral after loader
   handoff.
 - Define one versioned device/service API shared by shell commands, IgniteVM,
@@ -161,3 +163,11 @@ program using the same permission checks and Linux-owned device path while
 unrelated tasks remain schedulable.
 
 Architecture contract: [Linux device ownership and application model](device-ownership-and-applications.md).
+
+Current artifact: [M8 Linux device service and application ABI](m8-device-services.md).
+The physical gate completed the representative network/device-status workflow
+through `micronux-device`, a `libmicronux` native C program, and direct-compiled
+Ignite bytecode running in the real userspace C VM. The unprivileged VM saw
+only `observe`, a slow wait did not stall other clients, raw memory devices
+were absent, an intentional VM fault left the service responsive, a killed
+service restarted, and the subsequent microSD/C6 combined regression passed.

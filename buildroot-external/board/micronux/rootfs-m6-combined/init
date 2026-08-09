@@ -17,6 +17,20 @@ export HOME=/root
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export PS1='micronux# '
 
+/usr/sbin/micronux-deviced-supervise &
+device_supervisor_pid=$!
+for attempt in 1 2 3; do
+	if [ -S /run/micronux/device-v1.sock ]; then
+		break
+	fi
+	/bin/busybox sleep 1
+done
+if [ ! -S /run/micronux/device-v1.sock ]; then
+	echo 'MICRONUX:M8:SERVICE:FAIL socket-missing'
+	exit 1
+fi
+echo 'MICRONUX:M8:SERVICE state=ready abi=1.0 socket=/run/micronux/device-v1.sock'
+
 echo 'MICRONUX:M6:COMBINED:DRIVER storage=microsd-slot0 network=c6-sdio-slot1 arbitration=serialized'
 /bin/busybox sleep 5
 if [ -b /dev/mmcblk0 ]; then
@@ -31,6 +45,12 @@ else
 	echo 'MICRONUX:M6:COMBINED:IFACE state=missing name=ethsta0'
 fi
 
-echo 'MICRONUX:M6:COMBINED:SHELL ready console=ttyGS0 network=nonblocking'
-exec /bin/busybox setsid /bin/busybox cttyhack /bin/busybox sh -i \
-	</dev/ttyGS0 >/dev/ttyGS0 2>&1
+echo 'MICRONUX:M6:COMBINED:SHELL ready console=ttyGS0 network=nonblocking device_api=1.0'
+/bin/busybox setsid /bin/busybox cttyhack /bin/busybox sh -i \
+	</dev/ttyGS0 >/dev/ttyGS0 2>&1 &
+console_shell_pid=$!
+wait "$console_shell_pid"
+console_status=$?
+/bin/busybox kill "$device_supervisor_pid" 2>/dev/null
+wait "$device_supervisor_pid" 2>/dev/null
+exit "$console_status"

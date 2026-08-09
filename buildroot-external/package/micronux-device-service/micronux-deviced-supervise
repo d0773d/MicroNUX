@@ -1,0 +1,8 @@
+#!/bin/sh
+
+while :; do
+	/usr/sbin/micronux-deviced
+	status=$?
+	echo "MICRONUX:M8:SERVICE restart status=$status"
+	/bin/busybox sleep 1
+done

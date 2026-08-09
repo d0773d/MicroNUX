@@ -1,0 +1,7 @@
+{
+  "name": "micronux-device-fault",
+  "version": "0.1.0",
+  "kind": "app",
+  "permissions": [],
+  "requires": []
+}

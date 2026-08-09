@@ -1,0 +1,8 @@
+config BR2_PACKAGE_MICRONUX_IGNITEVM
+	bool "micronux-ignitevm"
+	select BR2_PACKAGE_CJSON
+	select BR2_PACKAGE_MICRONUX_DEVICE_SERVICE
+	help
+	  Linux userspace runner for real IgniteVM IGPK packages. The build
+	  requires MICRONUX_IGNITEVM_SOURCE_DIR to name an IgniteVM source
+	  checkout with the portable host support used by MicroNUX.

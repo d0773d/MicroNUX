@@ -10,7 +10,8 @@ desktop Linux compatibility or MMU-backed process isolation.
 
 ## Current status
 
-Milestones M0 through M5 are complete. The pinned `rv32imac`/`ilp32` NOMMU
+Milestones M0 through M5 and the M8 device-service ABI v1 slice are complete;
+M6 remains open for display work. The pinned `rv32imac`/`ilp32` NOMMU
 image boots a reduced BusyBox bFLT shell with 32 MiB RAM under QEMU. On the
 physical ESP32-P4 revision 1.3, the M3 loader validates and loads Linux and its
 device tree from flash, installs an exact PMP memory window, and hands off to a
@@ -46,7 +47,13 @@ controller profiles compile behind a default-off power-safety gate; physical
 color-bar verification awaits the attached panel's controller label. On
 revision 1.3, USB status is serviced once per kernel tick and every userspace
 return uses a two-stage CLIC `mret` sequence so task switches cannot retain an
-active interrupt level.
+active interrupt level. Linux now also exposes the local, versioned
+`micronux-deviced` ABI to shell commands, native C, and the actual IgniteVM C
+runtime. The hardware gate ran direct-compiler Ignite bytecode as UID 65534,
+proved observe-only peer credentials, survived an intentional VM fault, and
+recovered both a killed client and killed service without losing Linux device
+ownership. The resulting Image is 5,761,632 bytes, including the 231,288-byte
+IgniteVM bFLT runner, and remains within the fixed 6 MiB partition.
 
 ## Design baseline
 
@@ -75,6 +82,7 @@ userspace image and workload.
 - [M4 ESP32-P4 hardware shell](docs/m4-shell.md)
 - [M5 NOMMU hardening and stress gate](docs/m5-hardening.md)
 - [M6 storage and peripheral bring-up](docs/m6-peripherals.md)
+- [M8 Linux device service and application ABI](docs/m8-device-services.md)
 
 ## Project policy
 
