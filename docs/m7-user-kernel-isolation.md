@@ -1,12 +1,12 @@
 # M7 User/Kernel Isolation Results
 
-Status: **WP0-WP3 proven on hardware; shared-pool kernel containment active**
+Status: **WP0-WP4 proven on hardware; per-process containment active**
 
 M7 is converting the ESP32-P4 revision-1.3, machine-mode, single-core NOMMU
 baseline into a system where a faulty bFLT child can be terminated without
-being able to corrupt Linux. The work is deliberately gated in layers. WP3
-proves that boundary for the shared user pool; WP4 must still separate one
-userspace process from another.
+being able to corrupt Linux or another userspace process. The work is
+deliberately gated in layers. WP3 proved the kernel boundary for a shared user
+pool; WP4 now gives each userspace `mm_struct` its own hardware-enforced arena.
 
 ## Frozen baseline
 
@@ -19,14 +19,15 @@ userspace process from another.
 | Candidate kernel RAM | `[0x48400000,0x49700000)`, 19 MiB |
 | Loader reserve | `[0x48000000,0x48400000)`, 4 MiB |
 | Comms reserve | `[0x49f00000,0x4a000000)`, 1 MiB |
-| M7 Image | 5,753,528 bytes, SHA-256 `a0569c353b51ee805d008406d941767e2b8d5980706584a47c8992583fc9ef1f` |
+| M7 Image | 5,810,912 bytes, SHA-256 `9bb6555fff500fcaffe18232f1be1015485a291cfc5907c112011ae7ab1e5de8` |
 | M7 DTB | 2,147 bytes, SHA-256 `a820ab4da5722a71457adae47e25934c863f34f16fcbced747ef13d6390647db` |
-| M7 rootfs | 1,410,048 bytes, SHA-256 `5cc9a696a11b7d23caee9075dc1147edde901bc4d1cd99b7225523f1a62f2650` |
+| M7 rootfs | 1,512,960 bytes, SHA-256 `597553ae7b1d7d2b5dad384bacfba8d3022a9dad4255977519db452e9a64a4c2` |
 
 The dedicated reservation leaves 19 MiB in the general Linux allocator. The
-M7 kernel reported 13,084 KiB available during boot and a repeatable 8,916 KiB
-`MemFree` after the shell and device service were ready. The pool baseline was
-394 pages used and 1,654 pages free on every measured boot.
+M7 kernel reported 13,020 KiB available during boot and a repeatable 8,804 KiB
+`MemFree` after the shell and device service were ready. The WP4 pool baseline
+was 465 pages reserved, 394 pages mapped, 1,583 pages free, and five live
+arenas on every measured boot.
 
 The automated baseline executes three independent ROM-reset boots, records all
 16 PMP address/configuration entries before and after the loader handoff setup,
@@ -60,7 +61,7 @@ across three resets:
 | 15 | `5007fffc/18` | peripheral MMIO denied |
 
 The accepted loader is 273,008 bytes with SHA-256
-`0e7bd2b22f857fbb23cdba38e3ca64a36041969d9e3409d7dc7cc558d7de85d4`.
+`c352d61e0d0af3e82f0f1657e24f88deca99d537908ec0d8062c21c51d65ca67`.
 It emits:
 
 ```text
@@ -170,17 +171,64 @@ in both copy directions with `EFAULT`. The suite then reran the M5 process,
 signal, timer, allocation, and console gate plus repeated process teardown.
 Pool accounting returned to `394/1654` every time.
 
+## Per-process arenas
+
+Each NOMMU `mm_struct` now owns one contiguous, grow-only arena inside the
+8 MiB user pool. The bFLT loader reserves the exact initial mapping at the
+start of the largest free extent. Anonymous and copied-private mappings first
+reuse free pages within that arena and may then extend only through immediately
+adjacent unowned pages. An arena never grows across a page owned by another
+process; an allocation that cannot remain contiguous fails with `ENOMEM` even
+if smaller, non-contiguous extents remain elsewhere in the pool.
+
+The allocator maintains a global reservation bitmap, a page-owner table, and
+a mapped-page bitmap for each arena. It zeroes an initial arena before
+publishing valid bounds, zeroes every later mapping before returning it, keeps
+freed VMA pages reserved to the owning `mm_struct`, and clears the PMP bounds
+before releasing an arena for reuse. Ownership inconsistencies fail closed
+instead of clearing pages attributed to a different process.
+
+The U-return hook now loads `user_lo` and `user_hi` from the current
+`mm_struct`; it no longer grants the complete pool. Generic string uaccess
+helpers also cap their scan at the current `user_hi`, which lets normal exec
+argument copying work without relaxing the range check. The negative test
+discovers the exact upper bound through zero-length syscalls, requires a
+two-byte buffer crossing that bound to return `EFAULT`, accepts only a
+zero-length operation exactly at `user_hi`, and rejects `user_hi + 1`.
+
+The arena-specific hardware test keeps a parent and child alive
+simultaneously, exchanges their known stack addresses through inherited pipe
+descriptors, and verifies each receives `SIGSEGV` when reading the other's
+address. It then runs 32 write/re-exec/reuse cycles at the same address and
+requires zero-filled memory each time. A deliberately corrupt bFLT relocation
+tests exec-failure teardown and exact accounting recovery. The final clean
+payload passed three independent ROM resets:
+
+```text
+M7 arena boot 1/3 passed: reserved=465 mapped=394 free=1583 arenas=5 mem_kib=8804->8792
+M7 arena boot 2/3 passed: reserved=465 mapped=394 free=1583 arenas=5 mem_kib=8804->8792
+M7 arena boot 3/3 passed: reserved=465 mapped=394 free=1583 arenas=5 mem_kib=8804->8792
+```
+
+Every boot also passed the one MiB fragmentation regression, all 16 hardware
+fault cases, both directions of syscall-pointer validation, eight repeated
+probe executions, and the M5 4 MiB allocation/process/signal/timer/console
+suite. The sibling addresses were `0x499c6e0c` and `0x499eee80`; the 32 reuse
+cycles consistently reused `0x499ef000`. Pool accounting returned exactly to
+baseline and general `MemFree` remained within the 16 KiB tolerance.
+
 ## Exact guarantee and remaining work
 
-WP3 establishes **shared-pool kernel containment** for CPU accesses: U-mode
-code can execute only in `[0x49700000,0x49f00000)` and cannot directly read,
-write, or execute kernel RAM, loader RAM, direct aliases, or protected platform
-regions. The M-mode kernel remains fully trusted and is not constrained by
-these unlocked PMP permissions.
+WP4 establishes **per-process CPU containment**: U-mode code can access only
+the arena belonging to the `mm_struct` currently returning to userspace. It
+cannot directly read, write, or execute kernel RAM, loader RAM, direct aliases,
+protected platform regions, or another live process's arena. The M-mode kernel
+remains fully trusted and is not constrained by these unlocked PMP
+permissions.
 
-This is not yet full application isolation. Every `mm_struct` currently
-receives the whole 8 MiB pool, so one malicious userspace process could access
-another process's live memory. The interval is also RWX, and PMP does not act
-as an IOMMU for peripheral DMA. WP4 must assign one zeroed arena per process;
-WP5 adds job privilege and resource policy; WP6 audits DMA ownership and
-enforces the documented W^X design.
+This is not yet the complete untrusted-application profile. Arena pages remain
+RWX, and PMP does not act as an IOMMU for peripheral DMA. Application jobs also
+still originate from the root shell without the dedicated identity,
+capability/device policy, and resource supervisor required by WP5. WP6 audits
+every enabled DMA path and either implements the planned W^X split or retains
+it as an explicit measured limitation.

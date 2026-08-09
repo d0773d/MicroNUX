@@ -170,8 +170,27 @@ static int expect_efault(int descriptor, int reading,
 	return 0;
 }
 
+static int zero_length_read_allowed(int descriptor, uintptr_t address)
+{
+	ssize_t result;
+
+	errno = 0;
+	result = read(descriptor, (void *)address, 0);
+	if (result == 0)
+		return 1;
+	if (result == -1 && errno == EFAULT)
+		return 0;
+	return -1;
+}
+
 static int test_uaccess(void)
 {
+	struct pointer_case cross_arena = { "cross-arena-hi", 0, 2U };
+	struct pointer_case invalid_zero = { "zero-outside-arena", 0, 0U };
+	unsigned char valid_byte = 0;
+	uintptr_t current_hi;
+	uintptr_t high;
+	uintptr_t low;
 	int sink;
 	int source;
 	size_t index;
@@ -194,11 +213,47 @@ static int test_uaccess(void)
 			return 1;
 		}
 	}
-	if (read(source, (void *)MICRONUX_USER_END, 0) != 0 ||
-	    write(sink, (void *)MICRONUX_USER_END, 0) != 0) {
+	low = (uintptr_t)&valid_byte;
+	high = MICRONUX_USER_END;
+	if (low >= high || zero_length_read_allowed(source, low) != 1) {
 		(void)close(sink);
 		(void)close(source);
-		return fail("zero-length", "pool-end", MICRONUX_USER_END);
+		return fail("zero-length", "valid-user", (uintptr_t)&valid_byte);
+	}
+	while (low < high) {
+		const uintptr_t middle = low + (high - low + 1U) / 2U;
+		const int allowed = zero_length_read_allowed(source, middle);
+
+		if (allowed < 0) {
+			(void)close(sink);
+			(void)close(source);
+			return fail("zero-length", "search", middle);
+		}
+		if (allowed != 0)
+			low = middle;
+		else
+			high = middle - 1U;
+	}
+	current_hi = low;
+	cross_arena.address = current_hi - 1U;
+	if (expect_efault(source, 1, &cross_arena) != 0 ||
+	    expect_efault(sink, 0, &cross_arena) != 0) {
+		(void)close(sink);
+		(void)close(source);
+		return 1;
+	}
+	if (read(source, (void *)current_hi, 0) != 0 ||
+	    write(sink, (void *)current_hi, 0) != 0) {
+		(void)close(sink);
+		(void)close(source);
+		return fail("zero-length", "arena-hi", current_hi);
+	}
+	invalid_zero.address = current_hi + 1U;
+	if (expect_efault(source, 1, &invalid_zero) != 0 ||
+	    expect_efault(sink, 0, &invalid_zero) != 0) {
+		(void)close(sink);
+		(void)close(source);
+		return 1;
 	}
 	if (close(sink) != 0 || close(source) != 0)
 		return fail("close", "uaccess", 0);
@@ -211,8 +266,8 @@ static int test_uaccess(void)
 			return fail("marker", "uaccess", 0);
 	}
 	printf("MICRONUX:M7:UACCESS pass cases=%zu directions=2 overflow=pass "
-	       "zero_end=pass\n",
-	       sizeof(pointer_cases) / sizeof(pointer_cases[0]));
+	       "cross_hi=pass zero_hi=%08" PRIxPTR " zero_outside=pass\n",
+	       sizeof(pointer_cases) / sizeof(pointer_cases[0]), current_hi);
 	return 0;
 }
 

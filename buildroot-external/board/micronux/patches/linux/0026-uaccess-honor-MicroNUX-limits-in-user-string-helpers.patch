@@ -1,0 +1,84 @@
+From 616f89b862b84afaa8a6ed196f5e001424a108dc Mon Sep 17 00:00:00 2001
+From: MicroNUX_Project <micronux@example.invalid>
+Date: Sun, 9 Aug 2026 12:28:57 -0700
+Subject: [PATCH] uaccess: honor MicroNUX limits in user string helpers
+
+Generic user string helpers derive their maximum readable address from
+TASK_SIZE_MAX. MicroNUX assigns a smaller dynamic upper bound to each NOMMU
+process. Validating the caller's full count therefore rejects short strings
+near the top of an arena.
+
+Use the current arena limit as the address-space maximum. Existing loops
+preserve the distinction between a caller count and an address-space fault.
+
+Signed-off-by: MicroNUX_Project <micronux@example.invalid>
+---
+ arch/riscv/include/asm/micronux_user_isolation.h | 1 +
+ arch/riscv/mm/micronux_user_pool.c               | 9 +++++++++
+ lib/strncpy_from_user.c                          | 3 +++
+ lib/strnlen_user.c                               | 3 +++
+ 4 files changed, 16 insertions(+)
+
+diff --git a/arch/riscv/include/asm/micronux_user_isolation.h b/arch/riscv/include/asm/micronux_user_isolation.h
+index 6dab28b..614d488 100644
+--- a/arch/riscv/include/asm/micronux_user_isolation.h
++++ b/arch/riscv/include/asm/micronux_user_isolation.h
+@@ -11,6 +11,7 @@
+ #define MICRONUX_PMP_GRANULARITY	128UL
+ 
+ bool micronux_user_access_ok(unsigned long addr, unsigned long size);
++unsigned long micronux_user_addr_limit(void);
+ void micronux_user_pmp_prepare_return(void);
+ 
+ #endif /* _ASM_RISCV_MICRONUX_USER_ISOLATION_H */
+diff --git a/arch/riscv/mm/micronux_user_pool.c b/arch/riscv/mm/micronux_user_pool.c
+index 0302596..8e1694c 100644
+--- a/arch/riscv/mm/micronux_user_pool.c
++++ b/arch/riscv/mm/micronux_user_pool.c
+@@ -112,6 +112,15 @@ bool micronux_user_access_ok(unsigned long addr, unsigned long size)
+ 	return size <= hi - addr;
+ }
+ 
++unsigned long micronux_user_addr_limit(void)
++{
++	struct mm_struct *mm = current->mm;
++
++	if (!mm || !READ_ONCE(mm->context.user_bounds_valid))
++		return 0;
++	return READ_ONCE(mm->context.user_hi);
++}
++
+ unsigned long micronux_user_pool_free_pages(void)
+ {
+ 	unsigned long flags;
+diff --git a/lib/strncpy_from_user.c b/lib/strncpy_from_user.c
+index 6dc2349..4ab4b97 100644
+--- a/lib/strncpy_from_user.c
++++ b/lib/strncpy_from_user.c
+@@ -133,6 +133,9 @@ long strncpy_from_user(char *dst, const char __user *src, long count)
+ 	}
+ 
+ 	max_addr = TASK_SIZE_MAX;
++#ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++	max_addr = micronux_user_addr_limit();
++#endif
+ 	src_addr = (unsigned long)untagged_addr(src);
+ 	if (likely(src_addr < max_addr)) {
+ 		unsigned long max = max_addr - src_addr;
+diff --git a/lib/strnlen_user.c b/lib/strnlen_user.c
+index 6e489f9..9ca7d0d 100644
+--- a/lib/strnlen_user.c
++++ b/lib/strnlen_user.c
+@@ -106,6 +106,9 @@ long strnlen_user(const char __user *str, long count)
+ 	}
+ 
+ 	max_addr = TASK_SIZE_MAX;
++#ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++	max_addr = micronux_user_addr_limit();
++#endif
+ 	src_addr = (unsigned long)untagged_addr(str);
+ 	if (likely(src_addr < max_addr)) {
+ 		unsigned long max = max_addr - src_addr;
+-- 
+2.43.0
+

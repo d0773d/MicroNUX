@@ -133,6 +133,8 @@ install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-isolation-probe" \
 	"${ARTIFACT_DIR}/micronux-isolation-probe"
 install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-isolation-fault" \
 	"${ARTIFACT_DIR}/micronux-isolation-fault"
+install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-arena-test" \
+	"${ARTIFACT_DIR}/micronux-arena-test"
 
 (
 	cd "${ARTIFACT_DIR}"
@@ -140,7 +142,7 @@ install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-isolation-fault" \
 		micronux-selftest micronux-exec-child micronux-netctl \
 		micronux-device micronux-device-native micronux-device-selftest \
 		micronux-deviced micronux-storage-test micronux-isolation-probe \
-		micronux-isolation-fault \
+		micronux-isolation-fault micronux-arena-test \
 		> SHA256SUMS
 )
 

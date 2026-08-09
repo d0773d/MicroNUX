@@ -133,7 +133,7 @@ Linux scanout, backlight ownership, and a Linux console remain separate gates.
 
 ## M7 - Isolation, SMP, and upstream evaluation
 
-Status: **in progress; WP3 shared-pool kernel containment proven**
+Status: **in progress; WP4 per-process CPU containment proven**
 
 - Use PMP to protect critical kernel, loader, and coprocessor regions where
   practical.
@@ -147,14 +147,15 @@ paths MicroNUX will support.
 Current artifact: [M7 user/kernel isolation results](m7-user-kernel-isolation.md).
 The version-pinned ESP-IDF v6.0.1 early-PMP patch and loader audit passed three
 independent hardware resets on revision 1.3. A separate M7 Linux profile now
-reserves an 8 MiB user pool and routes bFLT images and anonymous NOMMU mappings
-through its zero-on-allocation, no-fallback allocator. Linux now replaces the
-unlocked loader handoff before every U-mode return with a read-back-verified
-PMP boundary around that pool, and NOMMU `access_ok()` enforces the same bounds.
-Three reset boots passed 16 privilege/read/write/execute fault cases, malformed
-syscall-pointer checks, M5 selftests, and repeated teardown with stable pool
-accounting. This proves kernel containment for the shared pool. Per-process
-arenas, job policy, DMA isolation, and W^X remain open.
+reserves an 8 MiB user pool and gives each `mm_struct` a contiguous,
+zero-on-allocation arena with no fallback to the kernel allocator. Linux now
+replaces the unlocked loader handoff before every U-mode return with a
+read-back-verified PMP boundary around the current arena, and NOMMU
+`access_ok()` enforces the same bounds. Three reset boots passed 16
+privilege/read/write/execute fault cases, cross-process address probes,
+malformed syscall-pointer checks, arena reuse and failed-exec recovery, M5
+selftests, and repeated teardown with stable accounting. This proves
+per-process CPU containment. Job policy, DMA isolation, and W^X remain open.
 
 ## M8 - Linux device services and applications
 

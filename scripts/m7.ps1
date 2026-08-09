@@ -45,12 +45,14 @@ $dtbPath = Join-Path $artifactPath "esp32p4-micronux.dtb"
 $metadataPath = Join-Path $artifactPath "metadata.bin"
 $probePath = Join-Path $artifactPath "micronux-isolation-probe"
 $faultPath = Join-Path $artifactPath "micronux-isolation-fault"
+$arenaTestPath = Join-Path $artifactPath "micronux-arena-test"
 foreach ($artifact in @(
     $linuxImagePath,
     $dtbPath,
     $metadataPath,
     $probePath,
-    $faultPath
+    $faultPath,
+    $arenaTestPath
 )) {
     if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
         throw "Missing M7 artifact: $artifact"

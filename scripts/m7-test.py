@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the MicroNUX M7 reserved-user-pool gate on ESP32-P4 hardware."""
+"""Exercise the MicroNUX M7 per-mm arena gate on ESP32-P4 hardware."""
 
 from __future__ import annotations
 
@@ -20,9 +20,10 @@ REQUIRED_MARKERS = (
     "MICRONUX:M3:JUMP",
     "MICRONUX:M7:PMP baseline=pass early-deny=pass "
     "handoff=13-14-unlocked overlay=13-14",
-    "MICRONUX:M7:PMP cached=7-9 direct=12-13 mode=tor+napot state=ready "
-    "range=[49700000,49f00000) config=08,0f,08,08,18 lock=off",
-    "MICRONUX:M7:POOL state=ready range=[49700000,49f00000) pages=2048",
+    "MICRONUX:M7:PMP cached=7-9 direct=12-13 mode=per-mm+tor+napot "
+    "state=ready first=[",
+    "MICRONUX:M7:POOL state=ready range=[49700000,49f00000) pages=2048 "
+    "zero=on-arena+allocate ownership=per-mm",
     "Linux version 6.12.27",
     "MICRONUX:M6:COMBINED:SHELL ready console=ttyGS0 network=nonblocking",
     "MICRONUX:M8:SERVICE state=ready abi=1.0",
@@ -35,6 +36,11 @@ REQUIRED_MARKERS = (
     "MICRONUX:M5:PASS",
     "MICRONUX:M7:POOL-TEST:SELFTEST:RC=0",
     "MICRONUX:M7:POOL-TEST:REPEAT:RC=0",
+    "MICRONUX:M7:ARENA:SIBLING:PASS",
+    "MICRONUX:M7:ARENA:REUSE:PASS cycles=32",
+    "MICRONUX:M7:ARENA:EXEC-FAIL:PASS",
+    "MICRONUX:M7:ARENA:PASS ownership=per-mm vfork=pass signals=pass",
+    "MICRONUX:M7:POOL-TEST:ARENA:RC=0",
     "MICRONUX:M7:POOL-TEST:DONE",
 )
 
@@ -47,6 +53,7 @@ FORBIDDEN_MARKERS = (
     "MICRONUX:M7:POOL state=exhausted",
     "MICRONUX:M7:POOL-PROBE:FAIL",
     "MICRONUX:M7:ISOLATION-FAULT:FAIL",
+    "MICRONUX:M7:ARENA:FAIL",
     "Kernel panic",
     "Oops:",
     "BUG:",
@@ -105,6 +112,8 @@ def test_command() -> str:
         f"{repeats}"
         "; do /usr/bin/micronux-isolation-probe >/dev/null || RC=1; done; "
         "echo MICRONUX:M7:POOL-TEST:REPEAT:RC=$RC; "
+        "/usr/bin/micronux-arena-test; "
+        "echo MICRONUX:M7:POOL-TEST:ARENA:RC=$?; "
         "echo MICRONUX:M7:POOL-TEST:ACCOUNT-AFTER; "
         "cat /proc/micronux_user_pool; "
         "echo MICRONUX:M7:POOL-TEST:MEM-AFTER; "
@@ -167,11 +176,12 @@ def artifact_hashes(directory: Path) -> tuple[str, str]:
     dtb = directory / "esp32p4-micronux.dtb"
     probe = directory / "micronux-isolation-probe"
     fault = directory / "micronux-isolation-fault"
-    for path in (image, dtb, probe, fault):
+    arena = directory / "micronux-arena-test"
+    for path in (image, dtb, probe, fault, arena):
         if not path.is_file():
             raise FileNotFoundError(path)
 
-    for binary in (probe, fault):
+    for binary in (probe, fault, arena):
         header = binary.read_bytes()[:44]
         if len(header) != 44 or header[:4] != b"bFLT":
             raise ValueError(f"{binary.name} is not bFLT")
@@ -194,19 +204,24 @@ def boot_hashes(log: str) -> tuple[str, str]:
     return kernel.group(1), dtb.group(1)
 
 
-def accounting(log: str, phase: str) -> tuple[int, int]:
+def accounting(log: str, phase: str) -> tuple[int, int, int, int]:
     match = re.search(
         rf"MICRONUX:M7:POOL-TEST:ACCOUNT-{phase}\r?\n"
         r"MICRONUX:M7:POOL range=\[49700000,49f00000\) "
-        r"pages=2048 used=(\d+) free=(\d+)",
+        r"pages=2048 reserved=(\d+) mapped=(\d+) free=(\d+) arenas=(\d+)",
         log,
     )
     if match is None:
         raise ValueError(f"missing pool accounting for {phase.lower()}")
-    used, free = int(match.group(1)), int(match.group(2))
-    if used + free != 2048:
+    reserved, mapped, free, arenas = (
+        int(match.group(1)),
+        int(match.group(2)),
+        int(match.group(3)),
+        int(match.group(4)),
+    )
+    if reserved + free != 2048 or mapped > reserved or arenas > reserved:
         raise ValueError(f"invalid pool accounting for {phase.lower()}")
-    return used, free
+    return reserved, mapped, free, arenas
 
 
 def free_memory(log: str, phase: str) -> int:
@@ -238,7 +253,7 @@ def main() -> int:
         return 1
 
     complete_log: list[str] = []
-    expected_accounting: tuple[int, int] | None = None
+    expected_accounting: tuple[int, int, int, int] | None = None
     for boot in range(1, args.boots + 1):
         log = ""
         try:
@@ -255,7 +270,7 @@ def main() -> int:
         except (OSError, subprocess.CalledProcessError, ValueError) as error:
             if log:
                 print(log, file=sys.stderr)
-            print(f"M7 pool boot {boot}: {error}", file=sys.stderr)
+            print(f"M7 arena boot {boot}: {error}", file=sys.stderr)
             return 1
 
         missing = [marker for marker in REQUIRED_MARKERS if not marker_seen(log, marker)]
@@ -270,7 +285,7 @@ def main() -> int:
         if missing or forbidden or payload != expected_payload or before != after:
             print(log, file=sys.stderr)
             print(
-                f"M7 pool boot {boot}: missing={missing} forbidden={forbidden} "
+                f"M7 arena boot {boot}: missing={missing} forbidden={forbidden} "
                 f"payload={payload} expected={expected_payload} "
                 f"pool_before={before} pool_after={after}",
                 file=sys.stderr,
@@ -278,7 +293,7 @@ def main() -> int:
             return 1
         if memory_after + 16 < memory_before:
             print(
-                f"M7 pool boot {boot}: kernel memory loss exceeds 16 KiB: "
+                f"M7 arena boot {boot}: kernel memory loss exceeds 16 KiB: "
                 f"{memory_before}->{memory_after}",
                 file=sys.stderr,
             )
@@ -286,18 +301,19 @@ def main() -> int:
         if expected_accounting is None:
             expected_accounting = before
         elif before != expected_accounting:
-            print(f"M7 pool accounting changed across boot {boot}", file=sys.stderr)
+            print(f"M7 arena accounting changed across boot {boot}", file=sys.stderr)
             return 1
         print(
-            f"M7 pool boot {boot}/{args.boots} passed: used={before[0]} "
-            f"free={before[1]} mem_kib={memory_before}->{memory_after}"
+            f"M7 arena boot {boot}/{args.boots} passed: "
+            f"reserved={before[0]} mapped={before[1]} free={before[2]} "
+            f"arenas={before[3]} mem_kib={memory_before}->{memory_after}"
         )
 
     if args.log is not None:
         args.log.parent.mkdir(parents=True, exist_ok=True)
         args.log.write_text("\n".join(complete_log), encoding="utf-8")
     print(
-        f"M7 reserved-user-pool gate passed: boots={args.boots} "
+        f"M7 per-mm arena gate passed: boots={args.boots} "
         f"range=[49700000,49f00000) payload={expected_payload[0]}"
     )
     return 0
