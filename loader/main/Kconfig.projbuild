@@ -40,6 +40,18 @@ menu "MicroNUX loader profile"
             reservation; this option does not grant Linux framebuffer
             ownership. Leave disabled until the attached panel label is known.
 
+    config MICRONUX_MIPI_DSI_PROBE
+        bool "Probe for a MIPI display adapter without powering the panel"
+        depends on !MICRONUX_MIPI_DSI
+        default n
+        help
+            Check only whether the Waveshare display adapter acknowledges at
+            I2C address 0x45. The probe performs no I2C register writes, does
+            not enable the panel rail, D-PHY, scanout, or backlight, and
+            releases the I2C controller before Linux handoff. An ACK proves
+            attachment, not the panel controller model; the physical label is
+            still required before selecting an electrical proof profile.
+
     if MICRONUX_MIPI_DSI
 
         choice MICRONUX_MIPI_PANEL

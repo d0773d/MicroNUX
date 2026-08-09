@@ -36,7 +36,7 @@ dependencies:
       require: private
       version: '>=4.0'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 1.5.2
   idf:
@@ -105,9 +105,10 @@ dependencies:
     version: 2.0.0
 direct_dependencies:
 - espressif/esp_lcd_ek79007
+- espressif/i2c_bus
 - waveshare/esp_lcd_hx8394
 - waveshare/esp_lcd_ili9881c
 - waveshare/esp_lcd_jd9365
-manifest_hash: db91a92c0803ce4b43256b33144bf601dc6b8d6112e07b7403a989fdb2931a78
+manifest_hash: 8dd2157c90bfcb005c3af2f15d0ec03146f85bf90cc26d13874226e51123518b
 target: esp32p4
 version: 3.0.0

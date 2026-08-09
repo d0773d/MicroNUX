@@ -17,7 +17,6 @@ import serial
 REQUIRED_MARKERS = (
     "MICRONUX:M3:BOOT",
     "MICRONUX:M3:JUMP",
-    "MICRONUX:M6:DSI state=disabled reason=profile-off",
     "MICRONUX:M6:SDMMC power=ldo4 voltage_mv=3300 slot=0 width=4",
     "MICRONUX:M6:NET transport=sdio slot=1 width=4",
     "MICRONUX:M6:SDMMC profile=dual slots=0,1 arbitration=linux-serialized",
@@ -262,6 +261,7 @@ def milestone_lines(log: str) -> list[str]:
                 "MICRONUX:M3:KERNEL",
                 "MICRONUX:M3:DTB",
                 "MICRONUX:M6:SDMMC",
+                "MICRONUX:M6:DSI",
                 "MICRONUX:M6:NET",
                 "MICRONUX:M6:COMBINED",
                 "MICRONUX:M6:STORAGE",
@@ -283,6 +283,11 @@ def main() -> int:
     parser.add_argument("--artifact-dir", type=Path, required=True)
     parser.add_argument("--write-test", action="store_true")
     parser.add_argument("--soak-cycles", type=int, default=0)
+    parser.add_argument(
+        "--expect-mipi-adapter",
+        choices=("present", "absent"),
+        help="accept the read-only MIPI attachment-probe loader and require this result",
+    )
     args = parser.parse_args()
     if args.boots < 1:
         parser.error("--boots must be at least 1")
@@ -308,7 +313,17 @@ def main() -> int:
         print(f"--- M6 combined boot {boot}/{args.boots} ---")
         print("\n".join(milestone_lines(log)) or "(no combined milestones captured)")
 
+        display_marker = (
+            "MICRONUX:M6:DSI state=disabled reason=profile-off"
+            if args.expect_mipi_adapter is None
+            else (
+                "MICRONUX:M6:DSI state=probe "
+                f"adapter={args.expect_mipi_adapter} address=0x45"
+            )
+        )
         missing = [marker for marker in REQUIRED_MARKERS if not marker_seen(log, marker)]
+        if not marker_seen(log, display_marker):
+            missing.append(display_marker)
         forbidden = [
             marker for marker in FORBIDDEN_MARKERS if marker_seen(log, marker)
         ]

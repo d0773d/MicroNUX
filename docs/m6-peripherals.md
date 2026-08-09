@@ -415,11 +415,33 @@ and [ESP-IDF Provisioning Android app](https://github.com/espressif/esp-idf-prov
 
 ## MIPI-DSI electrical-proof profile
 
+Before selecting a controller, a separate attachment probe can check whether
+the Waveshare adapter acknowledges at I2C address `0x45`. It performs only the
+address phase: no register or DSI command is written, the panel rail and D-PHY
+stay off, no scanout is created, and I2C is released before Linux handoff. An
+ACK confirms attachment but cannot distinguish panel controllers.
+
+Build-only is the default:
+
+```powershell
+.\scripts\m6-mipi-probe.ps1
+```
+
+Flashing requires explicit acknowledgement that the P4 will reset:
+
+```powershell
+.\scripts\m6-mipi-probe.ps1 -Port COM14 -Flash -ConfirmAttachmentProbe
+py -3 scripts\m6-combined-test.py --port COM14 --boots 1 --timeout 420 --artifact-dir out\m6-combined --expect-mipi-adapter present
+```
+
 M6-D0 is implemented as a loader-owned, exact-controller diagnostic. It
 enables ESP32-P4 D-PHY LDO channel 3 at 2.5 V, configures two DSI lanes, uses
 the Waveshare backlight controller at I2C address `0x45`, and starts the
 hardware vertical-color-bar generator. Backlight stays off until panel init,
-pattern setup, and framebuffer ownership checks have succeeded.
+pattern setup, and framebuffer ownership checks have succeeded. The pinned
+Waveshare constructors normally write the adapter power and full-brightness
+registers internally; the MicroNUX link guard suppresses those constructor
+writes and applies the configured bounded brightness only after every gate.
 
 | Profile | Resolution | Lane rate | Intended Waveshare panel |
 | --- | ---: | ---: | --- |
@@ -433,7 +455,8 @@ The profiles use the official
 and [Espressif LCD component](https://github.com/espressif/esp-iot-solution)
 implementations. All four selected branches and the unselected refusal branch
 compile with ESP-IDF v6.0.1 and pinned component versions. Build-only is the
-default:
+default. Exact-panel builds retain the already validated combined microSD/C6
+profile so the diagnostic does not replace the M6 baseline:
 
 ```powershell
 .\scripts\m6-mipi.ps1 -Panel jd9365

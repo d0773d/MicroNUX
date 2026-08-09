@@ -14,10 +14,66 @@
 #include "esp_log.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "micronux_mipi_dsi.h"
+#include "micronux_panel_guard.h"
 
 static const char *const TAG = "micronux_dsi";
+
+#if CONFIG_MICRONUX_MIPI_DSI || CONFIG_MICRONUX_MIPI_DSI_PROBE
+#define MICRONUX_DSI_I2C_PORT 0
+#define MICRONUX_DSI_I2C_SDA GPIO_NUM_7
+#define MICRONUX_DSI_I2C_SCL GPIO_NUM_8
+#define MICRONUX_DSI_BACKLIGHT_ADDRESS UINT16_C(0x45)
+#endif
+
+#if CONFIG_MICRONUX_MIPI_DSI_PROBE
+static esp_err_t probe_display_adapter(void)
+{
+    i2c_master_bus_handle_t bus = NULL;
+    const i2c_master_bus_config_t bus_config = {
+        .i2c_port = MICRONUX_DSI_I2C_PORT,
+        .sda_io_num = MICRONUX_DSI_I2C_SDA,
+        .scl_io_num = MICRONUX_DSI_I2C_SCL,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+
+    esp_err_t result = i2c_new_master_bus(&bus_config, &bus);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "MICRONUX:M6:DSI state=probe adapter=unknown"
+                 " reason=i2c-bus error=%s dphy=off writes=0",
+                 esp_err_to_name(result));
+        return ESP_OK;
+    }
+
+    result = i2c_master_probe(bus, MICRONUX_DSI_BACKLIGHT_ADDRESS, 50);
+    const esp_err_t release_result = i2c_del_master_bus(bus);
+    if (release_result != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "MICRONUX:M6:DSI state=probe adapter=unknown"
+                 " reason=i2c-release error=%s dphy=off writes=0",
+                 esp_err_to_name(release_result));
+        return ESP_OK;
+    }
+
+    if (result == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "MICRONUX:M6:DSI state=probe adapter=present address=0x45"
+                 " identity=label-required dphy=off writes=0");
+    } else {
+        ESP_LOGW(TAG,
+                 "MICRONUX:M6:DSI state=probe adapter=absent address=0x45"
+                 " error=%s dphy=off writes=0",
+                 esp_err_to_name(result));
+    }
+    return ESP_OK;
+}
+#endif
 
 #if CONFIG_MICRONUX_MIPI_DSI
 
@@ -36,10 +92,6 @@ static const char *const TAG = "micronux_dsi";
 #define MICRONUX_DSI_LANES 2U
 #define MICRONUX_DSI_PHY_LDO_CHANNEL 3
 #define MICRONUX_DSI_PHY_MILLIVOLTS 2500
-#define MICRONUX_DSI_I2C_PORT 0
-#define MICRONUX_DSI_I2C_SDA GPIO_NUM_7
-#define MICRONUX_DSI_I2C_SCL GPIO_NUM_8
-#define MICRONUX_DSI_BACKLIGHT_ADDRESS UINT16_C(0x45)
 #define MICRONUX_DSI_BACKLIGHT_REGISTER UINT8_C(0x96)
 #define MICRONUX_DSI_LOADER_PSRAM_START UINT32_C(0x48000000)
 #define MICRONUX_DSI_LOADER_PSRAM_END UINT32_C(0x48400000)
@@ -135,18 +187,21 @@ static esp_err_t prepare_backlight_off(void)
         return ret;
     }
 
-#if CONFIG_MICRONUX_MIPI_PANEL_EK79007_1024_600
     ESP_GOTO_ON_ERROR(write_backlight_register(0x95, 0x11), fail, TAG,
-                      "enable EK79007 display rail stage 1");
+                      "enable display rail stage 1");
     ESP_GOTO_ON_ERROR(write_backlight_register(0x95, 0x17), fail, TAG,
-                      "enable EK79007 display rail stage 2");
-#endif
+                      "enable display rail stage 2");
     ESP_GOTO_ON_ERROR(
         write_backlight_register(MICRONUX_DSI_BACKLIGHT_REGISTER, 0),
         fail, TAG, "turn backlight off");
+    vTaskDelay(pdMS_TO_TICKS(1000));
     return ESP_OK;
 
 fail:
+    if (s_backlight != NULL) {
+        /* Best effort: a partial rail sequence must never leave light on. */
+        (void)write_backlight_register(MICRONUX_DSI_BACKLIGHT_REGISTER, 0);
+    }
     release_backlight_bus();
     return ret;
 }
@@ -208,23 +263,19 @@ static esp_err_t create_selected_panel(void)
         .bits_per_pixel = 16,
         .vendor_config = &vendor_config,
     };
+    esp_err_t result;
+    micronux_panel_guard_begin();
 #if CONFIG_MICRONUX_MIPI_PANEL_JD9365_800_1280
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_jd9365(
-                            s_panel_io, &panel_config, &s_panel),
-                        TAG, "create JD9365 panel");
+    result = esp_lcd_new_panel_jd9365(s_panel_io, &panel_config, &s_panel);
 #elif CONFIG_MICRONUX_MIPI_PANEL_ILI9881C_720_1280
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_ili9881c(
-                            s_panel_io, &panel_config, &s_panel),
-                        TAG, "create ILI9881C panel");
+    result = esp_lcd_new_panel_ili9881c(s_panel_io, &panel_config, &s_panel);
 #elif CONFIG_MICRONUX_MIPI_PANEL_HX8394_720_1280
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_hx8394(
-                            s_panel_io, &panel_config, &s_panel),
-                        TAG, "create HX8394 panel");
+    result = esp_lcd_new_panel_hx8394(s_panel_io, &panel_config, &s_panel);
 #elif CONFIG_MICRONUX_MIPI_PANEL_EK79007_1024_600
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_ek79007(
-                            s_panel_io, &panel_config, &s_panel),
-                        TAG, "create EK79007 panel");
+    result = esp_lcd_new_panel_ek79007(s_panel_io, &panel_config, &s_panel);
 #endif
+    micronux_panel_guard_end();
+    ESP_RETURN_ON_ERROR(result, TAG, "create selected MIPI panel");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel), TAG,
                         "reset MIPI panel");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG,
@@ -239,7 +290,9 @@ static esp_err_t create_selected_panel(void)
 
 esp_err_t micronux_mipi_dsi_prepare(void)
 {
-#if !CONFIG_MICRONUX_MIPI_DSI
+#if CONFIG_MICRONUX_MIPI_DSI_PROBE
+    return probe_display_adapter();
+#elif !CONFIG_MICRONUX_MIPI_DSI
     ESP_LOGI(TAG, "MICRONUX:M6:DSI state=disabled reason=profile-off");
     return ESP_OK;
 #elif CONFIG_MICRONUX_MIPI_PANEL_UNSELECTED

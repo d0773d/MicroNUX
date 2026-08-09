@@ -1,4 +1,5 @@
 dependencies:
+  espressif/i2c_bus: "1.5.2"
   waveshare/esp_lcd_jd9365: "2.0.0"
   waveshare/esp_lcd_ili9881c: "2.0.0"
   waveshare/esp_lcd_hx8394: "2.0.0"
