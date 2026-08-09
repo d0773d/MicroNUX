@@ -11,11 +11,13 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #define SERIAL_DEVICE "/dev/esps0"
 #define NETWORK_DEVICE "ethsta0"
 #define BUFFER_CAPACITY 768
+#define PSERIAL_ENDPOINT_CAPACITY 16
 #define RPC_TIMEOUT_MS 10000
 
 #define RPC_TYPE_REQUEST 1
@@ -27,6 +29,7 @@
 #define RPC_WIFI_START 280
 #define RPC_WIFI_CONNECT 282
 #define RPC_WIFI_SET_CONFIG 284
+#define RPC_WIFI_RESTORE 291
 
 #define WIFI_INTERFACE_STA 0
 #define WIFI_MODE_STA 1
@@ -181,6 +184,30 @@ static int wait_fd(int fd, short events, int timeout_ms)
 	return (pfd.revents & events) != 0;
 }
 
+static int64_t monotonic_ms(void)
+{
+	struct timespec now;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+		return -1;
+	return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int remaining_timeout_ms(int64_t deadline_ms)
+{
+	int64_t now_ms = monotonic_ms();
+	int64_t remaining_ms;
+
+	if (now_ms < 0)
+		return -1;
+	remaining_ms = deadline_ms - now_ms;
+	if (remaining_ms <= 0) {
+		errno = ETIMEDOUT;
+		return 0;
+	}
+	return (int)remaining_ms;
+}
+
 static int write_all(int fd, const uint8_t *data, size_t length)
 {
 	size_t done = 0;
@@ -202,57 +229,66 @@ static int write_all(int fd, const uint8_t *data, size_t length)
 	return 0;
 }
 
-static ssize_t read_frame(int fd, uint8_t *data, size_t capacity)
+static int read_exact(int fd, uint8_t *data, size_t length,
+		int64_t deadline_ms)
 {
-	ssize_t total = 0;
-	int timeout_ms = RPC_TIMEOUT_MS;
+	size_t done = 0;
 
-	while ((size_t)total < capacity) {
-		int ready = wait_fd(fd, POLLIN, timeout_ms);
+	while (done < length) {
+		int timeout_ms = remaining_timeout_ms(deadline_ms);
+		int ready;
 		ssize_t rc;
 
-		if (ready < 0)
+		if (timeout_ms <= 0)
 			return -1;
-		if (ready == 0)
-			return total;
-		rc = read(fd, data + total, capacity - (size_t)total);
+		ready = wait_fd(fd, POLLIN, timeout_ms);
+		if (ready <= 0) {
+			if (ready == 0)
+				errno = ETIMEDOUT;
+			return -1;
+		}
+		rc = read(fd, data + done, length - done);
 		if (rc > 0) {
-			total += rc;
-			timeout_ms = 50;
+			done += (size_t)rc;
 			continue;
 		}
 		if (rc < 0 && (errno == EINTR || errno == EAGAIN ||
 				errno == EWOULDBLOCK))
 			continue;
-		return rc < 0 ? -1 : total;
+		if (rc == 0)
+			errno = EIO;
+		return -1;
 	}
-	return total;
+	return 0;
 }
 
-static int unwrap_pserial(const uint8_t *frame, size_t frame_length,
-		const uint8_t **protobuf, size_t *protobuf_length)
+static int read_pserial_frame(int fd, uint8_t *endpoint,
+		size_t endpoint_capacity, size_t *endpoint_length,
+		struct buffer *protobuf, int64_t deadline_ms)
 {
-	static const uint8_t endpoint[] = "RPCRsp";
-	size_t offset = 0;
+	uint8_t header[3];
 	uint16_t length;
 
-	if (frame_length < 12 || frame[offset++] != 1)
+	if (read_exact(fd, header, sizeof(header), deadline_ms) < 0)
+		return -1;
+	if (header[0] != 1)
 		goto bad;
-	length = (uint16_t)frame[offset] | ((uint16_t)frame[offset + 1] << 8);
-	offset += 2;
-	if (length != sizeof(endpoint) - 1 || length > frame_length - offset ||
-		memcmp(frame + offset, endpoint, length) != 0)
+	length = (uint16_t)header[1] | ((uint16_t)header[2] << 8);
+	if (length == 0 || length > endpoint_capacity)
 		goto bad;
-	offset += length;
-	if (offset + 3 > frame_length || frame[offset++] != 2)
+	if (read_exact(fd, endpoint, length, deadline_ms) < 0)
+		return -1;
+	*endpoint_length = length;
+
+	if (read_exact(fd, header, sizeof(header), deadline_ms) < 0)
+		return -1;
+	if (header[0] != 2)
 		goto bad;
-	length = (uint16_t)frame[offset] | ((uint16_t)frame[offset + 1] << 8);
-	offset += 2;
-	if (length > frame_length - offset)
+	length = (uint16_t)header[1] | ((uint16_t)header[2] << 8);
+	if (length > sizeof(protobuf->data))
 		goto bad;
-	*protobuf = frame + offset;
-	*protobuf_length = length;
-	return 0;
+	protobuf->length = length;
+	return read_exact(fd, protobuf->data, protobuf->length, deadline_ms);
 
 bad:
 	errno = EBADMSG;
@@ -262,68 +298,79 @@ bad:
 static int rpc_exchange(int fd, uint32_t request_id,
 		const struct buffer *request_payload, struct buffer *response_payload)
 {
-	static const uint8_t endpoint[] = "RPCRsp";
+	static const uint8_t response_endpoint[] = "RPCRsp";
 	struct buffer protobuf = {0};
 	struct buffer pserial = {0};
-	uint8_t frame[BUFFER_CAPACITY];
+	struct buffer response = {0};
+	uint8_t endpoint[PSERIAL_ENDPOINT_CAPACITY];
 	uint32_t uid = next_uid++;
 	uint32_t response_id = request_id + RPC_RESPONSE_OFFSET;
-	ssize_t frame_length;
-	const uint8_t *response;
-	size_t response_length;
-	size_t offset = 0;
-	uint64_t message_type = 0;
-	uint64_t message_id = 0;
-	uint64_t response_uid = 0;
-	bool have_response_payload = false;
-	struct pb_field field;
+	int64_t start_ms;
+	int64_t deadline_ms;
 
 	if (pb_uint(&protobuf, 1, RPC_TYPE_REQUEST) < 0 ||
 		pb_uint(&protobuf, 2, request_id) < 0 ||
 		pb_uint(&protobuf, 3, uid) < 0 ||
 		pb_message(&protobuf, request_id, request_payload) < 0 ||
 		buffer_u8(&pserial, 1) < 0 ||
-		buffer_u16_le(&pserial, sizeof(endpoint) - 1) < 0 ||
-		buffer_append(&pserial, endpoint, sizeof(endpoint) - 1) < 0 ||
+		buffer_u16_le(&pserial, sizeof(response_endpoint) - 1) < 0 ||
+		buffer_append(&pserial, response_endpoint,
+			sizeof(response_endpoint) - 1) < 0 ||
 		buffer_u8(&pserial, 2) < 0 ||
 		buffer_u16_le(&pserial, (uint16_t)protobuf.length) < 0 ||
 		buffer_append(&pserial, protobuf.data, protobuf.length) < 0)
 		return -1;
 	if (write_all(fd, pserial.data, pserial.length) < 0)
 		return -1;
-	frame_length = read_frame(fd, frame, sizeof(frame));
-	if (frame_length <= 0) {
-		if (frame_length == 0)
-			errno = ETIMEDOUT;
+	start_ms = monotonic_ms();
+	if (start_ms < 0)
 		return -1;
-	}
-	if (unwrap_pserial(frame, (size_t)frame_length, &response,
-			&response_length) < 0)
-		return -1;
+	deadline_ms = start_ms + RPC_TIMEOUT_MS;
 
-	response_payload->length = 0;
-	while (offset < response_length) {
-		if (pb_next(response, response_length, &offset, &field) < 0)
+	for (;;) {
+		size_t endpoint_length;
+		size_t offset = 0;
+		uint64_t message_type = 0;
+		uint64_t message_id = 0;
+		uint64_t response_uid = 0;
+		bool have_response_payload = false;
+		struct pb_field field;
+
+		if (read_pserial_frame(fd, endpoint, sizeof(endpoint),
+				&endpoint_length, &response, deadline_ms) < 0)
 			return -1;
-		if (field.number == 1 && field.wire_type == 0)
-			message_type = field.varint;
-		else if (field.number == 2 && field.wire_type == 0)
-			message_id = field.varint;
-		else if (field.number == 3 && field.wire_type == 0)
-			response_uid = field.varint;
-		else if (field.number == response_id && field.wire_type == 2) {
-			have_response_payload = true;
-			if (buffer_append(response_payload, field.bytes,
-					field.bytes_length) < 0)
+		if (endpoint_length != sizeof(response_endpoint) - 1 ||
+			memcmp(endpoint, response_endpoint, endpoint_length) != 0)
+			continue;
+
+		response_payload->length = 0;
+		while (offset < response.length) {
+			if (pb_next(response.data, response.length, &offset,
+					&field) < 0)
 				return -1;
+			if (field.number == 1 && field.wire_type == 0)
+				message_type = field.varint;
+			else if (field.number == 2 && field.wire_type == 0)
+				message_id = field.varint;
+			else if (field.number == 3 && field.wire_type == 0)
+				response_uid = field.varint;
+			else if (field.number == response_id &&
+					field.wire_type == 2) {
+				have_response_payload = true;
+				if (buffer_append(response_payload, field.bytes,
+						field.bytes_length) < 0)
+					return -1;
+			}
 		}
+		if (message_type != RPC_TYPE_RESPONSE ||
+			message_id != response_id || response_uid != uid)
+			continue;
+		if (!have_response_payload) {
+			errno = EBADMSG;
+			return -1;
+		}
+		return 0;
 	}
-	if (message_type != RPC_TYPE_RESPONSE || message_id != response_id ||
-		response_uid != uid || !have_response_payload) {
-		errno = EBADMSG;
-		return -1;
-	}
-	return 0;
 }
 
 static int response_status(const struct buffer *response, uint32_t field_number,
@@ -486,6 +533,7 @@ static int initialize_station(int fd, uint8_t mac[6], bool start)
 		rpc_get_station_mac(fd, mac) < 0 || set_linux_mac(mac) < 0)
 		return -1;
 	if (start && (rpc_status_call(fd, RPC_WIFI_START, &empty) < 0 ||
+		rpc_status_call(fd, RPC_WIFI_CONNECT, &empty) < 0 ||
 		set_linux_interface_up() < 0))
 		return -1;
 	return 0;
@@ -544,13 +592,38 @@ out:
 	return 0;
 }
 
+static int command_forget(void)
+{
+	struct buffer empty = {0};
+	int fd = open(SERIAL_DEVICE, O_RDWR | O_NONBLOCK);
+	int rc = -1;
+
+	if (fd < 0)
+		goto out;
+	if (rpc_wifi_init(fd) < 0 ||
+		rpc_status_call(fd, RPC_WIFI_RESTORE, &empty) < 0)
+		goto out;
+	rc = 0;
+
+out:
+	if (fd >= 0)
+		close(fd);
+	if (rc < 0) {
+		fprintf(stderr, "micronux-netctl: forget: %s\n", strerror(errno));
+		return 1;
+	}
+	printf("MICRONUX:M6:NET:FORGET storage=c6-nvs action=reboot-required\n");
+	return 0;
+}
+
 static void usage(const char *program)
 {
 	fprintf(stderr,
 		"usage: %s mac\n"
 		"       %s up\n"
+		"       %s forget\n"
 		"       %s connect SSID [PASSWORD]\n",
-		program, program, program);
+		program, program, program, program);
 }
 
 int main(int argc, char **argv)
@@ -559,6 +632,8 @@ int main(int argc, char **argv)
 		return command_mac_or_up(false);
 	if (argc == 2 && strcmp(argv[1], "up") == 0)
 		return command_mac_or_up(true);
+	if (argc == 2 && strcmp(argv[1], "forget") == 0)
+		return command_forget();
 	if ((argc == 3 || argc == 4) && strcmp(argv[1], "connect") == 0)
 		return command_connect(argv[2], argc == 4 ? argv[3] : "");
 	usage(argv[0]);

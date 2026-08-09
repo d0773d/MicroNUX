@@ -15,6 +15,15 @@ $repoPath = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $loaderPath = Join-Path $repoPath "loader"
 $buildPath = Join-Path $repoPath "build\m6-provisioning"
 $idfPath = "C:\esp\v6.0.1\esp-idf"
+$idfPython = "C:\Espressif\python_env\idf6.0_py3.11_env\Scripts\python.exe"
+$idfTool = Join-Path $idfPath "tools\idf.py"
+$ninjaTool = "C:\Espressif\tools\ninja\1.12.1\ninja.exe"
+
+foreach ($toolPath in @($idfPython, $idfTool, $ninjaTool)) {
+    if (-not (Test-Path -LiteralPath $toolPath -PathType Leaf)) {
+        throw "Missing pinned ESP-IDF v6.0.1 tool: $toolPath"
+    }
+}
 
 $previousErrorPreference = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
@@ -25,7 +34,7 @@ if ($exportExitCode -ne 0) {
     throw "ESP-IDF v6.0.1 activation failed."
 }
 
-$idfVersion = (& idf.py --version | Out-String).Trim()
+$idfVersion = (& $idfPython $idfTool --version | Out-String).Trim()
 if ($idfVersion -ne "ESP-IDF v6.0.1") {
     throw "Expected ESP-IDF v6.0.1, got '$idfVersion'."
 }
@@ -41,7 +50,7 @@ $sdkconfigDefaults = @(
     (Join-Path $loaderPath "sdkconfig.provisioning.defaults")
 ) -join ";"
 
-& idf.py -C $loaderPath -B $buildPath `
+& $idfPython $idfTool -C $loaderPath -B $buildPath `
     -D "SDKCONFIG=$sdkconfigPath" `
     -D "SDKCONFIG_DEFAULTS=$sdkconfigDefaults" `
     -D "MICRONUX_PROVISIONING_BUILD=ON" reconfigure
@@ -84,7 +93,7 @@ foreach ($line in $requiredConfig) {
     }
 }
 
-& ninja -C $buildPath -j 16
+& $ninjaTool -C $buildPath -j 16
 if ($LASTEXITCODE -ne 0) {
     throw "M6 provisioning loader build failed."
 }
@@ -102,7 +111,7 @@ Write-Host ("P4 provisioning loader built: {0} bytes; C6 firmware was not built 
 
 if ($Flash) {
     Write-Host "Flashing only the ESP32-P4 loader through $Port. The ESP32-C6 flash is out of scope."
-    & idf.py -C $loaderPath -B $buildPath -p $Port flash
+    & $idfPython $idfTool -C $loaderPath -B $buildPath -p $Port flash
     if ($LASTEXITCODE -ne 0) {
         throw "P4 provisioning loader flash failed."
     }

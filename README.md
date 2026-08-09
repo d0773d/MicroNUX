@@ -29,8 +29,11 @@ factory ESP-Hosted-MCU firmware: three boots produced stable SDIO function
 identities, C6 firmware `2.11.5`, MAC `b0:a6:04:8a:d3:78`, and an
 `UP,LOWER_UP` Linux interface. An optional P4-only loader profile now compiles
 Espressif phone provisioning over BLE with SoftAP fallback, mandatory Security
-2, and C6-resident Wi-Fi credentials; its physical phone/association gate is
-still pending and no C6 firmware is built or flashed. Four exact MIPI-DSI
+2, and C6-resident Wi-Fi credentials. The profile is physically flashed and
+has passed its stored-credential/Linux-handoff path; a stale saved network
+prevented DHCP, so fresh phone onboarding remains the next hardware gate.
+Linux can clear only the C6 Wi-Fi settings with `micronux-netctl forget` before
+that gate. No C6 firmware is built or flashed. Four exact MIPI-DSI
 controller profiles compile behind a default-off power-safety gate; physical
 color-bar verification awaits the attached panel's controller label. On
 revision 1.3, USB status is serviced once per kernel tick and interrupted

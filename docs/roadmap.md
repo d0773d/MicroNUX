@@ -110,10 +110,13 @@ Current artifact: [M6 storage and peripheral bring-up](m6-peripherals.md). The
 onboard microSD path passed its three-boot read-only gate and a separate
 write/remount/verify/delete test with unchanged media sampling. The ESP32-C6
 factory firmware now exposes a stable ESP-Hosted SDIO/RPC link and `ethsta0`;
-the optional P4-hosted provisioning loader now compiles BLE and SoftAP
-onboarding with mandatory Security 2 while keeping Wi-Fi credentials in C6
-NVS. Phone provisioning, association, and DHCP still need a credentialed
-hardware test. MIPI-D0 has four compiled
+the optional P4-hosted provisioning loader has been flashed and physically
+validated through its stored-credential/Linux-handoff path. BLE and SoftAP
+onboarding use mandatory Security 2 and keep Wi-Fi credentials in C6 NVS.
+`micronux-netctl up` now requests association with those saved credentials,
+and `micronux-netctl forget` provides an explicit C6-NVS reset path. Fresh
+phone provisioning, association, and DHCP remain the next credentialed
+hardware gate. MIPI-D0 has four compiled
 exact-controller color-bar profiles behind a default-off power gate. Physical
 display verification waits for the attached panel label, after which scanout
 ownership and a Linux console remain separate acceptance gates.

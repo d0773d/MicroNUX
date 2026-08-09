@@ -43,6 +43,14 @@ if ((Get-Item -LiteralPath $dtbPath).Length -gt 0x200000) {
 $idfPath = "C:\esp\v6.0.1\esp-idf"
 $loaderPath = Join-Path $repoPath "loader"
 $buildPath = Join-Path $repoPath "build\m6-network"
+$idfPython = "C:\Espressif\python_env\idf6.0_py3.11_env\Scripts\python.exe"
+$idfTool = Join-Path $idfPath "tools\idf.py"
+$ninjaTool = "C:\Espressif\tools\ninja\1.12.1\ninja.exe"
+foreach ($toolPath in @($idfPython, $idfTool, $ninjaTool)) {
+    if (-not (Test-Path -LiteralPath $toolPath -PathType Leaf)) {
+        throw "Missing pinned ESP-IDF v6.0.1 tool: $toolPath"
+    }
+}
 $previousErrorPreference = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 & (Join-Path $idfPath "export.ps1") *> $null
@@ -52,11 +60,10 @@ if ($exportExitCode -ne 0) {
     throw "ESP-IDF v6.0.1 activation failed."
 }
 
-$idfVersion = (& idf.py --version | Out-String).Trim()
+$idfVersion = (& $idfPython $idfTool --version | Out-String).Trim()
 if ($idfVersion -ne "ESP-IDF v6.0.1") {
     throw "Expected ESP-IDF v6.0.1, got '$idfVersion'."
 }
-$idfPython = (Get-Command python -ErrorAction Stop).Source
 
 if (-not $SkipLoaderBuild) {
     $env:CMAKE_GENERATOR = "Ninja"
@@ -66,20 +73,20 @@ if (-not $SkipLoaderBuild) {
         (Join-Path $loaderPath "sdkconfig.defaults"),
         (Join-Path $loaderPath "sdkconfig.network.defaults")
     ) -join ";"
-    & idf.py -C $loaderPath -B $buildPath `
+    & $idfPython $idfTool -C $loaderPath -B $buildPath `
         -D "SDKCONFIG=$sdkconfigPath" `
         -D "SDKCONFIG_DEFAULTS=$sdkconfigDefaults" reconfigure
     if ($LASTEXITCODE -ne 0) {
         throw "M6 network loader configure failed."
     }
-    & ninja -C $buildPath -j 16
+    & $ninjaTool -C $buildPath -j 16
     if ($LASTEXITCODE -ne 0) {
         throw "M6 network loader build failed."
     }
 }
 
 if (-not $SkipFlash) {
-    & idf.py -C $loaderPath -B $buildPath -p $Port flash
+    & $idfPython $idfTool -C $loaderPath -B $buildPath -p $Port flash
     if ($LASTEXITCODE -ne 0) {
         throw "M6 network loader flash failed."
     }

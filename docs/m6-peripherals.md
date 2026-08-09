@@ -184,16 +184,27 @@ the C6 and prepares SDIO slot 1 at 20 MHz; Linux discovers these two functions:
 ```sh
 micronux-netctl mac
 micronux-netctl up
+micronux-netctl forget
 micronux-netctl connect "SSID" "PASSWORD"
 ```
 
 `up` initializes station mode through `/dev/esps0`, reads the C6 MAC, assigns
-it to `ethsta0`, starts Wi-Fi, and raises the Linux interface. `connect` also
-sends station credentials and requests association. Passwords are not stored
-in the initramfs, but an interactive command is echoed on the serial console;
-use a test network rather than a valuable credential. Association and DHCP
-remain unverified because no credentials were supplied; the milestone gate
-stops at the native C6 RPC/link boundary.
+it to `ethsta0`, starts Wi-Fi, requests association using the configuration
+already stored in C6 NVS, and raises the Linux interface. It never receives a
+password from the loader. The pserial reader consumes each TLV at its declared
+length and ignores asynchronous `RPCEvt` frames or unrelated responses while
+waiting for the matching RPC message ID and UID. One absolute 10-second
+deadline bounds the exchange even if events continue arriving. `forget`
+invokes the factory firmware's
+`esp_wifi_restore()` RPC and requires a P4 reboot; this deliberately erases the
+C6's saved Wi-Fi configuration so the provisioning loader will advertise on
+the next boot. `connect` remains a direct diagnostic that sends station
+credentials and requests association. Passwords are not stored in the
+initramfs, but an interactive command is echoed on the serial console; use a
+test network rather than a valuable credential.
+
+The start/connect separation and restore behavior follow the
+[ESP-IDF 6.0 ESP32-C6 Wi-Fi API](https://docs.espressif.com/projects/esp-idf/en/v6.0/esp32c6/api-reference/network/esp_wifi.html).
 
 Build, flash, and run the three-boot hardware gate with:
 
@@ -203,11 +214,18 @@ Build, flash, and run the three-boot hardware gate with:
 
 On the connected board, all three boots reported factory firmware `2.11.5`,
 the two identities above, stable MAC `b0:a6:04:8a:d3:78`, and final
-`UP,LOWER_UP`. The P4 kernel image SHA-256 was
-`4a584505f4fb2e9ef0beadd7b9d7075069d3bbc91a72416dfb5b35d19b26e375`;
+`UP,LOWER_UP`. After the stream-parser correction, all three independent
+ROM-reset boots also returned `MICRONUX:M6:NET:UP:RC=0`; no asynchronous event
+was misidentified as the RPC response. The current P4 kernel image, including
+saved-credential connect and explicit forget support, has SHA-256
+`ce642d669f4f3b4cdf727ce984b8c69da68115382cbbd0f2c64638ecc014c8ac`;
 the DTB SHA-256 was
 `08f814249e0c776d6bc26f92d3185d216220be2af1936599d78f97b15d2ced20`.
-The C6 factory flash was not rewritten.
+On the first saved-credential test, the C6 contained a pre-existing
+`AP-5GHz` configuration. The loader correctly skipped onboarding and Linux
+successfully issued the connect RPC, but DHCP received no lease. That stored
+network is therefore not accepted as an association/DHCP result. The C6
+factory flash was not rewritten.
 
 ### P4-hosted phone provisioning
 
@@ -269,8 +287,12 @@ and Security 2 configuration before compiling. Its flash path invokes only the
 ESP32-P4 project image; it contains no C6 binary or C6 flashing command. The
 profile compiles under ESP-IDF v6.0.1 and produces a `0xf7610`-byte loader,
 leaving `0xf89f0` bytes free in the existing `0x1f0000` factory partition.
-Physical phone provisioning remains an explicit hardware acceptance gate; the
-build was not flashed while adding this profile.
+The profile was flashed to the connected ESP32-P4 revision 1.3 and booted with
+the factory C6 firmware `2.11.5`. It detected the pre-existing C6-NVS station
+configuration, emitted `state=provisioned action=linux-handoff`, released
+ESP-Hosted, and booted Linux without waiting for association or DHCP. Fresh
+phone provisioning remains an explicit hardware acceptance gate; executing
+`micronux-netctl forget` and rebooting will enter that path.
 
 API and protocol choices follow the official
 [ESP-IDF provisioning guide](https://docs.espressif.com/projects/esp-idf/en/v6.0/esp32p4/api-reference/provisioning/index.html),
