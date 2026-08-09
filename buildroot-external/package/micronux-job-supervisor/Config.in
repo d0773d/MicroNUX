@@ -1,0 +1,7 @@
+config BR2_PACKAGE_MICRONUX_JOB_SUPERVISOR
+	bool "micronux-job-supervisor"
+	depends on !BR2_USE_MMU
+	select BR2_PACKAGE_MICRONUX_DEVICE_SERVICE
+	help
+	  Root-owned launcher and policy helper for bounded, non-root
+	  MicroNUX native and IgniteVM application jobs.

@@ -12,14 +12,17 @@ desktop Linux compatibility or MMU-backed process isolation.
 
 Milestones M0 through M5 and the M8 device-service ABI v1 slice are complete;
 M6 now has a physical loader-owned display proof, while Linux-owned display
-scanout remains open. M7 WP0-WP4 are proven: the loader has a version-pinned
+scanout remains open. M7 WP0-WP5 are proven: the loader has a version-pinned
 early U-mode deny map, Linux routes userspace mappings through a dedicated,
 zero-on-allocation 8 MiB pool with one contiguous arena per `mm_struct`, and
 every U-mode return installs and verifies a fail-closed PMP boundary around
 the current process. Bounded `access_ok()` rejects syscall pointers outside
 the same interval. Physical read/write/execute, cross-process, arena-reuse,
-exec-failure, and malformed-pointer tests now prove per-process CPU
-containment; resource policy, DMA isolation, and W^X remain open. The
+exec-failure, and malformed-pointer tests prove per-process CPU containment.
+Admitted native or IgniteVM jobs now run as locked UID/GID 1000 with zero
+capabilities, a seccomp allowlist, peripheral restrictions, and fixed process,
+descriptor, memory, time, and output budgets. DMA isolation and W^X remain
+open. The
 pinned `rv32imac`/`ilp32` NOMMU
 image boots a reduced BusyBox bFLT shell with 32 MiB RAM under QEMU. On the
 physical ESP32-P4 revision 1.3, the M3 loader validates and loads Linux and its

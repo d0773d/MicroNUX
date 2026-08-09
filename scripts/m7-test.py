@@ -27,6 +27,9 @@ REQUIRED_MARKERS = (
     "Linux version 6.12.27",
     "MICRONUX:M6:COMBINED:SHELL ready console=ttyGS0 network=nonblocking",
     "MICRONUX:M8:SERVICE state=ready abi=1.0",
+    "MICRONUX:M7:JOB-SUPERVISOR state=ready uid=1000 gid=1000 "
+    "admission=root-owned seccomp=allowlist",
+    "MICRONUX:M7:WARMUP:PASS",
     "MICRONUX:M7:POOL-PROBE:PASS",
     "MICRONUX:M7:POOL-TEST:PROBE:RC=0",
     "MICRONUX:M7:FAULTS pass count=16 privilege=U memory_signal=11",
@@ -41,6 +44,15 @@ REQUIRED_MARKERS = (
     "MICRONUX:M7:ARENA:EXEC-FAIL:PASS",
     "MICRONUX:M7:ARENA:PASS ownership=per-mm vfork=pass signals=pass",
     "MICRONUX:M7:POOL-TEST:ARENA:RC=0",
+    "MICRONUX:M7:JOB-ADMISSION:PASS internal=denied writable=denied",
+    "MICRONUX:M7:JOB-POLICY uid=1000 gid=1000 caps=zero "
+    "no_new_privs=1 seccomp=allowlist",
+    "MICRONUX:M7:JOB-CONTRACT:PASS uid=1000 gid=1000 caps=zero "
+    "seccomp=2 devices=restricted fd=16 nproc=4 arena_kib=6144",
+    "MICRONUX:M7:POOL-TEST:JOB-CONTRACT:RC=0",
+    "MICRONUX:M7:POOL-TEST:JOB-WALL:RC=124",
+    "MICRONUX:M7:POOL-TEST:JOB-OUTPUT:RC=125",
+    "MICRONUX:M7:JOB-LIVENESS:PASS",
     "MICRONUX:M7:POOL-TEST:DONE",
 )
 
@@ -54,6 +66,11 @@ FORBIDDEN_MARKERS = (
     "MICRONUX:M7:POOL-PROBE:FAIL",
     "MICRONUX:M7:ISOLATION-FAULT:FAIL",
     "MICRONUX:M7:ARENA:FAIL",
+    "MICRONUX:M7:JOB-SUPERVISOR:FAIL",
+    "MICRONUX:M7:WARMUP:FAIL",
+    "MICRONUX:M7:JOB-ADMISSION:FAIL",
+    "MICRONUX:M7:JOB-CONTRACT:FAIL",
+    "MICRONUX:M7:JOB-LIVENESS:FAIL",
     "Kernel panic",
     "Oops:",
     "BUG:",
@@ -94,6 +111,43 @@ def rom_reset(port: str) -> None:
     )
 
 
+def warmup_command() -> str:
+    repeats = " ".join(str(index) for index in range(1, 9))
+    return (
+        "echo MICRONUX:M7:WARMUP:BEGIN; RC=0; "
+        "install -o root -g root -m 0755 /usr/libexec/micronux-job-test "
+        "/opt/micronux/apps/micronux-job-test || RC=1; "
+        "/usr/sbin/micronux-run -q -- /usr/libexec/micronux-job-test "
+        "contract >/dev/null 2>&1 && RC=1; "
+        "install -o root -g root -m 0777 /usr/libexec/micronux-job-test "
+        "/opt/micronux/apps/micronux-job-unsafe || RC=1; "
+        "/usr/sbin/micronux-run -q -- "
+        "/opt/micronux/apps/micronux-job-unsafe contract "
+        ">/dev/null 2>&1 && RC=1; "
+        "rm -f /opt/micronux/apps/micronux-job-unsafe; "
+        "/usr/bin/micronux-isolation-probe >/dev/null 2>&1 || RC=1; "
+        "/usr/bin/micronux-isolation-fault >/dev/null 2>&1 || RC=1; "
+        "/usr/bin/micronux-selftest >/dev/null 2>&1 || RC=1; "
+        "for I in "
+        f"{repeats}"
+        "; do /usr/bin/micronux-isolation-probe >/dev/null 2>&1 || RC=1; done; "
+        "/usr/bin/micronux-arena-test >/dev/null 2>&1 || RC=1; "
+        "/usr/sbin/micronux-run -- "
+        "/opt/micronux/apps/micronux-job-test contract "
+        ">/dev/null 2>&1 || RC=1; "
+        "/usr/sbin/micronux-run -q -- "
+        "/opt/micronux/apps/micronux-job-test spin "
+        ">/dev/null 2>&1; [ $? -eq 124 ] || RC=1; "
+        "/usr/sbin/micronux-run -q -- "
+        "/opt/micronux/apps/micronux-job-test flood "
+        ">/dev/null 2>&1; [ $? -eq 125 ] || RC=1; "
+        "/usr/bin/micronux-device api >/dev/null 2>&1 || RC=1; "
+        "sleep 1; if [ \"$RC\" -eq 0 ]; then "
+        "echo MICRONUX:M7:WARMUP:PASS; else "
+        "echo MICRONUX:M7:WARMUP:FAIL rc=$RC; fi\n"
+    )
+
+
 def test_command() -> str:
     repeats = " ".join(str(index) for index in range(1, 9))
     return (
@@ -114,6 +168,31 @@ def test_command() -> str:
         "echo MICRONUX:M7:POOL-TEST:REPEAT:RC=$RC; "
         "/usr/bin/micronux-arena-test; "
         "echo MICRONUX:M7:POOL-TEST:ARENA:RC=$?; "
+        "ADMISSION=0; /usr/sbin/micronux-run -q -- "
+        "/usr/libexec/micronux-job-test contract >/dev/null 2>&1 "
+        "&& ADMISSION=1; "
+        "install -o root -g root -m 0777 /usr/libexec/micronux-job-test "
+        "/opt/micronux/apps/micronux-job-unsafe || ADMISSION=1; "
+        "/usr/sbin/micronux-run -q -- "
+        "/opt/micronux/apps/micronux-job-unsafe contract >/dev/null 2>&1 "
+        "&& ADMISSION=1; "
+        "rm -f /opt/micronux/apps/micronux-job-unsafe; "
+        "if [ \"$ADMISSION\" -eq 0 ]; then "
+        "echo MICRONUX:M7:JOB-ADMISSION:PASS "
+        "internal=denied writable=denied; else "
+        "echo MICRONUX:M7:JOB-ADMISSION:FAIL rc=$ADMISSION; fi; "
+        "/usr/sbin/micronux-run -- "
+        "/opt/micronux/apps/micronux-job-test contract; "
+        "echo MICRONUX:M7:POOL-TEST:JOB-CONTRACT:RC=$?; "
+        "/usr/sbin/micronux-run -q -- "
+        "/opt/micronux/apps/micronux-job-test spin; "
+        "echo MICRONUX:M7:POOL-TEST:JOB-WALL:RC=$?; "
+        "/usr/sbin/micronux-run -q -- "
+        "/opt/micronux/apps/micronux-job-test flood; "
+        "echo MICRONUX:M7:POOL-TEST:JOB-OUTPUT:RC=$?; "
+        "if /usr/bin/micronux-device api >/dev/null; then "
+        "echo MICRONUX:M7:JOB-LIVENESS:PASS; else "
+        "echo MICRONUX:M7:JOB-LIVENESS:FAIL; fi; "
         "echo MICRONUX:M7:POOL-TEST:ACCOUNT-AFTER; "
         "cat /proc/micronux_user_pool; "
         "echo MICRONUX:M7:POOL-TEST:MEM-AFTER; "
@@ -136,6 +215,7 @@ def capture_boot(port: str, timeout: float) -> str:
     device.rts = False
     captured = bytearray()
     deadline = time.monotonic() + timeout
+    warmup_sent = False
     command_sent = False
     done_seen_at: float | None = None
 
@@ -145,10 +225,19 @@ def capture_boot(port: str, timeout: float) -> str:
             captured.extend(device.read(4096))
             text = captured.decode("utf-8", errors="replace")
             if (
-                not command_sent
+                not warmup_sent
                 and "MICRONUX:M6:COMBINED:SHELL ready" in text
                 and "MICRONUX:M7:POOL state=ready" in text
                 and "MICRONUX:M8:SERVICE state=ready" in text
+            ):
+                time.sleep(0.2)
+                device.write(warmup_command().encode("ascii"))
+                device.flush()
+                warmup_sent = True
+            if (
+                warmup_sent
+                and not command_sent
+                and marker_seen(text, "MICRONUX:M7:WARMUP:PASS")
             ):
                 time.sleep(0.2)
                 device.write(test_command().encode("ascii"))
@@ -177,11 +266,14 @@ def artifact_hashes(directory: Path) -> tuple[str, str]:
     probe = directory / "micronux-isolation-probe"
     fault = directory / "micronux-isolation-fault"
     arena = directory / "micronux-arena-test"
-    for path in (image, dtb, probe, fault, arena):
+    runner = directory / "micronux-run"
+    helper = directory / "micronux-job-exec"
+    job_test = directory / "micronux-job-test"
+    for path in (image, dtb, probe, fault, arena, runner, helper, job_test):
         if not path.is_file():
             raise FileNotFoundError(path)
 
-    for binary in (probe, fault, arena):
+    for binary in (probe, fault, arena, runner, helper, job_test):
         header = binary.read_bytes()[:44]
         if len(header) != 44 or header[:4] != b"bFLT":
             raise ValueError(f"{binary.name} is not bFLT")
@@ -234,6 +326,31 @@ def free_memory(log: str, phase: str) -> int:
     return int(match.group(1))
 
 
+def job_policy_results(log: str) -> None:
+    wall = re.search(
+        r"MICRONUX:M7:JOB result=killed reason=wall signal=9 "
+        r"output=(\d+) duration_ms=(\d+)",
+        log,
+    )
+    output = re.search(
+        r"MICRONUX:M7:JOB result=killed reason=output signal=9 "
+        r"output=(\d+) duration_ms=(\d+)",
+        log,
+    )
+    if wall is None or output is None:
+        raise ValueError("missing supervisor kill results")
+    wall_bytes, wall_ms = int(wall.group(1)), int(wall.group(2))
+    output_bytes, output_ms = int(output.group(1)), int(output.group(2))
+    if wall_bytes > 32768 or wall_ms < 2000 or wall_ms > 4000:
+        raise ValueError(
+            f"invalid wall policy result: bytes={wall_bytes} ms={wall_ms}"
+        )
+    if output_bytes <= 32768 or output_ms >= 2000:
+        raise ValueError(
+            f"invalid output policy result: bytes={output_bytes} ms={output_ms}"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", required=True)
@@ -267,6 +384,7 @@ def main() -> int:
             after = accounting(log, "AFTER")
             memory_before = free_memory(log, "BEFORE")
             memory_after = free_memory(log, "AFTER")
+            job_policy_results(log)
         except (OSError, subprocess.CalledProcessError, ValueError) as error:
             if log:
                 print(log, file=sys.stderr)

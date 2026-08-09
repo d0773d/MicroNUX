@@ -18,10 +18,11 @@ BR2_TARGET_GENERIC_ISSUE="MicroNUX M7 user/kernel isolation"
 BR2_INIT_NONE=y
 BR2_ROOTFS_DEVICE_CREATION_STATIC=y
 BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_MICRONUX_PATH)/board/micronux/rootfs-m6 $(BR2_EXTERNAL_MICRONUX_PATH)/board/micronux/rootfs-m6-network $(BR2_EXTERNAL_MICRONUX_PATH)/board/micronux/rootfs-m6-combined"
-BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="board/canaan/k210-soc/busybox-tiny.config $(BR2_EXTERNAL_MICRONUX_PATH)/board/micronux/busybox-m1.config $(BR2_EXTERNAL_MICRONUX_PATH)/board/micronux/busybox-m3.config $(BR2_EXTERNAL_MICRONUX_PATH)/board/micronux/busybox-m4.config $(BR2_EXTERNAL_MICRONUX_PATH)/board/micronux/busybox-m6.config $(BR2_EXTERNAL_MICRONUX_PATH)/board/micronux/busybox-m6-network.config $(BR2_EXTERNAL_MICRONUX_PATH)/board/micronux/busybox-m8.config"
+BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="board/canaan/k210-soc/busybox-tiny.config $(BR2_EXTERNAL_MICRONUX_PATH)/board/micronux/busybox-m1.config $(BR2_EXTERNAL_MICRONUX_PATH)/board/micronux/busybox-m3.config $(BR2_EXTERNAL_MICRONUX_PATH)/board/micronux/busybox-m4.config $(BR2_EXTERNAL_MICRONUX_PATH)/board/micronux/busybox-m6.config $(BR2_EXTERNAL_MICRONUX_PATH)/board/micronux/busybox-m6-network.config $(BR2_EXTERNAL_MICRONUX_PATH)/board/micronux/busybox-m7.config $(BR2_EXTERNAL_MICRONUX_PATH)/board/micronux/busybox-m8.config"
 BR2_PACKAGE_MICRONUX_SELFTEST=y
 BR2_PACKAGE_MICRONUX_NETCTL=y
 BR2_PACKAGE_MICRONUX_DEVICE_SERVICE=y
+BR2_PACKAGE_MICRONUX_JOB_SUPERVISOR=y
 BR2_PACKAGE_MICRONUX_ISOLATION_TEST=y
 BR2_LINUX_KERNEL_EXT_ESP_HOSTED_FG=y
 # BR2_PACKAGE_IFUPDOWN_SCRIPTS is not set

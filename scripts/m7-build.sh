@@ -75,6 +75,11 @@ make -C "${SOURCE_DIR}" \
 	O="${OUTPUT_DIR}" \
 	BR2_EXTERNAL="${EXTERNAL_DIR}" \
 	BR2_DL_DIR="${DOWNLOAD_DIR}/buildroot-dl" \
+	micronux-job-supervisor-rebuild
+make -C "${SOURCE_DIR}" \
+	O="${OUTPUT_DIR}" \
+	BR2_EXTERNAL="${EXTERNAL_DIR}" \
+	BR2_DL_DIR="${DOWNLOAD_DIR}/buildroot-dl" \
 	micronux-isolation-test-rebuild
 
 make -C "${SOURCE_DIR}" \
@@ -127,6 +132,12 @@ install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-device-selftest" \
 	"${ARTIFACT_DIR}/micronux-device-selftest"
 install -m 0755 "${OUTPUT_DIR}/target/usr/sbin/micronux-deviced" \
 	"${ARTIFACT_DIR}/micronux-deviced"
+install -m 0755 "${OUTPUT_DIR}/target/usr/sbin/micronux-run" \
+	"${ARTIFACT_DIR}/micronux-run"
+install -m 0755 "${OUTPUT_DIR}/target/usr/libexec/micronux-job-exec" \
+	"${ARTIFACT_DIR}/micronux-job-exec"
+install -m 0755 "${OUTPUT_DIR}/target/usr/libexec/micronux-job-test" \
+	"${ARTIFACT_DIR}/micronux-job-test"
 install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-storage-test" \
 	"${ARTIFACT_DIR}/micronux-storage-test"
 install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-isolation-probe" \
@@ -141,7 +152,8 @@ install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-arena-test" \
 	sha256sum Image esp32p4-micronux.dtb metadata.bin rootfs.cpio \
 		micronux-selftest micronux-exec-child micronux-netctl \
 		micronux-device micronux-device-native micronux-device-selftest \
-		micronux-deviced micronux-storage-test micronux-isolation-probe \
+		micronux-deviced micronux-run micronux-job-exec micronux-job-test \
+		micronux-storage-test micronux-isolation-probe \
 		micronux-isolation-fault micronux-arena-test \
 		> SHA256SUMS
 )

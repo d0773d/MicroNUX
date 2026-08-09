@@ -1,12 +1,13 @@
 # M7 User/Kernel Isolation Results
 
-Status: **WP0-WP4 proven on hardware; per-process containment active**
+Status: **WP0-WP5 proven on hardware; supervised application containment active**
 
 M7 is converting the ESP32-P4 revision-1.3, machine-mode, single-core NOMMU
 baseline into a system where a faulty bFLT child can be terminated without
 being able to corrupt Linux or another userspace process. The work is
 deliberately gated in layers. WP3 proved the kernel boundary for a shared user
-pool; WP4 now gives each userspace `mm_struct` its own hardware-enforced arena.
+pool, WP4 gave each userspace `mm_struct` its own hardware-enforced arena, and
+WP5 now runs admitted applications as a bounded non-root identity.
 
 ## Frozen baseline
 
@@ -19,15 +20,16 @@ pool; WP4 now gives each userspace `mm_struct` its own hardware-enforced arena.
 | Candidate kernel RAM | `[0x48400000,0x49700000)`, 19 MiB |
 | Loader reserve | `[0x48000000,0x48400000)`, 4 MiB |
 | Comms reserve | `[0x49f00000,0x4a000000)`, 1 MiB |
-| M7 Image | 5,810,912 bytes, SHA-256 `9bb6555fff500fcaffe18232f1be1015485a291cfc5907c112011ae7ab1e5de8` |
+| M7 Image | 5,950,176 bytes, SHA-256 `6dd1f6aecf0907e5620c5d0d0e1077110e0f0c980d440270028fc90ebd40cfaa` |
 | M7 DTB | 2,147 bytes, SHA-256 `a820ab4da5722a71457adae47e25934c863f34f16fcbced747ef13d6390647db` |
-| M7 rootfs | 1,512,960 bytes, SHA-256 `597553ae7b1d7d2b5dad384bacfba8d3022a9dad4255977519db452e9a64a4c2` |
+| M7 rootfs | 1,790,464 bytes, SHA-256 `017a99e42b202eb36eb2cb4a06f58c9b31cabeb84b710a87645e905faa29fca0` |
 
 The dedicated reservation leaves 19 MiB in the general Linux allocator. The
-M7 kernel reported 13,020 KiB available during boot and a repeatable 8,804 KiB
-`MemFree` after the shell and device service were ready. The WP4 pool baseline
-was 465 pages reserved, 394 pages mapped, 1,583 pages free, and five live
-arenas on every measured boot.
+M7 kernel reported 13,020 KiB available during boot. After warming the process,
+pipe, timer, and root-install paths used by the complete gate, WP5 had
+8,380-8,392 KiB `MemFree`, unchanged by each measured workload. The pool
+baseline was 472 pages reserved, 402 pages mapped, 1,576 pages free, and five
+live arenas on every measured boot.
 
 The automated baseline executes three independent ROM-reset boots, records all
 16 PMP address/configuration entries before and after the loader handoff setup,
@@ -61,7 +63,7 @@ across three resets:
 | 15 | `5007fffc/18` | peripheral MMIO denied |
 
 The accepted loader is 273,008 bytes with SHA-256
-`c352d61e0d0af3e82f0f1657e24f88deca99d537908ec0d8062c21c51d65ca67`.
+`6c250613c75ee1d725d22878441d768c6cda43fd6dee3e887f8792b1bafd342d`.
 It emits:
 
 ```text
@@ -217,18 +219,97 @@ suite. The sibling addresses were `0x499c6e0c` and `0x499eee80`; the 32 reuse
 cycles consistently reused `0x499ef000`. Pool accounting returned exactly to
 baseline and general `MemFree` remained within the 16 KiB tolerance.
 
+## Execution policy and resource controls
+
+WP5 adds a root-owned foreground supervisor at `/usr/sbin/micronux-run` and a
+root-only policy helper at `/usr/libexec/micronux-job-exec`. The image contains
+a locked `micronux-job` account with UID/GID 1000, `/bin/false` as its shell,
+and no supplementary groups. The helper drops every capability and bounding
+set bit, fixes all real/effective/saved IDs to 1000, sets `no_new_privs`, closes
+inherited descriptors, installs a RISC-V seccomp-BPF allowlist, and then
+executes the admitted target with a fixed environment and `/` as its working
+directory.
+
+The supervisor resolves the initial executable to a canonical path. It accepts
+only root-owned regular executables under `/opt/micronux/apps/` and the optional
+`/usr/bin/micronux-ignite` adapter. It rejects group/world-writable and set-ID
+files. The application directory,
+supervisor, and helper are root-owned in the generated initramfs; the two
+policy binaries are mode `0750`. A root-owned nonblocking lock permits one
+application job at a time.
+
+The fixed initial policy is:
+
+| Resource | Limit |
+| --- | ---: |
+| Wall time | 2,000 ms |
+| CPU time | 3 seconds |
+| File descriptors | 16 |
+| Processes for UID 1000 | 4 |
+| Stack | 256 KiB |
+| Data | 4 MiB |
+| Address space / arena | 6 MiB |
+| Forwarded stdout and stderr | 32 KiB |
+| Output file size | 4 MiB |
+| Core dump | disabled |
+
+Linux NOMMU did not enforce `RLIMIT_AS` in its private `mmap()` allocation
+path. The M7 patch series now performs the equivalent address-space check
+before allocating region metadata or user-pool pages. An admitted job's 7 MiB
+negative allocation therefore returns `ENOMEM` without producing a pool
+exhaustion event.
+
+The syscall profile admits the ordinary file, memory, process, signal, time,
+event, and TCP/UDP socket operations needed by native C and IgniteVM jobs.
+Unlisted calls return `EPERM`; the hardware contract explicitly verified
+unrestricted `ioctl`, `ptrace`, mount, reboot, and module-loading calls are
+denied. DAC plus the empty capability sets deny `/dev/mem`, `/dev/kmem`, the
+microSD block device, the console, and raw sockets. Applications can use the
+M8 device-service observer API, while its administrative operation is denied
+by peer-credential policy.
+
+Root installs an application and launches it with:
+
+```sh
+install -o root -g root -m 0755 /mnt/sd/app /opt/micronux/apps/app
+/usr/sbin/micronux-run -- /opt/micronux/apps/app argument
+```
+
+When the IgniteVM runtime is included, packages use the same boundary:
+
+```sh
+/usr/sbin/micronux-run -- /usr/bin/micronux-ignite package.igpk
+```
+
+The clean WP5 payload passed three independent ROM resets:
+
+```text
+M7 arena boot 1/3 passed: reserved=472 mapped=402 free=1576 arenas=5 mem_kib=8380->8380
+M7 arena boot 2/3 passed: reserved=472 mapped=402 free=1576 arenas=5 mem_kib=8380->8380
+M7 arena boot 3/3 passed: reserved=472 mapped=402 free=1576 arenas=5 mem_kib=8392->8392
+```
+
+Each measured boot proved UID/GID 1000, zero capability sets and bounding set,
+`no_new_privs=1`, seccomp filter mode 2, exact rlimits, peripheral and raw-socket
+denial, observer-only device service access, the descriptor/process/arena
+limits, and a clean exit. It also rejected both direct execution from the
+internal test path and a world-writable executable under the admitted
+directory. The supervisor killed the non-yielding job at
+2,031-2,032 ms and killed the output flood in 51-52 ms while forwarding no more
+than 32 KiB. The shell and device service remained live afterward. Pool
+accounting and general `MemFree` returned exactly to baseline on all three
+boots; no panic, oops, reset, stale grant, pool exhaustion, or policy-failure
+marker occurred.
+
 ## Exact guarantee and remaining work
 
-WP4 establishes **per-process CPU containment**: U-mode code can access only
-the arena belonging to the `mm_struct` currently returning to userspace. It
-cannot directly read, write, or execute kernel RAM, loader RAM, direct aliases,
-protected platform regions, or another live process's arena. The M-mode kernel
-remains fully trusted and is not constrained by these unlocked PMP
-permissions.
+WP5 establishes **supervised per-process CPU containment**: an admitted job
+runs as a non-root, capability-free identity inside its own bounded arena and
+documented syscall/device/resource profile. U-mode code cannot directly read,
+write, or execute kernel RAM, loader RAM, direct aliases, protected platform
+regions, or another live process's arena. The M-mode kernel and root supervisor
+remain fully trusted.
 
-This is not yet the complete untrusted-application profile. Arena pages remain
-RWX, and PMP does not act as an IOMMU for peripheral DMA. Application jobs also
-still originate from the root shell without the dedicated identity,
-capability/device policy, and resource supervisor required by WP5. WP6 audits
-every enabled DMA path and either implements the planned W^X split or retains
-it as an explicit measured limitation.
+Arena pages remain RWX, and PMP does not act as an IOMMU for peripheral DMA.
+WP6 audits every enabled DMA path and either implements the planned W^X split
+or retains it as an explicit measured limitation.

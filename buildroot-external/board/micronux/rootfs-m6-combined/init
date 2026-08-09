@@ -31,6 +31,13 @@ if [ ! -S /run/micronux/device-v1.sock ]; then
 fi
 echo 'MICRONUX:M8:SERVICE state=ready abi=1.0 socket=/run/micronux/device-v1.sock'
 
+if [ -x /usr/sbin/micronux-run ]; then
+	if ! /usr/sbin/micronux-run --check; then
+		echo 'MICRONUX:M7:JOB-SUPERVISOR:FAIL policy-installation'
+		exit 1
+	fi
+fi
+
 echo 'MICRONUX:M6:COMBINED:DRIVER storage=microsd-slot0 network=c6-sdio-slot1 arbitration=serialized'
 /bin/busybox sleep 5
 if [ -b /dev/mmcblk0 ]; then

@@ -133,7 +133,7 @@ Linux scanout, backlight ownership, and a Linux console remain separate gates.
 
 ## M7 - Isolation, SMP, and upstream evaluation
 
-Status: **in progress; WP4 per-process CPU containment proven**
+Status: **in progress; WP5 supervised application containment proven**
 
 - Use PMP to protect critical kernel, loader, and coprocessor regions where
   practical.
@@ -154,8 +154,13 @@ read-back-verified PMP boundary around the current arena, and NOMMU
 `access_ok()` enforces the same bounds. Three reset boots passed 16
 privilege/read/write/execute fault cases, cross-process address probes,
 malformed syscall-pointer checks, arena reuse and failed-exec recovery, M5
-selftests, and repeated teardown with stable accounting. This proves
-per-process CPU containment. Job policy, DMA isolation, and W^X remain open.
+selftests, and repeated teardown with stable accounting. A root-owned
+supervisor now launches admitted jobs as locked UID/GID 1000 with zero
+capabilities, `no_new_privs`, a seccomp allowlist, peripheral restrictions,
+and measured process, descriptor, memory, time, and output limits. Three more
+reset boots proved non-yielding/output-flood termination, shell and device
+service liveness, and exact pool/general-memory recovery. DMA isolation and
+W^X remain open.
 
 ## M8 - Linux device services and applications
 
