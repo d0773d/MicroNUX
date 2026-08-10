@@ -23,8 +23,11 @@ REQUIRED_MARKERS = (
     "MICRONUX:M7:DMA-PMS state=pass region0=[4ff80000,4ff82000) "
     "sdmmc=rw:00000001 display=ch0:r:00000006:w:0000000c",
     "fifo=[50105000,50106000) other=deny",
+    "MICRONUX:M7:DSI-BLANK state=ready backlight=off "
+    "restore=linux-after-first-frame",
     "MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending "
-    "pattern=framebuffer dma=descriptor-ring channel=0 rearm=linux",
+    "pattern=framebuffer dma=descriptor-ring channel=0 "
+    "rearm=linux-after-blank",
     "MICRONUX:M7:IRQ source=24 matrix=500d6060 clic=18 handoff=armed",
     "MICRONUX:M7:PMP cached=7-10 direct=12-13 mode=per-mm+wx+tor+napot "
     "state=ready first=[",
@@ -36,6 +39,9 @@ REQUIRED_MARKERS = (
     "event=block-done-irq irq=3 health_poll_us=50 enable_delay_ms=0 "
     "underrun=monitored write_chunk=512 write_gap_us=2 "
     "backlight=linux mmap=denied",
+    "MICRONUX:M7:DSI-SCANOUT state=ready handoff=blanked-restart "
+    "first-frame=confirmed scanout=hardware-reload-running "
+    "backlight=restored",
     "MICRONUX:M6:COMBINED:SHELL ready console=ttyGS0 network=nonblocking",
     "MICRONUX:M8:SERVICE state=ready abi=1.0",
     "MICRONUX:M7:JOB-SUPERVISOR state=ready uid=1000 gid=1000 "
@@ -89,6 +95,7 @@ FORBIDDEN_MARKERS = (
     "MICRONUX:M7:DMA-PMS state=fail",
     "MICRONUX:M7:DSI-HANDOFF state=fail",
     "MICRONUX:M7:DSI-LINUX state=fail",
+    "MICRONUX:M7:DSI-SCANOUT state=fail",
     "MICRONUX:M7:DISPLAY:FAIL",
     "MICRONUX:M7:POOL state=fail",
     "MICRONUX:M7:POOL state=exhausted",

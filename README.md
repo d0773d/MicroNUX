@@ -27,11 +27,12 @@ external IPv4/DNS, and router reconnect holdoff through attempt 7. MicroNUX
 does not build or flash replacement C6 firmware.
 
 The loader initializes the exact 800x1280, two-lane, 1500-Mbps/lane JD9365
-panel, leaves DPI/framebuffer mode selected, quiesces its one-shot transfer,
-and publishes a bounded, CRC-protected descriptor-ring contract. Linux
-validates and claims it as `/dev/fb0`, programs DW-GDMA hardware auto-reload,
-counts frames through the routed block-done IRQ, attaches a 100x80 framebuffer
-console, and owns backlight control. A monitored 50-microsecond timer only
+panel, leaves DPI/framebuffer mode selected, blanks the backlight, quiesces its
+one-shot transfer, and publishes a bounded, CRC-protected descriptor-ring
+contract. Linux validates and claims it as `/dev/fb0`, starts DW-GDMA hardware
+reload, confirms the first frame through the routed block-done IRQ, and only
+then restores the backlight. Linux owns the 100x80 framebuffer console and
+backlight control. A monitored 50-microsecond timer only
 checks the bridge underrun latch. Framebuffer writes are paced in 512-byte
 bursts to protect PSRAM scanout bandwidth, while userspace `mmap()` and the
 unsafe revision-1.3 hardware-pattern transition are denied. DMA permissions

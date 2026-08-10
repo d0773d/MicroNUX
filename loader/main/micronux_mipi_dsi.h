@@ -19,6 +19,7 @@
 #define MICRONUX_DISPLAY_FLAG_RGB565 (UINT32_C(1) << 1)
 #define MICRONUX_DISPLAY_FLAG_DMA_RING (UINT32_C(1) << 2)
 #define MICRONUX_DISPLAY_FLAG_I2C_TRANSFERRED (UINT32_C(1) << 3)
+#define MICRONUX_DISPLAY_FLAG_BACKLIGHT_BLANKED (UINT32_C(1) << 4)
 
 typedef struct {
     uint32_t magic;
@@ -58,9 +59,8 @@ typedef struct {
 esp_err_t micronux_mipi_dsi_prepare(void);
 
 /*
- * Quiesce the loader's scanout, publish its bounded descriptor-ring ownership
- * contract, and leave DPI/framebuffer mode active for Linux to restart with
- * hardware GDMA reload. No loader callback remains active after this call.
+ * Blank the backlight, quiesce loader scanout, publish the bounded ownership
+ * contract, and leave DPI/framebuffer mode ready for Linux to restart.
  */
 esp_err_t micronux_mipi_dsi_handoff(void);
 

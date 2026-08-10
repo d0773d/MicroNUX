@@ -489,10 +489,11 @@ allocation. M6-D0 remains the electrical and timing proof; it is not an
 emulator or an application-facing display path.
 
 M6-D1 and the minimal M6-D2 console gate are now complete in the isolated M7
-profile. The production loader leaves DPI/framebuffer mode selected, quiesces
-scanout, and publishes a versioned descriptor-ring contract. Linux validates
-and claims `/dev/fb0`, programs hardware auto-reload, counts frames through the
-routed GDMA interrupt, and owns the 100x80 framebuffer console and backlight.
+profile. The production loader leaves DPI/framebuffer mode selected, blanks the
+backlight, quiesces callback-driven scanout, and publishes a versioned
+descriptor-ring contract. Linux validates the contract, starts hardware reload
+as `/dev/fb0`, confirms the first frame through the routed GDMA interrupt, then
+restores and owns the 100x80 framebuffer console and backlight.
 The runtime hardware-pattern switch is intentionally disabled on P4 revision
 1.3 because returning from VPG can stall the external DPI stream. See
 the [M7 Linux-owned Kit C display report](m7-linux-display.md) for the exact
