@@ -8,28 +8,39 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "sdkconfig.h"
 #include "esp_attr.h"
 #include "esp_cache.h"
 #include "esp_chip_info.h"
 #include "esp_cpu.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
+#include "heap_memory_layout.h"
 #include "esp_log.h"
+#include "esp_ldo_regulator.h"
 #include "esp_mmu_map.h"
 #include "esp_partition.h"
 #include "esp_private/esp_clk.h"
+#include "esp_private/gpio.h"
 #include "esp_psram.h"
 #include "esp_rom_crc.h"
+#include "esp_rom_gpio.h"
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/sd_host_sdmmc.h"
 #include "hal/mmu_types.h"
+#include "hal/sdmmc_periph.h"
 #include "riscv/csr.h"
 #include "sha/sha_core.h"
 
 #include "micronux_handoff.h"
+#include "micronux_dma_pms.h"
+#include "micronux_mipi_dsi.h"
 #include "micronux_payload.h"
+#include "micronux_provisioning.h"
 
 #define MICRONUX_LINUX_PARTITION_SUBTYPE 0x40
 #define MICRONUX_DTB_PARTITION_SUBTYPE 0x41
@@ -55,9 +66,20 @@
 
 #define MICRONUX_PMP_LOWER_BOUND_ENTRY 13
 #define MICRONUX_PMP_LINUX_ENTRY 14
+#define MICRONUX_PMP_ENTRY_COUNT 16
+#if CONFIG_MICRONUX_M7_EARLY_UMODE_DENY
+#define MICRONUX_PMP_LOWER_BOUND_CONFIG UINT32_C(0)
+#define MICRONUX_PMP_LINUX_CONFIG (PMP_TOR | PMP_R | PMP_W | PMP_X)
+#define MICRONUX_PMP_LOCK_STATE "off"
+#define MICRONUX_PMP_DENY_NAPOT_CONFIG PMP_NAPOT
+#define MICRONUX_PMP_DENY_TOR_CONFIG PMP_TOR
+#define MICRONUX_PMP_DENY_OFF_CONFIG UINT32_C(0)
+#else
 #define MICRONUX_PMP_LOWER_BOUND_CONFIG PMP_L
 #define MICRONUX_PMP_LINUX_CONFIG \
     (PMP_L | PMP_TOR | PMP_R | PMP_W | PMP_X)
+#define MICRONUX_PMP_LOCK_STATE "on"
+#endif
 
 #define ESP32P4_CLIC_CONFIG UINT32_C(0x20800000)
 #define ESP32P4_CLIC_THRESHOLD UINT32_C(0x20800008)
@@ -74,9 +96,61 @@
 #define ESP32P4_INTERRUPT_MAP_MASK UINT32_C(0x3F)
 #define MICRONUX_USB_SERIAL_JTAG_CLIC_ID UINT32_C(16)
 
+/*
+ * Waveshare ESP32-P4-Module-DEV-KIT onboard microSD wiring.  Slot 0 uses
+ * the P4's dedicated IOMUX pins and SD1_VDD is supplied by LDO_VO4.
+ */
+#define MICRONUX_SD_LDO_CHANNEL 4
+#define MICRONUX_SD_LDO_MILLIVOLTS 3300
+#define MICRONUX_SD_CLK_GPIO GPIO_NUM_43
+#define MICRONUX_SD_CMD_GPIO GPIO_NUM_44
+#define MICRONUX_SD_D0_GPIO GPIO_NUM_39
+#define MICRONUX_SD_D1_GPIO GPIO_NUM_40
+#define MICRONUX_SD_D2_GPIO GPIO_NUM_41
+#define MICRONUX_SD_D3_GPIO GPIO_NUM_42
+#define MICRONUX_SD_IOMUX_FUNCTION 0
+#define MICRONUX_SD_DRIVE_CAPABILITY 3
+
+/* ESP32-C6 SDIO wiring used by the Waveshare/function-board layout. */
+#define MICRONUX_C6_SD_CLK_GPIO GPIO_NUM_18
+#define MICRONUX_C6_SD_CMD_GPIO GPIO_NUM_19
+#define MICRONUX_C6_SD_D0_GPIO GPIO_NUM_14
+#define MICRONUX_C6_SD_D1_GPIO GPIO_NUM_15
+#define MICRONUX_C6_SD_D2_GPIO GPIO_NUM_16
+#define MICRONUX_C6_SD_D3_GPIO GPIO_NUM_17
+#define MICRONUX_C6_RESET_GPIO GPIO_NUM_54
+#define MICRONUX_C6_RESET_PULSE_MS 10
+#define MICRONUX_C6_RESET_SETTLE_MS 3000
+
+/* SDIO_HOST is peripheral interrupt source 23 on ESP32-P4. */
+#define ESP32P4_SDMMC_BASE UINT32_C(0x50083000)
+#define ESP32P4_SDMMC_CTRL (ESP32P4_SDMMC_BASE + UINT32_C(0x000))
+#define ESP32P4_SDMMC_INTMASK (ESP32P4_SDMMC_BASE + UINT32_C(0x024))
+#define ESP32P4_SDMMC_RINTSTS (ESP32P4_SDMMC_BASE + UINT32_C(0x044))
+#define ESP32P4_SDMMC_BMOD (ESP32P4_SDMMC_BASE + UINT32_C(0x080))
+#define ESP32P4_SDMMC_IDSTS (ESP32P4_SDMMC_BASE + UINT32_C(0x08C))
+#define ESP32P4_SDMMC_IDINTEN (ESP32P4_SDMMC_BASE + UINT32_C(0x090))
+#define ESP32P4_SDMMC_CTRL_INT_ENABLE (UINT32_C(1) << 4)
+#define ESP32P4_SDMMC_CTRL_DMA_ENABLE (UINT32_C(1) << 5)
+#define ESP32P4_SDMMC_CTRL_USE_IDMAC (UINT32_C(1) << 25)
+#define ESP32P4_CORE0_SDIO_HOST_INT_MAP UINT32_C(0x500D605C)
+#define MICRONUX_SDMMC_IRQ_PLACEHOLDER_ID UINT32_C(17)
+#define MICRONUX_SDMMC_PARK_CLIC_ID UINT32_C(31)
+#define MICRONUX_SD_DMA_DESC_ADDR UINT32_C(0x4FF80000)
+#define MICRONUX_SD_DMA_DATA_ADDR UINT32_C(0x4FF81000)
+#define MICRONUX_SD_DMA_END UINT32_C(0x4FF82000)
+#define MICRONUX_SD_DMA_UNCACHED_ALIAS UINT32_C(0x8FF80000)
+
+/* This system loader owns the fixed SRAM handoff contract used by Linux. */
+SOC_RESERVE_MEMORY_REGION(MICRONUX_SD_DMA_DESC_ADDR,
+                          MICRONUX_SD_DMA_END,
+                          micronux_sd_dma);
+
 static const char *const TAG = "micronux_m3";
 static DRAM_ATTR micronux_handoff_v1_t s_handoff;
 static DRAM_ATTR micronux_payload_v1_t s_payload;
+static esp_ldo_channel_handle_t s_sd_ldo;
+static sd_host_ctlr_handle_t s_sd_controller;
 
 extern void micronux_handoff_jump(uint32_t boot_hart_id,
                                   const void *dtb,
@@ -279,15 +353,271 @@ static void prepare_usb_serial_jtag_for_linux(void)
     }
 }
 
+static void configure_sd_iomux_pin(gpio_num_t gpio, bool pull_up)
+{
+    gpio_pulldown_dis(gpio);
+    if (pull_up) {
+        gpio_pullup_en(gpio);
+    } else {
+        gpio_pullup_dis(gpio);
+    }
+    gpio_input_enable(gpio);
+    gpio_iomux_output(gpio, MICRONUX_SD_IOMUX_FUNCTION);
+    ESP_ERROR_CHECK(gpio_set_drive_capability(
+        gpio, MICRONUX_SD_DRIVE_CAPABILITY));
+}
+
+static void prepare_microsd_electrical_state(void)
+{
+    const esp_ldo_channel_config_t ldo_config = {
+        .chan_id = MICRONUX_SD_LDO_CHANNEL,
+        .voltage_mv = MICRONUX_SD_LDO_MILLIVOLTS,
+    };
+
+    ESP_ERROR_CHECK(esp_ldo_acquire_channel(&ldo_config, &s_sd_ldo));
+    configure_sd_iomux_pin(MICRONUX_SD_CLK_GPIO, false);
+    configure_sd_iomux_pin(MICRONUX_SD_CMD_GPIO, true);
+    configure_sd_iomux_pin(MICRONUX_SD_D0_GPIO, true);
+    configure_sd_iomux_pin(MICRONUX_SD_D1_GPIO, true);
+    configure_sd_iomux_pin(MICRONUX_SD_D2_GPIO, true);
+    configure_sd_iomux_pin(MICRONUX_SD_D3_GPIO, true);
+
+    /* The IDF controller setup selects PLL160M / 2: Linux receives 80 MHz. */
+    esp_rom_delay_us(1000);
+    ESP_LOGI(TAG,
+             "MICRONUX:M6:SDMMC power=ldo4 voltage_mv=3300"
+             " slot=0 width=4 clock_hz=80000000 pins=43,44,39,40,41,42");
+}
+
+#if CONFIG_MICRONUX_C6_SDIO_PROFILE
+static void configure_c6_sdio_pin(gpio_num_t gpio, int signal,
+                                  gpio_mode_t mode, bool pull_up)
+{
+    ESP_ERROR_CHECK(gpio_reset_pin(gpio));
+    ESP_ERROR_CHECK(gpio_set_direction(gpio, mode));
+    ESP_ERROR_CHECK(gpio_pulldown_dis(gpio));
+    if (pull_up) {
+        ESP_ERROR_CHECK(gpio_pullup_en(gpio));
+    } else {
+        ESP_ERROR_CHECK(gpio_pullup_dis(gpio));
+    }
+    ESP_ERROR_CHECK(gpio_set_drive_capability(
+        gpio, MICRONUX_SD_DRIVE_CAPABILITY));
+
+    if (mode == GPIO_MODE_INPUT || mode == GPIO_MODE_INPUT_OUTPUT) {
+        esp_rom_gpio_connect_in_signal(gpio, signal, false);
+    }
+    if (mode == GPIO_MODE_OUTPUT || mode == GPIO_MODE_INPUT_OUTPUT) {
+        esp_rom_gpio_connect_out_signal(gpio, signal, false, false);
+    }
+}
+
+static void prepare_c6_sdio_electrical_state(void)
+{
+    const gpio_config_t reset_config = {
+        .pin_bit_mask = UINT64_C(1) << MICRONUX_C6_RESET_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    configure_c6_sdio_pin(MICRONUX_C6_SD_CLK_GPIO,
+                          sdmmc_slot_gpio_sig[1].clk,
+                          GPIO_MODE_OUTPUT, false);
+    configure_c6_sdio_pin(MICRONUX_C6_SD_CMD_GPIO,
+                          sdmmc_slot_gpio_sig[1].cmd,
+                          GPIO_MODE_INPUT_OUTPUT, true);
+    configure_c6_sdio_pin(MICRONUX_C6_SD_D0_GPIO,
+                          sdmmc_slot_gpio_sig[1].d0,
+                          GPIO_MODE_INPUT_OUTPUT, true);
+    configure_c6_sdio_pin(MICRONUX_C6_SD_D1_GPIO,
+                          sdmmc_slot_gpio_sig[1].d1,
+                          GPIO_MODE_INPUT_OUTPUT, true);
+    configure_c6_sdio_pin(MICRONUX_C6_SD_D2_GPIO,
+                          sdmmc_slot_gpio_sig[1].d2,
+                          GPIO_MODE_INPUT_OUTPUT, true);
+    configure_c6_sdio_pin(MICRONUX_C6_SD_D3_GPIO,
+                          sdmmc_slot_gpio_sig[1].d3,
+                          GPIO_MODE_INPUT_OUTPUT, true);
+
+    ESP_ERROR_CHECK(gpio_config(&reset_config));
+    /* GPIO54 is C6 CHIP_PU: low resets the coprocessor, high runs it. */
+    ESP_ERROR_CHECK(gpio_set_level(MICRONUX_C6_RESET_GPIO, 1));
+    vTaskDelay(pdMS_TO_TICKS(MICRONUX_C6_RESET_PULSE_MS));
+    ESP_ERROR_CHECK(gpio_set_level(MICRONUX_C6_RESET_GPIO, 0));
+    vTaskDelay(pdMS_TO_TICKS(MICRONUX_C6_RESET_PULSE_MS));
+    ESP_ERROR_CHECK(gpio_set_level(MICRONUX_C6_RESET_GPIO, 1));
+    vTaskDelay(pdMS_TO_TICKS(MICRONUX_C6_RESET_SETTLE_MS));
+
+    ESP_LOGI(TAG,
+             "MICRONUX:M6:NET transport=sdio slot=1 width=4"
+             " clock_max_hz=40000000 pins=18,19,14,15,16,17 reset=54");
+}
+#endif
+
+static void quiesce_sdmmc_controller(void)
+{
+    uint32_t control = read_reg32(ESP32P4_SDMMC_CTRL);
+
+    control &= ~(ESP32P4_SDMMC_CTRL_INT_ENABLE |
+                 ESP32P4_SDMMC_CTRL_DMA_ENABLE |
+                 ESP32P4_SDMMC_CTRL_USE_IDMAC);
+    write_reg32(ESP32P4_SDMMC_CTRL, control);
+    write_reg32(ESP32P4_SDMMC_INTMASK, 0);
+    write_reg32(ESP32P4_SDMMC_RINTSTS, UINT32_MAX);
+    write_reg32(ESP32P4_SDMMC_IDINTEN, 0);
+    write_reg32(ESP32P4_SDMMC_IDSTS, UINT32_MAX);
+    write_reg32(ESP32P4_SDMMC_BMOD, 0);
+}
+
+static void prepare_sdmmc_electrical_state(void)
+{
+    const sd_host_sdmmc_cfg_t controller_config = {
+        .event_queue_items = 1,
+        .dma_desc_num = 1,
+    };
+
+    ESP_ERROR_CHECK(sd_host_create_sdmmc_controller(
+        &controller_config, &s_sd_controller));
+    /* No IDF slot is registered: silence its ISR before exposing the pins. */
+    quiesce_sdmmc_controller();
+
+#if !CONFIG_MICRONUX_C6_SDIO_PROFILE || \
+    CONFIG_MICRONUX_SDMMC_DUAL_SLOT_PROFILE
+    prepare_microsd_electrical_state();
+#endif
+#if CONFIG_MICRONUX_C6_SDIO_PROFILE
+    prepare_c6_sdio_electrical_state();
+#endif
+#if CONFIG_MICRONUX_SDMMC_DUAL_SLOT_PROFILE
+    ESP_LOGI(TAG,
+             "MICRONUX:M6:SDMMC profile=dual slots=0,1"
+             " arbitration=linux-serialized");
+#endif
+}
+
+static void prepare_sdmmc_for_linux(void)
+{
+    /*
+     * Linux reinitializes IDMAC after taking ownership.  Its descriptors and
+     * 4 KiB bounce buffer use the internal-SRAM range reserved above, and the
+     * driver accesses that range through the uncached alias.  The accepted
+     * M6 path is synchronous-polled, so park the physical source on CLIC 31.
+     * prepare_clic_for_linux() leaves that otherwise-unused input disabled;
+     * Linux IRQ 17 exists only so the generic driver can request and disable
+     * a valid placeholder IRQ without the SD line entering Linux.
+     */
+    quiesce_sdmmc_controller();
+
+    const uint32_t map = read_reg32(ESP32P4_CORE0_SDIO_HOST_INT_MAP);
+    write_reg32(ESP32P4_CORE0_SDIO_HOST_INT_MAP,
+        (map & ~ESP32P4_INTERRUPT_MAP_MASK) | MICRONUX_SDMMC_PARK_CLIC_ID);
+    if ((read_reg32(ESP32P4_CORE0_SDIO_HOST_INT_MAP) &
+         ESP32P4_INTERRUPT_MAP_MASK) != MICRONUX_SDMMC_PARK_CLIC_ID) {
+        fail("sdmmc-route");
+    }
+}
+
+#define MICRONUX_LOG_PMP_ENTRY(phase, entry)                              \
+    ESP_LOGI(TAG,                                                         \
+             "MICRONUX:M7:PMP phase=%s entry=%u addr=%08" PRIx32         \
+             " config=%02" PRIx32,                                      \
+             phase, (unsigned int)(entry), PMP_ENTRY_ADDR_READ(entry),    \
+             PMP_ENTRY_CFG_READ(entry))
+
+static void log_pmp_entries(const char *phase)
+{
+    /* PMP CSR numbers are instruction immediates, so the reads stay unrolled. */
+    MICRONUX_LOG_PMP_ENTRY(phase, 0);
+    MICRONUX_LOG_PMP_ENTRY(phase, 1);
+    MICRONUX_LOG_PMP_ENTRY(phase, 2);
+    MICRONUX_LOG_PMP_ENTRY(phase, 3);
+    MICRONUX_LOG_PMP_ENTRY(phase, 4);
+    MICRONUX_LOG_PMP_ENTRY(phase, 5);
+    MICRONUX_LOG_PMP_ENTRY(phase, 6);
+    MICRONUX_LOG_PMP_ENTRY(phase, 7);
+    MICRONUX_LOG_PMP_ENTRY(phase, 8);
+    MICRONUX_LOG_PMP_ENTRY(phase, 9);
+    MICRONUX_LOG_PMP_ENTRY(phase, 10);
+    MICRONUX_LOG_PMP_ENTRY(phase, 11);
+    MICRONUX_LOG_PMP_ENTRY(phase, 12);
+    MICRONUX_LOG_PMP_ENTRY(phase, 13);
+    MICRONUX_LOG_PMP_ENTRY(phase, 14);
+    MICRONUX_LOG_PMP_ENTRY(phase, 15);
+    ESP_LOGI(TAG, "MICRONUX:M7:PMP-DUMP phase=%s entries=%u",
+             phase, (unsigned int)MICRONUX_PMP_ENTRY_COUNT);
+}
+
+#if CONFIG_MICRONUX_M7_EARLY_UMODE_DENY
+#define MICRONUX_AUDIT_PMP_ENTRY(entry, address, config)                  \
+    do {                                                                 \
+        if (PMP_ENTRY_ADDR_READ(entry) != (address) ||                    \
+            PMP_ENTRY_CFG_READ(entry) != (config)) {                     \
+            ESP_LOGE(TAG,                                                 \
+                     "MICRONUX:M7:PMP-AUDIT state=fail entry=%u"         \
+                     " expected_addr=%08" PRIx32                         \
+                     " actual_addr=%08" PRIx32                           \
+                     " expected_config=%02" PRIx32                       \
+                     " actual_config=%02" PRIx32,                        \
+                     (unsigned int)(entry), (uint32_t)(address),          \
+                     PMP_ENTRY_ADDR_READ(entry), (uint32_t)(config),      \
+                     PMP_ENTRY_CFG_READ(entry));                          \
+            fail("m7-pmp-audit");                                       \
+        }                                                                \
+    } while (0)
+
+static void audit_m7_early_pmp(bool linux_window_installed)
+{
+    MICRONUX_AUDIT_PMP_ENTRY(0, UINT32_C(0x27fffffc),
+                             MICRONUX_PMP_DENY_NAPOT_CONFIG);
+    MICRONUX_AUDIT_PMP_ENTRY(1, UINT32_C(0x3ff0fffc),
+                             MICRONUX_PMP_DENY_NAPOT_CONFIG);
+    MICRONUX_AUDIT_PMP_ENTRY(2, UINT32_C(0x4fc0fffc),
+                             MICRONUX_PMP_DENY_NAPOT_CONFIG);
+    MICRONUX_AUDIT_PMP_ENTRY(3, UINT32_C(0x4ff00000),
+                             MICRONUX_PMP_DENY_OFF_CONFIG);
+    MICRONUX_AUDIT_PMP_ENTRY(4, UINT32_C(0x4ffc0000),
+                             MICRONUX_PMP_DENY_TOR_CONFIG);
+    MICRONUX_AUDIT_PMP_ENTRY(5, UINT32_C(0), UINT32_C(0));
+    MICRONUX_AUDIT_PMP_ENTRY(6, UINT32_C(0x41fffffc),
+                             MICRONUX_PMP_DENY_NAPOT_CONFIG);
+    MICRONUX_AUDIT_PMP_ENTRY(7, UINT32_C(0), UINT32_C(0));
+    MICRONUX_AUDIT_PMP_ENTRY(8, UINT32_C(0), UINT32_C(0));
+    MICRONUX_AUDIT_PMP_ENTRY(9, UINT32_C(0), UINT32_C(0));
+    MICRONUX_AUDIT_PMP_ENTRY(10, UINT32_C(0), UINT32_C(0));
+    MICRONUX_AUDIT_PMP_ENTRY(11, UINT32_C(0x5010bffc),
+                             MICRONUX_PMP_DENY_NAPOT_CONFIG);
+    MICRONUX_AUDIT_PMP_ENTRY(12, UINT32_C(0), UINT32_C(0));
+    MICRONUX_AUDIT_PMP_ENTRY(13,
+                             linux_window_installed ?
+                                 MICRONUX_KERNEL_VADDR : UINT32_C(0),
+                             linux_window_installed ?
+                                 MICRONUX_PMP_LOWER_BOUND_CONFIG :
+                                 UINT32_C(0));
+    MICRONUX_AUDIT_PMP_ENTRY(14,
+                             linux_window_installed ?
+                                 MICRONUX_COMMS_VADDR : UINT32_C(0),
+                             linux_window_installed ?
+                                 MICRONUX_PMP_LINUX_CONFIG : UINT32_C(0));
+    MICRONUX_AUDIT_PMP_ENTRY(15, UINT32_C(0x5007fffc),
+                             MICRONUX_PMP_DENY_NAPOT_CONFIG);
+}
+#endif
+
 static void prepare_pmp_for_linux(void)
 {
     /*
-     * ESP-IDF locks its platform PMP entries before app_main().  Entries 13
-     * and 14 are unused on ESP32-P4 revision 1.3, so use them as a TOR pair
-     * for the exact Linux-owned PSRAM interval.  Locking the pair makes the
-     * U-mode contract deterministic: loader and comms reserves remain out of
-     * reach while NOMMU Linux receives the RWX memory it requires.
+     * Entries 13 and 14 are unused on ESP32-P4 revision 1.3.  The M7 profile
+     * hands Linux an unlocked TOR pair for its complete PSRAM interval; Linux
+     * replaces this pair before its first U-mode return.  Earlier profiles
+     * retain their locked, static handoff window.
      */
+    log_pmp_entries("pre");
+#if CONFIG_MICRONUX_M7_EARLY_UMODE_DENY
+    audit_m7_early_pmp(false);
+#endif
+
     PMP_RESET_AND_ENTRY_SET(MICRONUX_PMP_LOWER_BOUND_ENTRY,
                             MICRONUX_KERNEL_VADDR,
                             MICRONUX_PMP_LOWER_BOUND_CONFIG);
@@ -313,9 +643,19 @@ static void prepare_pmp_for_linux(void)
 
     ESP_LOGI(TAG,
              "MICRONUX:M3:PMP entries=%u,%u linux=[%08" PRIx32
-             ",%08" PRIx32 ") config=%02" PRIx32,
+             ",%08" PRIx32 ") config=%02" PRIx32 " lock=%s",
              MICRONUX_PMP_LOWER_BOUND_ENTRY, MICRONUX_PMP_LINUX_ENTRY,
-             lower_address, linux_address, linux_config);
+             lower_address, linux_address, linux_config,
+             MICRONUX_PMP_LOCK_STATE);
+#if CONFIG_MICRONUX_M7_EARLY_UMODE_DENY
+    audit_m7_early_pmp(true);
+    ESP_LOGI(TAG,
+             "MICRONUX:M7:PMP baseline=pass early-deny=pass"
+             " handoff=13-14-unlocked overlay=13-14"
+             " linux=[%08" PRIx32 ",%08" PRIx32 ")",
+             MICRONUX_KERNEL_VADDR, MICRONUX_COMMS_VADDR);
+#endif
+    log_pmp_entries("post");
 }
 
 void app_main(void)
@@ -332,6 +672,22 @@ void app_main(void)
     }
 
     characterize_clint();
+#if CONFIG_MICRONUX_C6_PROVISIONING
+    const esp_err_t provisioning_err = micronux_provisioning_run();
+    if (provisioning_err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "MICRONUX:M6:PROV result=error action=linux-handoff error=%s",
+                 esp_err_to_name(provisioning_err));
+    }
+#endif
+    prepare_sdmmc_electrical_state();
+    ESP_LOGI(TAG,
+             "MICRONUX:M6:DMA reserved=[%08" PRIx32 ",%08" PRIx32
+             ") desc=%08" PRIx32 " data=%08" PRIx32
+             " uncached=%08" PRIx32,
+             MICRONUX_SD_DMA_DESC_ADDR, MICRONUX_SD_DMA_END,
+             MICRONUX_SD_DMA_DESC_ADDR, MICRONUX_SD_DMA_DATA_ADDR,
+             MICRONUX_SD_DMA_UNCACHED_ALIAS);
 
     const size_t psram_size = esp_psram_get_size();
     const size_t psram_heap = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
@@ -344,6 +700,10 @@ void app_main(void)
              psram_size, psram_heap, psram_free, psram_largest);
     if (psram_size != 32U * 1024U * 1024U) {
         fail("psram-capacity");
+    }
+
+    if (micronux_mipi_dsi_prepare() != ESP_OK) {
+        fail("mipi-dsi-prepare");
     }
 
     const esp_partition_t *metadata_partition = find_partition(
@@ -515,6 +875,22 @@ void app_main(void)
              " clic=%" PRIu32 " handoff=armed",
              ESP32P4_CORE0_USB_SERIAL_JTAG_INT_MAP,
              MICRONUX_USB_SERIAL_JTAG_CLIC_ID);
+    ESP_LOGI(TAG,
+             "MICRONUX:M6:IRQ source=23 matrix=%08" PRIx32
+             " route=parked:%" PRIu32
+             " irq=%" PRIu32 ":placeholder-polled"
+             " dma=idmac-sram-bounce handoff=armed",
+             ESP32P4_CORE0_SDIO_HOST_INT_MAP,
+             MICRONUX_SDMMC_PARK_CLIC_ID,
+             MICRONUX_SDMMC_IRQ_PLACEHOLDER_ID);
+
+    if (micronux_mipi_dsi_handoff() != ESP_OK) {
+        fail("mipi-dsi-handoff");
+    }
+    prepare_sdmmc_for_linux();
+    if (micronux_dma_pms_prepare() != ESP_OK) {
+        fail("dma-pms");
+    }
 
     fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(100));

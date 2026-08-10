@@ -1,0 +1,204 @@
+From eb5fa695b9297a042b840fac4ab591c52cde12ca Mon Sep 17 00:00:00 2001
+From: MicroNUX Project <micronux@example.invalid>
+Date: Sun, 9 Aug 2026 10:00:06 -0700
+Subject: [PATCH 05/10] riscv: program MicroNUX PMP on user return
+
+Keep the generic RISC-V startup code from installing an all-address entry-0
+RWX grant when MicroNUX isolation is enabled.  Entry 0 has highest priority
+on ESP32-P4 and would otherwise shadow the audited loader baseline and every
+per-process rule.
+
+Before every U-mode return, revoke the previous grant and install a TOR
+ladder that denies cached memory below the current mm, grants only the mm,
+and denies cached memory above it.  Deny the direct-access half of the
+address space separately and cover the final 128-byte PMP granule with
+NAPOT.  Verify all address and configuration CSRs before returning to U-mode
+and panic after a best-effort deny-all transition if any invariant fails.
+
+Signed-off-by: MicroNUX Project <micronux@example.invalid>
+---
+ arch/riscv/kernel/Makefile            |   1 +
+ arch/riscv/kernel/entry.S             |   7 +-
+ arch/riscv/kernel/head.S              |   2 +
+ arch/riscv/kernel/micronux_user_pmp.c | 121 ++++++++++++++++++++++++++
+ 4 files changed, 130 insertions(+), 1 deletion(-)
+ create mode 100644 arch/riscv/kernel/micronux_user_pmp.c
+
+diff --git a/arch/riscv/kernel/Makefile b/arch/riscv/kernel/Makefile
+index 69dc8aa..d345269 100644
+--- a/arch/riscv/kernel/Makefile
++++ b/arch/riscv/kernel/Makefile
+@@ -51,6 +51,7 @@ obj-$(CONFIG_RISCV_ALTERNATIVE) += alternative.o
+ obj-y	+= cpu.o
+ obj-y	+= cpufeature.o
+ obj-y	+= entry.o
++obj-$(CONFIG_MICRONUX_ESP32P4_ISOLATION) += micronux_user_pmp.o
+ obj-y	+= irq.o
+ obj-y	+= process.o
+ obj-y	+= ptrace.o
+diff --git a/arch/riscv/kernel/entry.S b/arch/riscv/kernel/entry.S
+index d31d15c..68d4a86 100644
+--- a/arch/riscv/kernel/entry.S
++++ b/arch/riscv/kernel/entry.S
+@@ -242,9 +242,14 @@ SYM_CODE_START_NOALIGN(ret_from_exception)
+ 	/* Save the kernel shadow call stack pointer */
+ 	scs_save_current
+ 
++#ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++	/* Program and verify the PMP interval before the CLIC first-stage mret. */
++	call micronux_user_pmp_prepare_return
++#endif
+ 	/*
+ 	 * Save TP into the scratch register , so we can find the kernel data
+-	 * structures again.
++	 * structures again.  Keep this after the PMP helper so a helper fault
++	 * cannot be mistaken for a trap originating in userspace.
+ 	 */
+ 	csrw CSR_SCRATCH, tp
+ 1:
+diff --git a/arch/riscv/kernel/head.S b/arch/riscv/kernel/head.S
+index 1418a79..01b2c63 100644
+--- a/arch/riscv/kernel/head.S
++++ b/arch/riscv/kernel/head.S
+@@ -222,10 +222,12 @@ SYM_CODE_START(_start_kernel)
+ 	la a0, .Lpmp_done
+ 	set_trap_vector a0
+ 
++#ifndef CONFIG_MICRONUX_ESP32P4_ISOLATION
+ 	li a0, -1
+ 	csrw CSR_PMPADDR0, a0
+ 	li a0, (PMP_A_NAPOT | PMP_R | PMP_W | PMP_X)
+ 	csrw CSR_PMPCFG0, a0
++#endif
+ .balign 64
+ .align 2
+ .Lpmp_done:
+diff --git a/arch/riscv/kernel/micronux_user_pmp.c b/arch/riscv/kernel/micronux_user_pmp.c
+new file mode 100644
+index 0000000..16aed90
+--- /dev/null
++++ b/arch/riscv/kernel/micronux_user_pmp.c
+@@ -0,0 +1,121 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Fail-closed U-mode PMP overlay for MicroNUX on ESP32-P4. */
++
++#include <linux/kernel.h>
++#include <linux/mm.h>
++#include <linux/sched.h>
++
++#include <asm/csr.h>
++#include <asm/micronux_user_isolation.h>
++#include <asm/micronux_user_pool.h>
++
++#define MICRONUX_PMPCFG1	(CSR_PMPCFG0 + 1)
++#define MICRONUX_PMPCFG2	(CSR_PMPCFG0 + 2)
++#define MICRONUX_PMPCFG3	(CSR_PMPCFG0 + 3)
++#define MICRONUX_PMPADDR7	(CSR_PMPADDR0 + 7)
++#define MICRONUX_PMPADDR8	(CSR_PMPADDR0 + 8)
++#define MICRONUX_PMPADDR9	(CSR_PMPADDR0 + 9)
++#define MICRONUX_PMPADDR12	(CSR_PMPADDR0 + 12)
++#define MICRONUX_PMPADDR13	(CSR_PMPADDR0 + 13)
++
++#define MICRONUX_PMPCFG1_KEEP	0x00ffffffUL
++#define MICRONUX_PMPCFG2_KEEP	0xff000000UL
++#define MICRONUX_PMPCFG3_KEEP	0xff000000UL
++#define MICRONUX_PMP_ALLOW_CONFIG	(PMP_A_TOR | PMP_R | PMP_W | PMP_X)
++#define MICRONUX_PMP_DENY_CONFIG	PMP_A_TOR
++#define MICRONUX_PMP_FINAL_DENY_CONFIG	PMP_A_NAPOT
++#define MICRONUX_CACHED_DENY_TOP	0x4fc00000UL
++#define MICRONUX_DIRECT_DENY_TOP	0xffffff80UL
++#define MICRONUX_PMPADDR_FINAL_DENY \
++	((MICRONUX_DIRECT_DENY_TOP | ((MICRONUX_PMP_GRANULARITY - 1) >> 1)) >> 2)
++
++static bool micronux_user_pmp_program(unsigned long lo, unsigned long hi,
++				      bool allow)
++{
++	unsigned long cached_lo = allow ? lo : MICRONUX_CACHED_DENY_TOP;
++	unsigned long cached_hi = allow ? hi : MICRONUX_CACHED_DENY_TOP;
++	unsigned long revoked_cfg1;
++	unsigned long revoked_cfg2;
++	unsigned long revoked_cfg3;
++	unsigned long deny_cfg2;
++	unsigned long final_cfg1;
++	unsigned long final_cfg2;
++	unsigned long final_cfg3;
++
++	revoked_cfg1 = csr_read(MICRONUX_PMPCFG1) & MICRONUX_PMPCFG1_KEEP;
++	revoked_cfg2 = csr_read(MICRONUX_PMPCFG2) & MICRONUX_PMPCFG2_KEEP;
++	revoked_cfg3 = csr_read(MICRONUX_PMPCFG3) & MICRONUX_PMPCFG3_KEEP;
++
++	/* Revoke every U-mode grant before changing any PMP address. */
++	csr_write(MICRONUX_PMPCFG1, revoked_cfg1);
++	csr_write(MICRONUX_PMPCFG2, revoked_cfg2);
++	csr_write(MICRONUX_PMPCFG3, revoked_cfg3);
++	if (csr_read(MICRONUX_PMPCFG1) != revoked_cfg1 ||
++	    csr_read(MICRONUX_PMPCFG2) != revoked_cfg2 ||
++	    csr_read(MICRONUX_PMPCFG3) != revoked_cfg3)
++		return false;
++
++	csr_write(MICRONUX_PMPADDR7, cached_lo >> 2);
++	csr_write(MICRONUX_PMPADDR8, cached_hi >> 2);
++	csr_write(MICRONUX_PMPADDR9, MICRONUX_CACHED_DENY_TOP >> 2);
++	csr_write(MICRONUX_PMPADDR12, MICRONUX_DIRECT_DENY_TOP >> 2);
++	csr_write(MICRONUX_PMPADDR13, MICRONUX_PMPADDR_FINAL_DENY);
++
++	final_cfg1 = revoked_cfg1 | MICRONUX_PMP_DENY_CONFIG << 24;
++	deny_cfg2 = revoked_cfg2 | MICRONUX_PMP_DENY_CONFIG << 8;
++	final_cfg2 = deny_cfg2;
++	if (allow)
++		final_cfg2 |= MICRONUX_PMP_ALLOW_CONFIG;
++	final_cfg3 = revoked_cfg3 | MICRONUX_PMP_DENY_CONFIG |
++		     MICRONUX_PMP_FINAL_DENY_CONFIG << 8;
++
++	/* Install every deny interval before enabling the user interval. */
++	csr_write(MICRONUX_PMPCFG3, final_cfg3);
++	csr_write(MICRONUX_PMPCFG2, deny_cfg2);
++	csr_write(MICRONUX_PMPCFG1, final_cfg1);
++	csr_write(MICRONUX_PMPCFG2, final_cfg2);
++	asm volatile("fence rw, rw\n\tfence.i" ::: "memory");
++
++	return csr_read(MICRONUX_PMPCFG1) == final_cfg1 &&
++	       csr_read(MICRONUX_PMPCFG2) == final_cfg2 &&
++	       csr_read(MICRONUX_PMPCFG3) == final_cfg3 &&
++	       csr_read(MICRONUX_PMPADDR7) == cached_lo >> 2 &&
++	       csr_read(MICRONUX_PMPADDR8) == cached_hi >> 2 &&
++	       csr_read(MICRONUX_PMPADDR9) == MICRONUX_CACHED_DENY_TOP >> 2 &&
++	       csr_read(MICRONUX_PMPADDR12) == MICRONUX_DIRECT_DENY_TOP >> 2 &&
++	       csr_read(MICRONUX_PMPADDR13) == MICRONUX_PMPADDR_FINAL_DENY;
++}
++
++static __noreturn void micronux_user_pmp_fail(const char *reason)
++{
++	bool denied;
++
++	denied = micronux_user_pmp_program(MICRONUX_USER_POOL_END,
++					   MICRONUX_USER_POOL_END, false);
++	panic("MICRONUX:M7:PMP-OVERLAY state=fail reason=%s deny_all=%u",
++	      reason, denied);
++}
++
++void micronux_user_pmp_prepare_return(void)
++{
++	struct mm_struct *mm = current->mm;
++	unsigned long lo;
++	unsigned long hi;
++
++	if (!mm || !micronux_user_pool_ready() ||
++	    !READ_ONCE(mm->context.user_bounds_valid))
++		micronux_user_pmp_fail("bounds-unavailable");
++
++	lo = READ_ONCE(mm->context.user_lo);
++	hi = READ_ONCE(mm->context.user_hi);
++	if (lo < MICRONUX_USER_POOL_START || hi > MICRONUX_USER_POOL_END ||
++	    lo >= hi || !IS_ALIGNED(lo, MICRONUX_PMP_GRANULARITY) ||
++	    !IS_ALIGNED(hi, MICRONUX_PMP_GRANULARITY))
++		micronux_user_pmp_fail("bounds-invalid");
++
++	if (!micronux_user_pmp_program(lo, hi, true))
++		micronux_user_pmp_fail("csr-readback");
++
++	pr_info_once("MICRONUX:M7:PMP cached=7-9 direct=12-13 mode=tor+napot state=ready range=[%08lx,%08lx) config=08,0f,08,08,18 lock=off\n",
++		     lo, hi);
++}
+-- 
+2.43.0

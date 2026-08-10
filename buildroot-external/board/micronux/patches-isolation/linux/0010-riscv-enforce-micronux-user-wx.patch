@@ -1,0 +1,457 @@
+From 6d886f6adcaabbb7ba2ce001148f9410f18c4fc1 Mon Sep 17 00:00:00 2001
+From: MicroNUX Project <micronux@example.invalid>
+Date: Sun, 9 Aug 2026 18:00:00 -0700
+Subject: [PATCH 10/10] riscv: enforce MicroNUX user W^X
+
+Split each isolated NOMMU address space into an immutable executable range
+and a writable non-executable range.  Place the signal-return sequence in a
+fixed read-only trampoline, reject post-exec executable mappings, and make
+all kernel-to-user copies honor the writable boundary.  Program and verify
+a four-entry PMP TOR ladder before every U-mode return so code writes and
+data or stack execution fault in hardware.
+
+Signed-off-by: MicroNUX Project <micronux@example.invalid>
+---
+diff --git a/arch/riscv/include/asm/micronux_user_isolation.h b/arch/riscv/include/asm/micronux_user_isolation.h
+index 614d488..a3f5b37 100644
+--- a/arch/riscv/include/asm/micronux_user_isolation.h
++++ b/arch/riscv/include/asm/micronux_user_isolation.h
+@@ -11,6 +11,7 @@
+ #define MICRONUX_PMP_GRANULARITY	128UL
+ 
+ bool micronux_user_access_ok(unsigned long addr, unsigned long size);
++bool micronux_user_write_ok(unsigned long addr, unsigned long size);
+ unsigned long micronux_user_addr_limit(void);
+ void micronux_user_pmp_prepare_return(void);
+ 
+diff --git a/arch/riscv/include/asm/micronux_user_pool.h b/arch/riscv/include/asm/micronux_user_pool.h
+--- a/arch/riscv/include/asm/micronux_user_pool.h
++++ b/arch/riscv/include/asm/micronux_user_pool.h
+@@ -7,6 +7,10 @@ struct mm_struct;
+ struct micronux_user_arena;
+ 
+ int micronux_user_arena_prepare(struct mm_struct *mm, unsigned long bytes);
++int micronux_user_wx_finalize(struct mm_struct *mm,
++			      unsigned long exec_hi,
++			      unsigned long sigreturn,
++			      unsigned long sigreturn_size);
+ void *micronux_user_arena_alloc(struct mm_struct *mm,
+ 				unsigned long nr_pages);
+ bool micronux_user_arena_free(unsigned long start, unsigned long end);
+diff --git a/arch/riscv/include/asm/mmu.h b/arch/riscv/include/asm/mmu.h
+index ce4962f..ed090c9 100644
+--- a/arch/riscv/include/asm/mmu.h
++++ b/arch/riscv/include/asm/mmu.h
+@@ -17,8 +17,11 @@ typedef struct {
+ #ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
+ 	struct micronux_user_arena *user_arena;
+ 	unsigned long	user_lo;
++	unsigned long	user_exec_hi;
+ 	unsigned long	user_hi;
++	unsigned long	user_sigreturn;
+ 	bool		user_bounds_valid;
++	bool		user_wx_valid;
+ #endif
+ #else
+ 	atomic_long_t id;
+diff --git a/arch/riscv/include/asm/mmu_context.h b/arch/riscv/include/asm/mmu_context.h
+index 07b571e..c6b7c1b 100644
+--- a/arch/riscv/include/asm/mmu_context.h
++++ b/arch/riscv/include/asm/mmu_context.h
+@@ -38,8 +38,11 @@ static inline int init_new_context(struct task_struct *tsk,
+ #ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
+ 	mm->context.user_arena = NULL;
+ 	mm->context.user_lo = 0;
++	mm->context.user_exec_hi = 0;
+ 	mm->context.user_hi = 0;
++	mm->context.user_sigreturn = 0;
+ 	mm->context.user_bounds_valid = false;
++	mm->context.user_wx_valid = false;
+ #endif
+ 	return 0;
+ }
+diff --git a/arch/riscv/include/asm/uaccess.h b/arch/riscv/include/asm/uaccess.h
+index 7ac96c9..19045f5 100644
+--- a/arch/riscv/include/asm/uaccess.h
++++ b/arch/riscv/include/asm/uaccess.h
+@@ -337,10 +337,54 @@ do {									\
+ 
+ #else /* CONFIG_MMU */
+ #ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++#include <linux/string.h>
+ #include <asm/micronux_user_isolation.h>
+ #define __access_ok(ptr, size) \
+ 	micronux_user_access_ok((unsigned long)(ptr), (unsigned long)(size))
++
++/*
++ * CONFIG_UACCESS_MEMCPY's generic NOMMU implementation writes directly to
++ * user pointers.  Supply the same primitives here so every kernel-to-user
++ * copy also respects the immutable RX/RW split once exec has completed.
++ */
++#ifdef CONFIG_UACCESS_MEMCPY
++#define MICRONUX_RESTORE_UACCESS_MEMCPY
++#undef CONFIG_UACCESS_MEMCPY
++#endif
++
++static inline __must_check unsigned long
++raw_copy_from_user(void *to, const void __user *from, unsigned long n)
++{
++	memcpy(to, (const void __force *)from, n);
++	return 0;
++}
++
++static inline __must_check unsigned long
++raw_copy_to_user(void __user *to, const void *from, unsigned long n)
++{
++	if (!micronux_user_write_ok((unsigned long)to, n))
++		return n;
++	memcpy((void __force *)to, from, n);
++	return 0;
++}
++
++#define INLINE_COPY_FROM_USER
++#define INLINE_COPY_TO_USER
++
++#define __clear_user __micronux_clear_user
++static inline __must_check unsigned long
++__micronux_clear_user(void __user *to, unsigned long n)
++{
++	if (!micronux_user_write_ok((unsigned long)to, n))
++		return n;
++	memset((void __force *)to, 0, n);
++	return 0;
++}
+ #endif
+ #include <asm-generic/uaccess.h>
++#ifdef MICRONUX_RESTORE_UACCESS_MEMCPY
++#define CONFIG_UACCESS_MEMCPY 1
++#undef MICRONUX_RESTORE_UACCESS_MEMCPY
++#endif
+ #endif /* CONFIG_MMU */
+ #endif /* _ASM_RISCV_UACCESS_H */
+diff --git a/arch/riscv/kernel/micronux_user_pmp.c b/arch/riscv/kernel/micronux_user_pmp.c
+index e82c630..128c6bf 100644
+--- a/arch/riscv/kernel/micronux_user_pmp.c
++++ b/arch/riscv/kernel/micronux_user_pmp.c
+@@ -15,13 +15,15 @@
+ #define MICRONUX_PMPADDR7	(CSR_PMPADDR0 + 7)
+ #define MICRONUX_PMPADDR8	(CSR_PMPADDR0 + 8)
+ #define MICRONUX_PMPADDR9	(CSR_PMPADDR0 + 9)
++#define MICRONUX_PMPADDR10	(CSR_PMPADDR0 + 10)
+ #define MICRONUX_PMPADDR12	(CSR_PMPADDR0 + 12)
+ #define MICRONUX_PMPADDR13	(CSR_PMPADDR0 + 13)
+ 
+ #define MICRONUX_PMPCFG1_KEEP	0x00ffffffUL
+ #define MICRONUX_PMPCFG2_KEEP	0xff000000UL
+ #define MICRONUX_PMPCFG3_KEEP	0xff000000UL
+-#define MICRONUX_PMP_ALLOW_CONFIG	(PMP_A_TOR | PMP_R | PMP_W | PMP_X)
++#define MICRONUX_PMP_EXEC_CONFIG	(PMP_A_TOR | PMP_R | PMP_X)
++#define MICRONUX_PMP_WRITE_CONFIG	(PMP_A_TOR | PMP_R | PMP_W)
+ #define MICRONUX_PMP_DENY_CONFIG	PMP_A_TOR
+ #define MICRONUX_PMP_FINAL_DENY_CONFIG	PMP_A_NAPOT
+ #define MICRONUX_CACHED_DENY_TOP	0x4fc00000UL
+@@ -29,15 +31,16 @@
+ #define MICRONUX_PMPADDR_FINAL_DENY \
+ 	((MICRONUX_DIRECT_DENY_TOP | ((MICRONUX_PMP_GRANULARITY - 1) >> 1)) >> 2)
+ 
+-static bool micronux_user_pmp_program(unsigned long lo, unsigned long hi,
+-				      bool allow)
++static bool micronux_user_pmp_program(unsigned long lo,
++				      unsigned long exec_hi,
++				      unsigned long hi, bool allow)
+ {
+ 	unsigned long cached_lo = allow ? lo : MICRONUX_CACHED_DENY_TOP;
++	unsigned long cached_exec_hi = allow ? exec_hi : MICRONUX_CACHED_DENY_TOP;
+ 	unsigned long cached_hi = allow ? hi : MICRONUX_CACHED_DENY_TOP;
+ 	unsigned long revoked_cfg1;
+ 	unsigned long revoked_cfg2;
+ 	unsigned long revoked_cfg3;
+-	unsigned long deny_cfg2;
+ 	unsigned long final_cfg1;
+ 	unsigned long final_cfg2;
+ 	unsigned long final_cfg3;
+@@ -56,22 +59,25 @@ static bool micronux_user_pmp_program(unsigned long lo, unsigned long hi,
+ 		return false;
+ 
+ 	csr_write(MICRONUX_PMPADDR7, cached_lo >> 2);
+-	csr_write(MICRONUX_PMPADDR8, cached_hi >> 2);
+-	csr_write(MICRONUX_PMPADDR9, MICRONUX_CACHED_DENY_TOP >> 2);
++	csr_write(MICRONUX_PMPADDR8, cached_exec_hi >> 2);
++	csr_write(MICRONUX_PMPADDR9, cached_hi >> 2);
++	csr_write(MICRONUX_PMPADDR10, MICRONUX_CACHED_DENY_TOP >> 2);
+ 	csr_write(MICRONUX_PMPADDR12, MICRONUX_DIRECT_DENY_TOP >> 2);
+ 	csr_write(MICRONUX_PMPADDR13, MICRONUX_PMPADDR_FINAL_DENY);
+ 
+ 	final_cfg1 = revoked_cfg1 | MICRONUX_PMP_DENY_CONFIG << 24;
+-	deny_cfg2 = revoked_cfg2 | MICRONUX_PMP_DENY_CONFIG << 8;
+-	final_cfg2 = deny_cfg2;
+-	if (allow)
+-		final_cfg2 |= MICRONUX_PMP_ALLOW_CONFIG;
++	final_cfg2 = revoked_cfg2 | MICRONUX_PMP_DENY_CONFIG << 16;
++	if (allow) {
++		final_cfg2 |= MICRONUX_PMP_EXEC_CONFIG;
++		final_cfg2 |= MICRONUX_PMP_WRITE_CONFIG << 8;
++	}
+ 	final_cfg3 = revoked_cfg3 | MICRONUX_PMP_DENY_CONFIG |
+ 		     MICRONUX_PMP_FINAL_DENY_CONFIG << 8;
+ 
+ 	/* Install every deny interval before enabling the user interval. */
+ 	csr_write(MICRONUX_PMPCFG3, final_cfg3);
+-	csr_write(MICRONUX_PMPCFG2, deny_cfg2);
++	csr_write(MICRONUX_PMPCFG2,
++		  revoked_cfg2 | MICRONUX_PMP_DENY_CONFIG << 16);
+ 	csr_write(MICRONUX_PMPCFG1, final_cfg1);
+ 	csr_write(MICRONUX_PMPCFG2, final_cfg2);
+ 	asm volatile("fence rw, rw\n\tfence.i" ::: "memory");
+@@ -80,8 +86,9 @@ static bool micronux_user_pmp_program(unsigned long lo, unsigned long hi,
+ 	       csr_read(MICRONUX_PMPCFG2) == final_cfg2 &&
+ 	       csr_read(MICRONUX_PMPCFG3) == final_cfg3 &&
+ 	       csr_read(MICRONUX_PMPADDR7) == cached_lo >> 2 &&
+-	       csr_read(MICRONUX_PMPADDR8) == cached_hi >> 2 &&
+-	       csr_read(MICRONUX_PMPADDR9) == MICRONUX_CACHED_DENY_TOP >> 2 &&
++	       csr_read(MICRONUX_PMPADDR8) == cached_exec_hi >> 2 &&
++	       csr_read(MICRONUX_PMPADDR9) == cached_hi >> 2 &&
++	       csr_read(MICRONUX_PMPADDR10) == MICRONUX_CACHED_DENY_TOP >> 2 &&
+ 	       csr_read(MICRONUX_PMPADDR12) == MICRONUX_DIRECT_DENY_TOP >> 2 &&
+ 	       csr_read(MICRONUX_PMPADDR13) == MICRONUX_PMPADDR_FINAL_DENY;
+ }
+@@ -91,6 +98,7 @@ static __noreturn void micronux_user_pmp_fail(const char *reason)
+ 	bool denied;
+ 
+ 	denied = micronux_user_pmp_program(MICRONUX_USER_POOL_END,
++					   MICRONUX_USER_POOL_END,
+ 					   MICRONUX_USER_POOL_END, false);
+ 	panic("MICRONUX:M7:PMP-OVERLAY state=fail reason=%s deny_all=%u",
+ 	      reason, denied);
+@@ -99,23 +107,32 @@ static __noreturn void micronux_user_pmp_fail(const char *reason)
+ void micronux_user_pmp_prepare_return(void)
+ {
+ 	struct mm_struct *mm = current->mm;
++	unsigned long exec_hi;
+ 	unsigned long lo;
+ 	unsigned long hi;
++	unsigned long sigreturn;
+ 
+ 	if (!mm || !micronux_user_pool_ready() ||
+-	    !READ_ONCE(mm->context.user_bounds_valid))
+-		micronux_user_pmp_fail("bounds-unavailable");
++	    !READ_ONCE(mm->context.user_bounds_valid) ||
++	    !READ_ONCE(mm->context.user_wx_valid))
++		micronux_user_pmp_fail("wx-unavailable");
+ 
+ 	lo = READ_ONCE(mm->context.user_lo);
++	exec_hi = READ_ONCE(mm->context.user_exec_hi);
+ 	hi = READ_ONCE(mm->context.user_hi);
++	sigreturn = READ_ONCE(mm->context.user_sigreturn);
+ 	if (lo < MICRONUX_USER_POOL_START || hi > MICRONUX_USER_POOL_END ||
+-	    lo >= hi || !IS_ALIGNED(lo, MICRONUX_PMP_GRANULARITY) ||
++	    lo >= exec_hi || exec_hi >= hi ||
++	    !IS_ALIGNED(lo, MICRONUX_PMP_GRANULARITY) ||
++	    !IS_ALIGNED(exec_hi, MICRONUX_PMP_GRANULARITY) ||
+ 	    !IS_ALIGNED(hi, MICRONUX_PMP_GRANULARITY))
+ 		micronux_user_pmp_fail("bounds-invalid");
++	if (sigreturn != lo || sizeof(u32) * 2 > exec_hi - sigreturn)
++		micronux_user_pmp_fail("sigreturn-invalid");
+ 
+-	if (!micronux_user_pmp_program(lo, hi, true))
++	if (!micronux_user_pmp_program(lo, exec_hi, hi, true))
+ 		micronux_user_pmp_fail("csr-readback");
+ 
+-	pr_info_once("MICRONUX:M7:PMP cached=7-9 direct=12-13 mode=per-mm+tor+napot state=ready first=[%08lx,%08lx) config=08,0f,08,08,18 lock=off\n",
+-		     lo, hi);
++	pr_info_once("MICRONUX:M7:PMP cached=7-10 direct=12-13 mode=per-mm+wx+tor+napot state=ready first=[%08lx,%08lx,%08lx) config=08,0d,0b,08,08,18 lock=off\n",
++		     lo, exec_hi, hi);
+ }
+diff --git a/arch/riscv/kernel/signal.c b/arch/riscv/kernel/signal.c
+index c3c517b..68acda0 100644
+--- a/arch/riscv/kernel/signal.c
++++ b/arch/riscv/kernel/signal.c
+@@ -22,6 +22,9 @@
+ #include <asm/vector.h>
+ #include <asm/csr.h>
+ #include <asm/cacheflush.h>
++#ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++#include <asm/micronux_user_isolation.h>
++#endif
+ 
+ unsigned long signal_minsigstksz __ro_after_init;
+ 
+@@ -339,6 +342,17 @@ static int setup_rt_frame(struct ksignal *ksig, sigset_t *set,
+ #ifdef CONFIG_MMU
+ 	regs->ra = (unsigned long)VDSO_SYMBOL(
+ 		current->mm->context.vdso, rt_sigreturn);
++#else
++#ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++	if (!READ_ONCE(current->mm->context.user_wx_valid))
++		return -EFAULT;
++	addr = READ_ONCE(current->mm->context.user_sigreturn);
++	if (addr != READ_ONCE(current->mm->context.user_lo) ||
++	    addr > READ_ONCE(current->mm->context.user_exec_hi) ||
++	    sizeof(__user_rt_sigreturn) >
++		READ_ONCE(current->mm->context.user_exec_hi) - addr)
++		return -EFAULT;
++	regs->ra = addr;
+ #else
+ 	/*
+ 	 * For the nommu case we don't have a VDSO.  Instead we push two
+@@ -353,6 +367,7 @@ static int setup_rt_frame(struct ksignal *ksig, sigset_t *set,
+ 	flush_icache_range(addr, addr + sizeof(frame->sigreturn_code));
+ 
+ 	regs->ra = addr;
++#endif
+ #endif /* CONFIG_MMU */
+ 
+ 	/*
+diff --git a/arch/riscv/mm/micronux_user_pool.c b/arch/riscv/mm/micronux_user_pool.c
+index a882103..424dd80 100644
+--- a/arch/riscv/mm/micronux_user_pool.c
++++ b/arch/riscv/mm/micronux_user_pool.c
+@@ -112,6 +112,57 @@ bool micronux_user_access_ok(unsigned long addr, unsigned long size)
+ 	return size <= hi - addr;
+ }
+ 
++bool micronux_user_write_ok(unsigned long addr, unsigned long size)
++{
++	struct mm_struct *mm = current->mm;
++	unsigned long exec_hi;
++	unsigned long lo;
++	unsigned long hi;
++
++	if (!mm || !READ_ONCE(mm->context.user_bounds_valid))
++		return false;
++	lo = READ_ONCE(mm->context.user_lo);
++	hi = READ_ONCE(mm->context.user_hi);
++	if (lo < MICRONUX_USER_POOL_START || hi > MICRONUX_USER_POOL_END ||
++	    lo >= hi || addr < lo || addr > hi || size > hi - addr)
++		return false;
++
++	if (!READ_ONCE(mm->context.user_wx_valid) || !size)
++		return true;
++	exec_hi = READ_ONCE(mm->context.user_exec_hi);
++	return exec_hi > lo && exec_hi < hi && addr >= exec_hi;
++}
++
++int micronux_user_wx_finalize(struct mm_struct *mm,
++			      unsigned long exec_hi,
++			      unsigned long sigreturn,
++			      unsigned long sigreturn_size)
++{
++	unsigned long lo;
++	unsigned long hi;
++
++	if (!mm || !READ_ONCE(mm->context.user_bounds_valid) ||
++	    READ_ONCE(mm->context.user_wx_valid))
++		return -EINVAL;
++	lo = READ_ONCE(mm->context.user_lo);
++	hi = READ_ONCE(mm->context.user_hi);
++	if (lo < MICRONUX_USER_POOL_START || hi > MICRONUX_USER_POOL_END ||
++	    lo >= exec_hi || exec_hi >= hi ||
++	    !IS_ALIGNED(lo, MICRONUX_PMP_GRANULARITY) ||
++	    !IS_ALIGNED(exec_hi, MICRONUX_PMP_GRANULARITY) ||
++	    !IS_ALIGNED(hi, MICRONUX_PMP_GRANULARITY) ||
++	    sigreturn != lo || !sigreturn_size ||
++	    sigreturn_size > exec_hi - sigreturn)
++		return -EINVAL;
++
++	WRITE_ONCE(mm->context.user_exec_hi, exec_hi);
++	WRITE_ONCE(mm->context.user_sigreturn, sigreturn);
++	/* Publish the immutable split only after both bounds are visible. */
++	smp_wmb();
++	WRITE_ONCE(mm->context.user_wx_valid, true);
++	return 0;
++}
++
+ unsigned long micronux_user_addr_limit(void)
+ {
+ 	struct mm_struct *mm = current->mm;
+@@ -210,7 +261,10 @@ int micronux_user_arena_prepare(struct mm_struct *mm, unsigned long bytes)
+ 	memset((void *)start, 0, nr_pages << PAGE_SHIFT);
+ 	WRITE_ONCE(mm->context.user_arena, arena);
+ 	WRITE_ONCE(mm->context.user_lo, start);
++	WRITE_ONCE(mm->context.user_exec_hi, 0);
+ 	WRITE_ONCE(mm->context.user_hi, start + (nr_pages << PAGE_SHIFT));
++	WRITE_ONCE(mm->context.user_sigreturn, 0);
++	WRITE_ONCE(mm->context.user_wx_valid, false);
+ 	/* Publish valid bounds only after the arena has been fully zeroed. */
+ 	smp_wmb();
+ 	WRITE_ONCE(mm->context.user_bounds_valid, true);
+@@ -329,10 +383,13 @@ void micronux_user_arena_release(struct mm_struct *mm)
+ 		return;
+ 	arena = READ_ONCE(mm->context.user_arena);
+ 	WRITE_ONCE(mm->context.user_bounds_valid, false);
++	WRITE_ONCE(mm->context.user_wx_valid, false);
+ 	/* Revoke U-mode access before clearing and releasing the arena. */
+ 	smp_wmb();
+ 	WRITE_ONCE(mm->context.user_lo, 0);
++	WRITE_ONCE(mm->context.user_exec_hi, 0);
+ 	WRITE_ONCE(mm->context.user_hi, 0);
++	WRITE_ONCE(mm->context.user_sigreturn, 0);
+ 	WRITE_ONCE(mm->context.user_arena, NULL);
+ 	if (!arena)
+ 		return;
+diff --git a/fs/binfmt_flat.c b/fs/binfmt_flat.c
+index 4e69e91..2dae5cd 100644
+--- a/fs/binfmt_flat.c
++++ b/fs/binfmt_flat.c
+@@ -42,7 +42,9 @@
+ 
+ #include <asm/byteorder.h>
+ #ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++#include <asm/micronux_user_isolation.h>
+ #include <asm/micronux_user_pool.h>
++extern u32 __user_rt_sigreturn[2];
+ #endif
+ #include <linux/unaligned.h>
+ #include <asm/cacheflush.h>
+@@ -505,7 +507,8 @@ static int load_flat_file(struct linux_binprm *bprm,
+ 
+ 	if (entry < sizeof(*hdr) || entry >= text_len ||
+ 	    text_len < sizeof(*hdr) || data_end < text_len ||
+-	    bss_end < data_end || reloc_start != data_end) {
++	    bss_end < data_end || reloc_start != data_end ||
++	    !IS_ALIGNED(text_len, MICRONUX_PMP_GRANULARITY)) {
+ 		pr_err("MicroNUX rejected non-monotonic bFLT bounds\n");
+ 		ret = -ENOEXEC;
+ 		goto err;
+@@ -918,6 +921,24 @@ static int load_flat_file(struct linux_binprm *bprm,
+ 		       stack_len))
+ 		return -EFAULT;
+ 
++#ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++	if (textpos != READ_ONCE(current->mm->context.user_lo) ||
++	    realdatastart != textpos + text_len + sizeof(struct flat_hdr)) {
++		pr_err("MicroNUX rejected a non-contiguous W^X image\n");
++		return -ENOEXEC;
++	}
++	if (copy_to_user((void __user *)textpos, __user_rt_sigreturn,
++			 sizeof(__user_rt_sigreturn)))
++		return -EFAULT;
++	flush_icache_range(textpos, textpos + sizeof(__user_rt_sigreturn));
++	ret = micronux_user_wx_finalize(current->mm, realdatastart, textpos,
++				       sizeof(__user_rt_sigreturn));
++	if (ret) {
++		pr_err("MicroNUX could not finalize W^X: %d\n", ret);
++		return ret;
++	}
++#endif
++
+ 	return 0;
+ err:
+ 	return ret;
+diff --git a/mm/nommu.c b/mm/nommu.c
+index de48346..7b5cd6e 100644
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -839,6 +839,10 @@ static int validate_mmap_request(struct file *file,
+ 	}
+ 
+ #ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++	if (current->mm && READ_ONCE(current->mm->context.user_wx_valid) &&
++	    (prot & PROT_EXEC))
++		return -EACCES;
++
+ 	/*
+ 	 * A direct or shared NOMMU mapping would make storage owned by a
+ 	 * device, filesystem, or another process visible through the U-mode
+-- 
+2.43.0

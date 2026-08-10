@@ -1,0 +1,4 @@
+config BR2_PACKAGE_MICRONUX_NETCTL
+	bool "micronux-netctl"
+	help
+	  Minimal ESP-Hosted-MCU control-plane client for MicroNUX.

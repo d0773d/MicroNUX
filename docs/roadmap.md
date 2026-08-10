@@ -95,6 +95,8 @@ free from a 20,400 KiB baseline.
 
 ## M6 - Storage, networking, and peripherals
 
+Status: **complete; Linux-owned display closure landed in the M7 profile**
+
 - Add storage only after its pin mux and DMA behavior are frozen.
 - Integrate ESP32-C6 networking through a narrow, documented transport.
 - Evaluate Ethernet, USB, microSD, display, and other board peripherals
@@ -104,7 +106,35 @@ free from a 20,400 KiB baseline.
 Exit criterion: selected services work without destabilizing the minimal shell
 or violating reserved-memory boundaries.
 
+Current artifact: [M6 storage and peripheral bring-up](m6-peripherals.md). The
+onboard microSD and factory ESP32-C6 now run simultaneously under one
+Linux-owned DesignWare controller with serialized dual-slot arbitration. The
+clean combined candidate passed 20-cycle and 120-cycle concurrent storage and
+network soaks plus three independent ROM-reset boots, retaining the same raw
+SD sample hash throughout. The ESP32-C6 factory firmware exposes a stable
+ESP-Hosted SDIO/RPC link and `ethsta0`;
+the optional P4-hosted provisioning loader has been flashed and physically
+validated through its stored-credential/Linux-handoff path. BLE and SoftAP
+onboarding use mandatory Security 2 and keep Wi-Fi credentials in C6 NVS.
+`micronux-netctl up` now requests association with those saved credentials,
+and `micronux-netctl forget` provides an explicit C6-NVS reset path. BLE
+Security 2 phone provisioning, C6-NVS persistence, the automatic P4 restart,
+saved-credential association, DHCP, default routing, external IPv4, and DNS
+all passed on hardware. `micronux-netctl status` and `wait` now expose the
+factory C6's true association state, and the explicit `micronux-online` command
+retries association and DHCP up to ten times with a five-second inter-attempt
+cooldown without making shell boot wait on Wi-Fi. The combined gates
+reproduced the router's reconnect holdoff and recovered as late as attempt 7.
+MIPI-D0 has four compiled exact-controller color-bar profiles behind a
+default-off power gate. Kit C was identified as the 10.1-inch JD9365 panel;
+the exact profile read ID `93 65 04` and produced visible vertical bars at
+800x1280 over two 1500-Mbps lanes. The loader-owned result remains the M6
+electrical proof. The accepted M7 profile now transfers persistent circular
+scanout, I2C/backlight state, and framebuffer ownership to Linux.
+
 ## M7 - Isolation, SMP, and upstream evaluation
+
+Status: **complete; WP0-WP6 and post-WP6 evaluations proven**
 
 - Use PMP to protect critical kernel, loader, and coprocessor regions where
   practical.
@@ -114,3 +144,65 @@ or violating reserved-memory boundaries.
 
 Exit criterion: decide, from measurements, which isolation, SMP, and upstream
 paths MicroNUX will support.
+
+Current artifact: [M7 user/kernel isolation results](m7-user-kernel-isolation.md).
+The version-pinned ESP-IDF v6.0.1 early-PMP patch and loader audit passed three
+independent hardware resets on revision 1.3. A separate M7 Linux profile now
+reserves an 8 MiB user pool and gives each `mm_struct` a contiguous,
+zero-on-allocation arena with no fallback to the kernel allocator. Linux now
+replaces the unlocked loader handoff before every U-mode return with a
+read-back-verified PMP boundary around the current arena, and NOMMU
+`access_ok()` enforces the same bounds. Three reset boots passed 16
+privilege/read/write/execute fault cases, cross-process address probes,
+malformed syscall-pointer checks, arena reuse and failed-exec recovery, M5
+selftests, and repeated teardown with stable accounting. A root-owned
+supervisor now launches admitted jobs as locked UID/GID 1000 with zero
+capabilities, `no_new_privs`, a seccomp allowlist, peripheral restrictions,
+and measured process, descriptor, memory, time, and output limits. Three more
+reset boots proved non-yielding/output-flood termination, shell and device
+service liveness, and exact pool/general-memory recovery. WP6 adds a
+128-byte-granule RX/RW bFLT split, fixed read-only signal trampoline,
+kernel-to-user write checks, physical W^X fault tests, and fail-closed DMA
+permissions for the active SDMMC and display channels. The exact Kit C display
+is now Linux-owned as `/dev/fb0`, a 100x80 framebuffer console, sysfs pattern
+control, and a standard backlight device; framebuffer `mmap()` is denied.
+Three reset boots passed the complete SD/C6/display/isolation workload with
+identical arena accounting and `MemFree` at 8,176 KiB.
+
+SMP is explicitly deferred: the compile-only two-hart image exceeds the fixed
+partition and disables the per-hart isolation contract. The Linux changes are
+review-separated into 6 platform, 16 peripheral, and 10 isolation patches;
+they are categorized for review but not claimed upstream-ready. See the
+[SMP evaluation](m7-smp-evaluation.md), [patch organization](linux-patch-organization.md),
+and [Linux-owned display report](m7-linux-display.md).
+
+## M8 - Linux device services and applications
+
+Status: **ABI v1 representative workflow complete**
+
+- Make Linux the sole persistent owner of every peripheral after loader
+  handoff.
+- Define one versioned device/service API shared by shell commands, IgniteVM,
+  and native C applications.
+- Add nonblocking file-descriptor and event-wait behavior for long-running
+  device operations.
+- Package bounded IgniteVM device bindings with explicit capabilities.
+- Provide a NOMMU native C SDK that links applications to the userspace ABI,
+  not to kernel internals.
+- Reject raw MMIO, kernel hooks, unrestricted device mappings, and alternate
+  post-handoff hardware runtimes.
+
+Exit criterion: one representative storage, networking, display, or GPIO
+workflow runs through a shell command, an Ignite package, and a native C
+program using the same permission checks and Linux-owned device path while
+unrelated tasks remain schedulable.
+
+Architecture contract: [Linux device ownership and application model](device-ownership-and-applications.md).
+
+Current artifact: [M8 Linux device service and application ABI](m8-device-services.md).
+The physical gate completed the representative network/device-status workflow
+through `micronux-device`, a `libmicronux` native C program, and direct-compiled
+Ignite bytecode running in the real userspace C VM. The unprivileged VM saw
+only `observe`, a slow wait did not stall other clients, raw memory devices
+were absent, an intentional VM fault left the service responsive, a killed
+service restarted, and the subsequent microSD/C6 combined regression passed.

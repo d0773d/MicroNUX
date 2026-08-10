@@ -1,0 +1,4 @@
+app {
+  let divisor = 0
+  globals[0] = 1 // divisor
+}

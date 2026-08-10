@@ -1,0 +1,130 @@
+From a83a8ff4eed81d9f90e5b60a75734184dde9fa4e Mon Sep 17 00:00:00 2001
+From: MicroNUX Project <micronux@example.invalid>
+Date: Fri, 7 Aug 2026 15:00:00 -0700
+Subject: [PATCH 2/6] serial: enable ESP32-P4 USB Serial/JTAG console
+
+The ESP32-P4 USB Serial/JTAG block uses the same FIFO and interrupt
+register layout as the controller already supported by esp32_acm.  Add the
+P4 compatible and permit the driver on the MicroNUX P4 platform.
+
+P4 peripheral sources enter CLIC interrupt IDs 16 through 47.  MicroNUX is
+currently single-core and uses ID 16 for USB Serial/JTAG, so handle external
+CLIC IDs as ordinary level IRQs rather than per-CPU local interrupts.
+
+Also arm the endpoint-empty interrupt when start_tx finds the previous USB
+packet busy.  Without that wakeup, a new tty burst can remain queued forever
+after the host drains the packet that was already in flight.
+
+Signed-off-by: MicroNUX Project <micronux@example.invalid>
+---
+ drivers/irqchip/irq-riscv-intc.c |  6 ++++++
+ drivers/tty/serial/Kconfig       |  6 +++---
+ drivers/tty/serial/esp32_acm.c   | 27 +++++++++++++++++++++++----
+ 3 files changed, 32 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/irqchip/irq-riscv-intc.c b/drivers/irqchip/irq-riscv-intc.c
+index eb813b10f96c..0f974de38b74 100644
+--- a/drivers/irqchip/irq-riscv-intc.c
++++ b/drivers/irqchip/irq-riscv-intc.c
+@@ -161,6 +161,12 @@ static int riscv_intc_domain_map(struct irq_domain *d, unsigned int irq,
+ 		writeb(ESP32P4_CLIC_LEVEL_1,
+ 		       base + ESP32P4_CLIC_INT_CTL);
+ 	}
++	/* IDs 16..47 are P4 interrupt-matrix inputs, not hart-local IRQs. */
++	if (esp32p4_clic && hwirq >= 16) {
++		irq_domain_set_info(d, irq, hwirq, chip, NULL,
++				    handle_level_irq, NULL, NULL);
++		return 0;
++	}
+ 
+ 	irq_set_percpu_devid(irq);
+ 	irq_domain_set_info(d, irq, hwirq, chip, NULL, handle_percpu_devid_irq,
+diff --git a/drivers/tty/serial/Kconfig b/drivers/tty/serial/Kconfig
+index 3ba1f21933e2..556f97f5dfd8 100644
+--- a/drivers/tty/serial/Kconfig
++++ b/drivers/tty/serial/Kconfig
+@@ -1600,13 +1600,13 @@ config SERIAL_ESP32P4_EARLYCON
+ 
+ config SERIAL_ESP32_ACM
+ 	tristate "Espressif ESP32 USB ACM gadget support"
+-	depends on XTENSA_PLATFORM_ESP32 || (COMPILE_TEST && OF)
++	depends on XTENSA_PLATFORM_ESP32 || SOC_ESP32P4 || (COMPILE_TEST && OF)
+ 	select SERIAL_CORE
+ 	select SERIAL_CORE_CONSOLE
+ 	select SERIAL_EARLYCON
+ 	help
+-	  Driver for the CDC ACM gadget controller of the Espressif ESP32S3
+-	  SoCs that share separate USB controller with the JTAG adapter.
++	  Driver for the native USB Serial/JTAG CDC controller in Espressif
++	  ESP32-S3 and ESP32-P4 SoCs.
+ 	  When earlycon option is enabled the following kernel command line
+ 	  snippet may be used:
+ 	    earlycon=esp32s3acm,mmio32,0x60038000
+diff --git a/drivers/tty/serial/esp32_acm.c b/drivers/tty/serial/esp32_acm.c
+index 1bb9f79f244c..403f40a0ac83 100644
+--- a/drivers/tty/serial/esp32_acm.c
++++ b/drivers/tty/serial/esp32_acm.c
+@@ -39,5 +39,7 @@ static const struct of_device_id esp32s3_acm_dt_ids[] = {
+ 	{
+ 		.compatible = "esp,esp32s3-acm",
++	}, {
++		.compatible = "espressif,esp32p4-usb-serial-jtag",
+ 	}, { /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, esp32s3_acm_dt_ids);
+@@ -137,8 +139,18 @@ static void esp32s3_acm_transmit_buffer(struct uart_port *port)
+ 	unsigned int pending;
+ 	u8 ch;
+ 
+-	if (!esp32s3_acm_tx_fifo_free(port))
++	if (!esp32s3_acm_tx_fifo_free(port)) {
++		u32 int_ena;
++
++		/*
++		 * start_tx() can race the host draining the previous packet.
++		 * Arm the empty interrupt so queued bytes are not stranded.
++		 */
++		int_ena = esp32s3_acm_read(port, USB_SERIAL_JTAG_INT_ENA_REG);
++		int_ena |= USB_SERIAL_JTAG_SERIAL_IN_EMPTY_INT_ENA;
++		esp32s3_acm_write(port, USB_SERIAL_JTAG_INT_ENA_REG, int_ena);
+ 		return;
++	}
+ 
+ 	tx_fifo_used = esp32s3_acm_tx_fifo_cnt(port);
+ 	pending = uart_port_tx_limited(port, ch,
+@@ -217,7 +219,7 @@ static void esp32s3_acm_set_termios(struct uart_port *port,
+ 
+ static const char *esp32s3_acm_type(struct uart_port *port)
+ {
+-	return "ESP32S3 ACM";
++	return "Espressif USB Serial/JTAG";
+ }
+ 
+ /* configure/auto-configure the port */
+@@ -376,7 +378,10 @@ static int esp32s3_acm_probe(struct platform_device *pdev)
+ 	port->dev = &pdev->dev;
+ 	port->type = PORT_GENERIC;
+ 	port->iotype = UPIO_MEM;
+-	port->irq = platform_get_irq(pdev, 0);
++	ret = platform_get_irq(pdev, 0);
++	if (ret < 0)
++		return ret;
++	port->irq = ret;
+ 	port->ops = &esp32s3_acm_pops;
+ 	port->flags = UPF_BOOT_AUTOCONF;
+ 	port->has_sysrq = 1;
+@@ -387,7 +392,11 @@ static int esp32s3_acm_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, port);
+ 
+-	return uart_add_one_port(&esp32s3_acm_reg, port);
++	ret = uart_add_one_port(&esp32s3_acm_reg, port);
++	if (!ret)
++		dev_info(&pdev->dev, "USB Serial/JTAG ttyGS%d at %pa irq %d\n",
++			 port->line, &port->mapbase, port->irq);
++	return ret;
+ }
+ 
+ static void esp32s3_acm_remove(struct platform_device *pdev)
+-- 
+2.43.0

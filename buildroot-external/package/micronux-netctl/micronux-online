@@ -1,0 +1,32 @@
+#!/bin/sh
+
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+	echo "MICRONUX:M6:NET:ONLINE attempt=$attempt phase=associate"
+	if ! /usr/bin/micronux-netctl up; then
+		echo "MICRONUX:M6:NET:ONLINE attempt=$attempt phase=control state=retry"
+		if [ "$attempt" -lt 10 ]; then
+			/bin/busybox sleep 5
+		fi
+		continue
+	fi
+	if ! /usr/bin/micronux-netctl wait 20; then
+		echo "MICRONUX:M6:NET:ONLINE attempt=$attempt phase=associate state=retry"
+		if [ "$attempt" -lt 10 ]; then
+			/bin/busybox sleep 5
+		fi
+		continue
+	fi
+	if /bin/busybox udhcpc -f -q -n -i ethsta0 \
+		-s /usr/share/udhcpc/default.script -t 5 -T 2; then
+		echo "MICRONUX:M6:NET:ONLINE state=ready name=ethsta0 attempt=$attempt"
+		exit 0
+	fi
+	/usr/bin/micronux-netctl status || :
+	echo "MICRONUX:M6:NET:ONLINE attempt=$attempt phase=dhcp state=retry"
+	if [ "$attempt" -lt 10 ]; then
+		/bin/busybox sleep 5
+	fi
+done
+
+echo 'MICRONUX:M6:NET:ONLINE state=failed name=ethsta0 attempts=10'
+exit 1

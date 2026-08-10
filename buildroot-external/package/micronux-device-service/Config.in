@@ -1,0 +1,5 @@
+config BR2_PACKAGE_MICRONUX_DEVICE_SERVICE
+	bool "micronux-device-service"
+	help
+	  Versioned local device-service ABI, policy daemon, shell client,
+	  native C SDK, and acceptance tests for MicroNUX.

@@ -9,7 +9,10 @@ __pycache__/
 
 # ESP-IDF generated state
 sdkconfig
-sdkconfig.old
+sdkconfig.*
+!sdkconfig.defaults
+!sdkconfig.*.defaults
+managed_components/
 
 # Buildroot generated output
 buildroot/output/

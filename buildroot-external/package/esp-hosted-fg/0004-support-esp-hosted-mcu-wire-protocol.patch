@@ -1,0 +1,236 @@
+From 8b2c5800d8e24c3071bed2a803470a1cff685df3 Mon Sep 17 00:00:00 2001
+From: MicroNUX contributors <micronux@users.noreply.github.com>
+Date: Sat, 8 Aug 2026 11:15:00 -0700
+Subject: [PATCH] esp-hosted-fg: support ESP-Hosted-MCU wire protocol
+
+The factory ESP32-C6 firmware on the Waveshare ESP32-P4 Module DEV KIT
+uses the ESP-Hosted-MCU transport and protobuf RPC control plane, rather
+than the legacy FG wire ABI. Detect its exact private-init signature and
+translate interface and event identifiers without changing legacy FG.
+
+MCU SDIO register writes require CMD52 RAW semantics. MCU packet writes
+also use the real frame length for the end-window address while the bus
+transfer remains block padded. Keep MCU transfers to one frame so the
+length is unambiguous, and parse MCU RX streams without legacy FG's
+four-byte inter-frame alignment.
+
+Signed-off-by: MicroNUX contributors <micronux@users.noreply.github.com>
+---
+ .../linux/host_driver/esp32/esp_api.h         |  1 +
+ .../linux/host_driver/esp32/main.c            | 36 ++++++++++++++++
+ .../host_driver/esp32/sdio/esp_sdio.c         | 62 +++++++++++++++++++++++++--
+ .../host_driver/esp32/sdio/esp_sdio_api.c     |  3 +-
+ 4 files changed, 98 insertions(+), 4 deletions(-)
+
+diff --git a/esp_hosted_fg/host/linux/host_driver/esp32/esp_api.h b/esp_hosted_fg/host/linux/host_driver/esp32/esp_api.h
+index f5d4b76..b511b2f 100644
+--- a/esp_hosted_fg/host/linux/host_driver/esp32/esp_api.h
++++ b/esp_hosted_fg/host/linux/host_driver/esp32/esp_api.h
+@@ -21,5 +21,6 @@ int esp_add_card(struct esp_adapter *adapter);
+ void process_capabilities(u8 cap);
+ void process_test_capabilities(u8 cap);
+ int is_host_sleeping(void);
++bool esp_is_mcu_wire_compat(void);
+ 
+ #endif
+diff --git a/esp_hosted_fg/host/linux/host_driver/esp32/main.c b/esp_hosted_fg/host/linux/host_driver/esp32/main.c
+index b7518e3..e32a16c 100644
+--- a/esp_hosted_fg/host/linux/host_driver/esp32/main.c
++++ b/esp_hosted_fg/host/linux/host_driver/esp32/main.c
+@@ -22,6 +22,21 @@
+ #define SERIAL_REASM_MAX_DEVS 2
+ #define SERIAL_REASM_MAX_LEN  12288
+ 
++/* Waveshare's factory ESP32-C6 firmware uses the ESP-Hosted-MCU wire IDs:
++ * interfaces are numbered one higher than legacy FG, and private init packets
++ * use fixed 0x33/0x22 type values. Detect that exact init signature before
++ * translating so legacy FG firmware keeps its original ABI. */
++#define ESP_MCU_PRIV_IF          5
++#define ESP_MCU_PACKET_EVENT     0x33
++#define ESP_MCU_EVENT_INIT       0x22
++
++static bool esp_mcu_wire_compat;
++
++bool esp_is_mcu_wire_compat(void)
++{
++	return esp_mcu_wire_compat;
++}
++
+ struct serial_reasm_state {
+ 	u8 *buf;
+ 	size_t len;
+@@ -490,6 +505,27 @@ static int process_skb(struct esp_adapter *adapter, struct sk_buff *skb)
+ 
+ 	payload_header = (struct esp_payload_header *) skb->data;
+ 
++	if (!esp_mcu_wire_compat &&
++	    payload_header->if_type == ESP_MCU_PRIV_IF &&
++	    payload_header->priv_pkt_type == ESP_MCU_PACKET_EVENT &&
++	    len >= 2 &&
++	    skb->data[offset] == ESP_MCU_EVENT_INIT) {
++		esp_mcu_wire_compat = true;
++		esp_info("ESP-Hosted-MCU wire protocol detected\n");
++	}
++
++	if (esp_mcu_wire_compat &&
++	    payload_header->if_type > 0 &&
++	    payload_header->if_type <= ESP_MAX_IF) {
++		payload_header->if_type--;
++		if (payload_header->if_type == ESP_PRIV_IF &&
++		    payload_header->priv_pkt_type == ESP_MCU_PACKET_EVENT) {
++			payload_header->priv_pkt_type = ESP_PACKET_TYPE_EVENT;
++			if (len >= 2 && skb->data[offset] == ESP_MCU_EVENT_INIT)
++				skb->data[offset] = ESP_PRIV_EVENT_INIT;
++		}
++	}
++
+ 	UPDATE_HEADER_RX_PKT_NO(payload_header);
+ 
+ 	if ((payload_header->flags & FLAG_WAKEUP_PKT) && (len<1500)) {
+diff --git a/esp_hosted_fg/host/linux/host_driver/esp32/sdio/esp_sdio.c b/esp_hosted_fg/host/linux/host_driver/esp32/sdio/esp_sdio.c
+index e5215e3..85d64d0 100644
+--- a/esp_hosted_fg/host/linux/host_driver/esp32/sdio/esp_sdio.c
++++ b/esp_hosted_fg/host/linux/host_driver/esp32/sdio/esp_sdio.c
+@@ -136,6 +136,35 @@ static int process_init_event(struct esp_adapter *adapter, u8 *evt_buf, u8 len)
+ 		}
+ 
+ 		switch (tag) {
++		case 0x11: /* ESP-Hosted-MCU: ESP_PRIV_CAPABILITY */
++			adapter->capabilities = *(pos + 2);
++			esp_info("MCU TLV capability: 0x%x\n", adapter->capabilities);
++			break;
++		case 0x12: /* ESP-Hosted-MCU: ESP_PRIV_FIRMWARE_CHIP_ID */
++			esp_info("MCU TLV chip_id: 0x%x\n", *(pos + 2));
++			if (esp_validate_chipset(adapter, *(pos + 2)))
++				chip_unsupported = 1;
++			break;
++		case 0x13: /* ESP-Hosted-MCU: ESP_PRIV_TEST_RAW_TP */
++			esp_info("MCU TLV raw_tp_cap: 0x%x\n", *(pos + 2));
++			break;
++		case 0x14: /* ESP-Hosted-MCU: ESP_PRIV_RX_Q_SIZE */
++			esp_info("MCU TLV rx_queue_size: %u\n", *(pos + 2));
++			break;
++		case 0x15: /* ESP-Hosted-MCU: ESP_PRIV_TX_Q_SIZE */
++			esp_info("MCU TLV tx_queue_size: %u\n", *(pos + 2));
++			break;
++		case 0x16: /* ESP-Hosted-MCU: ESP_PRIV_CAP_EXT */
++			esp_info("MCU TLV extended capabilities (len %u)\n", tag_len);
++			break;
++		case 0x17: /* ESP-Hosted-MCU: ESP_PRIV_FIRMWARE_VERSION */
++			if (tag_len == 4)
++				esp_info("MCU firmware version: %u.%u.%u\n",
++					 pos[4], pos[3], pos[2]);
++			break;
++		case 0x18: /* ESP-Hosted-MCU: ESP_PRIV_TRANS_SDIO_MODE */
++			esp_info("MCU SDIO mode: %s\n", *(pos + 2) ? "streaming" : "packet");
++			break;
+ 		case ESP_PRIV_CAPABILITY:
+ 			adapter->capabilities = *(pos + 2);
+ 			esp_info("TLV[%u] capability: 0x%x\n", tag, adapter->capabilities);
+@@ -902,7 +931,8 @@ static struct sk_buff *read_packet(struct esp_adapter *adapter)
+ 		dev_kfree_skb(skb);
+ 		return NULL;
+ 	}
+-	aligned_len = (frame_len + 3) & ~3;
++	aligned_len = esp_is_mcu_wire_compat() ? frame_len :
++		(frame_len + 3) & ~3;
+ 	if (aligned_len >= len_from_slave) {
+ 		if (frame_len < skb->len)
+ 			skb_trim(skb, frame_len);
+@@ -923,7 +953,8 @@ static struct sk_buff *read_packet(struct esp_adapter *adapter)
+ 			break;
+ 		}
+ 		frame_len = len + offset;
+-		aligned_len = (frame_len + 3) & ~3;
++		aligned_len = esp_is_mcu_wire_compat() ? frame_len :
++			(frame_len + 3) & ~3;
+ 		if (pos_in_aggr + frame_len > len_from_slave) {
+ 			esp_err("Drop truncated aggregate pkt: len=%d offset=%d pos=%d total=%d\n",
+ 				len, offset, pos_in_aggr, len_from_slave);
+@@ -959,6 +990,18 @@ static int write_packet(struct esp_adapter *adapter, struct sk_buff *skb)
+ 	else
+ 		prio = PRIO_Q_OTHERS;
+ 
++	/* ESP-Hosted-MCU numbers every wire interface one above legacy FG. */
++	if (esp_is_mcu_wire_compat() && payload_header->if_type <= ESP_TEST_IF)
++		payload_header->if_type++;
++	if (adapter->capabilities & ESP_CHECKSUM_ENABLED) {
++		u16 payload_len = le16_to_cpu(payload_header->len);
++		u16 offset = le16_to_cpu(payload_header->offset);
++
++		payload_header->checksum = 0;
++		payload_header->checksum = cpu_to_le16(compute_checksum(
++				skb->data, payload_len + offset));
++	}
++
+ 	H2E_HOST_STATS_INC(h2e_host_tx_queued);
+ 	/* Publish the skb into tx_q BEFORE the count the TX thread gates on, then
+ 	 * wake it. The consumer's wait condition reads queue_items, so the skb must
+@@ -1029,6 +1072,7 @@ static int tx_process(void *data)
+ 	struct esp_payload_header *payload_header = NULL;
+ 	u8 *aggr_buf = NULL;
+ 	u32 aggr_len = 0;
++	u32 wire_len = 0;
+ 	u32 frame_len = 0;
+ 	bool flush_after_pkt = false;
+ 	bool aggr_has_ctrl = false;	/* aggregate carries serial/BT (control) frames */
+@@ -1046 +1090 @@ static int tx_process(void *data)
+-	aggr_buf = kzalloc(tx_aggr_size, GFP_KERNEL);
++	aggr_buf = kzalloc(ALIGN(tx_aggr_size, ESP_BLOCK_SIZE), GFP_KERNEL);
+@@ -1063,6 +1107,7 @@ static int tx_process(void *data)
+ 
+ 		aggr_start = ktime_get();
+ 		aggr_len = 0;
++		wire_len = 0;
+ 		aggr_has_ctrl = false;
+ 		while (aggr_len < tx_aggr_size) {
+ 			prio = -1;
+@@ -1118,9 +1163,10 @@ static int tx_process(void *data)
+ 				continue;
+ 			}
+ 			len_to_send = (frame_len + 3) & ~3;
+-			flush_after_pkt = prio == PRIO_Q_OTHERS &&
++			flush_after_pkt = esp_is_mcu_wire_compat() ||
++				(prio == PRIO_Q_OTHERS &&
+ 				le16_to_cpu(payload_header->len) <=
+-				ESP_HOST_TX_LATENCY_BYPASS_SIZE;
++				ESP_HOST_TX_LATENCY_BYPASS_SIZE);
+ 			if (flush_after_pkt && aggr_len)
+ 				break;
+ 			if (aggr_len + len_to_send > tx_aggr_size)
+@@ -1152,6 +1198,10 @@ static int tx_process(void *data)
+ 				memset(aggr_buf + aggr_len + frame_len, 0,
+ 				       len_to_send - frame_len);
+ 			aggr_len += len_to_send;
++			/* MCU addresses the real frame at the end of the CMD53 window,
++			 * while the transfer itself remains block padded. One frame per
++			 * MCU transfer keeps this length unambiguous. */
++			wire_len = esp_is_mcu_wire_compat() ? frame_len : aggr_len;
+ 			dev_kfree_skb(tx_skb);
+ 			tx_skb = NULL;
+ 			if (flush_after_pkt)
+@@ -1227,7 +1278,7 @@ static int tx_process(void *data)
+ 		do {
+ 			block_cnt = data_left / ESP_BLOCK_SIZE;
+ 			len_to_send = data_left;
+-			ret = esp_write_block(context, ESP_SLAVE_CMD53_END_ADDR - len_to_send,
++			ret = esp_write_block(context, ESP_SLAVE_CMD53_END_ADDR - wire_len,
+ 					pos, (len_to_send + 3) & (~3), ACQUIRE_LOCK);
+ 
+ 				if (ret) {
+diff --git a/esp_hosted_fg/host/linux/host_driver/esp32/sdio/esp_sdio_api.c b/esp_hosted_fg/host/linux/host_driver/esp32/sdio/esp_sdio_api.c
+index 3575db4..2796d61 100644
+--- a/esp_hosted_fg/host/linux/host_driver/esp32/sdio/esp_sdio_api.c
++++ b/esp_hosted_fg/host/linux/host_driver/esp32/sdio/esp_sdio_api.c
+@@ -64,7 +64,8 @@ int esp_write_byte(struct esp_sdio_context *context, u32 reg, u8 data, u8 is_lock
+ 	if (is_lock_needed)
+ 		sdio_claim_host(func);
+ 
+-	sdio_writeb(func, data, reg, &ret);
++	/* ESP-Hosted-MCU uses CMD52 with RAW/exchange for register writes. */
++	(void)sdio_writeb_readb(func, data, reg, &ret);
+ 
+ 	if (is_lock_needed)
+ 		sdio_release_host(func);
+-- 
+2.43.0
