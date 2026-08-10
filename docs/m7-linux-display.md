@@ -76,6 +76,35 @@ The fixed-mode fbdev driver exposes:
 The framebuffer console attached as a 100x80 color console. The native USB
 `ttyGS0` console remains the primary automation and recovery path.
 
+## Boot splash and local status console
+
+The loader renders a dependency-free RGB565 splash directly into the
+ESP-IDF-allocated scanout buffer before cache writeback and backlight enable.
+It shows `MICRONUX`, `BOOTING LINUX`, and a simple progress indicator while
+the kernel starts. The splash has no decoder, filesystem, task, or callback
+dependency and is part of the same framebuffer handed to Linux.
+
+After storage and the C6-backed network interface have been probed, `/init`
+writes a compact status page to `/dev/tty1`. It reports the fixed display
+mode, storage and network presence, `SYSTEM READY`, and the USB shell name.
+The kernel command line intentionally keeps only `ttyGS0` as its logging and
+interactive console; this prevents boot-log scrolling from competing with
+DSI scanout while preserving the visible tty1 status page. The accepted live
+health sample after rendering the page was:
+
+```text
+running frames=3812->3816 error=00000000 underruns=0 chen=1
+  3:       3818  RISC-V INTC  18 Edge      500a0000.display
+63
+```
+
+The corresponding acceptance markers are:
+
+```text
+MICRONUX:M7:SPLASH state=ready title=MICRONUX resolution=800x1280 format=rgb565
+MICRONUX:M7:FB-CONSOLE state=ready tty=tty1 role=status usb=ttyGS0
+```
+
 This is intentionally a fixed board driver, not a general DRM/KMS stack. It
 does not implement runtime modesetting, hotplug, EDID, alternate panels,
 rotation, acceleration, or unprivileged direct mapping. Applications should
@@ -131,10 +160,10 @@ The 2026-08-10 clean build and physical three-boot gate produced:
 
 | Artifact | Size | SHA-256 |
 | --- | ---: | --- |
-| Linux `Image` | 6,025,008 B | `90e88c4dece114ed26407e7a8f69efb082bdd8037c651c20b4f1b76b8117d229` |
+| Linux `Image` | 6,025,008 B | `7ab85bdc6a0a7761db2f326c5798b697206ec11952b109cac2925589663ab776` |
 | Device tree | 2,453 B | `3c31c2d81ad6c2a4017d20fc8364732eb829097291150a4894609b383f39a703` |
-| Metadata | 128 B | `d6a0adbc54a4096a2b17124942bf736ce1744988619d46508b1b806efb4dad99` |
-| ESP-IDF loader | 279,168 B | `d80b0a6f4a03e2197950e3c984689c6a2171e0132bc59f426eb5adc36370c186` |
+| Metadata | 128 B | `d747b1bea5585ecdac07a88ec6ec6a08f891a62c945a329b4783358a6c3756a6` |
+| ESP-IDF loader | 280,016 B | `18358b4f3835f511ae8a8433823a7fd2be3801a928468e5df4f4c7e5120195e4` |
 
 The Linux image leaves 266,448 bytes in the fixed 6 MiB partition. The bFLT
 W^X audit passed all 14 userspace executables. Every boot returned identical

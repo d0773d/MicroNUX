@@ -129,6 +129,14 @@ if ! grep -qx 'CONFIG_MICRONUX_ESP32P4_ISOLATION=y' "${KERNEL_DIR}/.config"; the
 	printf 'M7 kernel did not retain CONFIG_MICRONUX_ESP32P4_ISOLATION.\n' >&2
 	exit 1
 fi
+if ! grep -q 'console=ttyGS0,115200' "${KERNEL_DIR}/.config"; then
+	printf 'M7 kernel did not retain the USB recovery console.\n' >&2
+	exit 1
+fi
+if ! grep -q 'MICRONUX:M7:FB-CONSOLE state=ready' "${OUTPUT_DIR}/target/init"; then
+	printf 'M7 rootfs is missing the framebuffer status console.\n' >&2
+	exit 1
+fi
 if ! grep -aq 'micronux,esp32p4-user-pool' "${DTB}"; then
 	printf 'M7 DTB is missing the dedicated user-pool contract.\n' >&2
 	exit 1

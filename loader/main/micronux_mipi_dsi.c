@@ -106,6 +106,9 @@ static esp_err_t probe_display_adapter(void)
 #define MICRONUX_DSI_NONCACHE_OFFSET UINT32_C(0x40000000)
 #define MICRONUX_DSI_DMA_DESCRIPTOR_ALIGNMENT UINT32_C(64)
 #define MICRONUX_DSI_DMA_DESCRIPTOR_COUNT UINT32_C(4)
+#define MICRONUX_SPLASH_BACKGROUND UINT16_C(0x0842)
+#define MICRONUX_SPLASH_FOREGROUND UINT16_C(0xffff)
+#define MICRONUX_SPLASH_ACCENT UINT16_C(0x05ff)
 
 typedef struct {
     const char *name;
@@ -206,6 +209,133 @@ static uint32_t align_down_4k(uint32_t address)
 static uint32_t align_up_4k(uint32_t address)
 {
     return (address + UINT32_C(0xfff)) & ~UINT32_C(0xfff);
+}
+
+typedef struct {
+    char character;
+    uint8_t rows[7];
+} micronux_splash_glyph_t;
+
+static const micronux_splash_glyph_t s_splash_glyphs[] = {
+    {'B', {0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e}},
+    {'C', {0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e}},
+    {'G', {0x0e, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0f}},
+    {'I', {0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1f}},
+    {'L', {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f}},
+    {'M', {0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11}},
+    {'N', {0x11, 0x19, 0x19, 0x15, 0x13, 0x13, 0x11}},
+    {'O', {0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}},
+    {'R', {0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11}},
+    {'T', {0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}},
+    {'U', {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}},
+    {'X', {0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11}},
+};
+
+static void splash_fill_rect(uint16_t *framebuffer, uint32_t width,
+                             uint32_t height, uint32_t x, uint32_t y,
+                             uint32_t rect_width, uint32_t rect_height,
+                             uint16_t color)
+{
+    if (x >= width || y >= height) {
+        return;
+    }
+    if (rect_width > width - x) {
+        rect_width = width - x;
+    }
+    if (rect_height > height - y) {
+        rect_height = height - y;
+    }
+    for (uint32_t row = 0; row < rect_height; ++row) {
+        uint16_t *const destination = framebuffer + (y + row) * width + x;
+        for (uint32_t column = 0; column < rect_width; ++column) {
+            destination[column] = color;
+        }
+    }
+}
+
+static const uint8_t *splash_glyph(char character)
+{
+    for (size_t index = 0;
+         index < sizeof(s_splash_glyphs) / sizeof(s_splash_glyphs[0]);
+         ++index) {
+        if (s_splash_glyphs[index].character == character) {
+            return s_splash_glyphs[index].rows;
+        }
+    }
+    return NULL;
+}
+
+static uint32_t splash_text_width(const char *text, uint32_t scale)
+{
+    uint32_t characters = 0;
+    while (text[characters] != '\0') {
+        ++characters;
+    }
+    return characters == 0 ? 0 : (characters * 6U - 1U) * scale;
+}
+
+static void splash_draw_text(uint16_t *framebuffer, uint32_t width,
+                             uint32_t height, uint32_t x, uint32_t y,
+                             const char *text, uint32_t scale,
+                             uint16_t color)
+{
+    while (*text != '\0') {
+        const uint8_t *const rows = splash_glyph(*text);
+        if (rows != NULL) {
+            for (uint32_t row = 0; row < 7; ++row) {
+                for (uint32_t column = 0; column < 5; ++column) {
+                    if ((rows[row] & (UINT8_C(1) << (4U - column))) != 0) {
+                        splash_fill_rect(framebuffer, width, height,
+                                         x + column * scale,
+                                         y + row * scale,
+                                         scale, scale, color);
+                    }
+                }
+            }
+        }
+        x += 6U * scale;
+        ++text;
+    }
+}
+
+static void render_boot_splash(uint16_t *framebuffer, uint32_t width,
+                               uint32_t height)
+{
+    static const char title[] = "MICRONUX";
+    static const char subtitle[] = "BOOTING LINUX";
+    uint32_t title_scale = width / 56U;
+    if (title_scale < 4U) {
+        title_scale = 4U;
+    }
+    const uint32_t subtitle_scale = title_scale / 3U;
+    const uint32_t title_width = splash_text_width(title, title_scale);
+    const uint32_t subtitle_width =
+        splash_text_width(subtitle, subtitle_scale);
+    const uint32_t title_height = 7U * title_scale;
+    const uint32_t group_height = title_height + 34U +
+                                  7U * subtitle_scale + 44U;
+    const uint32_t title_x = (width - title_width) / 2U;
+    const uint32_t title_y = (height - group_height) / 2U;
+
+    splash_fill_rect(framebuffer, width, height, 0, 0, width, height,
+                     MICRONUX_SPLASH_BACKGROUND);
+    splash_draw_text(framebuffer, width, height, title_x, title_y, title,
+                     title_scale, MICRONUX_SPLASH_FOREGROUND);
+    splash_fill_rect(framebuffer, width, height, title_x,
+                     title_y + title_height + 14U, title_width, 4U,
+                     MICRONUX_SPLASH_ACCENT);
+    splash_draw_text(framebuffer, width, height,
+                     (width - subtitle_width) / 2U,
+                     title_y + title_height + 34U, subtitle,
+                     subtitle_scale, MICRONUX_SPLASH_ACCENT);
+
+    const uint32_t indicator_y = title_y + group_height - 10U;
+    const uint32_t indicator_x = width / 2U - 38U;
+    for (uint32_t index = 0; index < 5U; ++index) {
+        splash_fill_rect(framebuffer, width, height,
+                         indicator_x + index * 18U, indicator_y,
+                         10U, 10U, MICRONUX_SPLASH_ACCENT);
+    }
 }
 
 static esp_err_t prepare_backlight_off(void)
@@ -396,6 +526,7 @@ esp_err_t micronux_mipi_dsi_prepare(void)
                  MICRONUX_DSI_LOADER_PSRAM_END);
         return ESP_ERR_INVALID_STATE;
     }
+    render_boot_splash(framebuffer, s_profile.width, s_profile.height);
     ESP_RETURN_ON_ERROR(
         esp_cache_msync(framebuffer, framebuffer_size,
                         ESP_CACHE_MSYNC_FLAG_DIR_C2M |
@@ -403,6 +534,10 @@ esp_err_t micronux_mipi_dsi_prepare(void)
         TAG, "flush initial MIPI framebuffer");
     s_framebuffer = framebuffer;
     s_framebuffer_size = framebuffer_size;
+    ESP_LOGI(TAG,
+             "MICRONUX:M7:SPLASH state=ready title=MICRONUX"
+             " resolution=%ux%u format=rgb565",
+             s_profile.width, s_profile.height);
 
     const uint8_t brightness =
         (uint8_t)((UINT32_C(255) * CONFIG_MICRONUX_MIPI_BACKLIGHT_PERCENT) /

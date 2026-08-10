@@ -40,16 +40,34 @@ fi
 
 echo 'MICRONUX:M6:COMBINED:DRIVER storage=microsd-slot0 network=c6-sdio-slot1 arbitration=serialized'
 /bin/busybox sleep 5
+storage_state=missing
 if [ -b /dev/mmcblk0 ]; then
+	storage_state=ready
 	echo 'MICRONUX:M6:COMBINED:STORAGE state=ready name=mmcblk0'
 else
 	echo 'MICRONUX:M6:COMBINED:STORAGE state=missing name=mmcblk0'
 fi
+network_state=missing
 if [ -d /sys/class/net/ethsta0 ]; then
+	network_state=ready
 	echo 'MICRONUX:M6:COMBINED:IFACE state=ready name=ethsta0'
 	/bin/busybox ip link show ethsta0
 else
 	echo 'MICRONUX:M6:COMBINED:IFACE state=missing name=ethsta0'
+fi
+
+if [ -c /dev/fb0 ] && [ -c /dev/tty1 ]; then
+	{
+		printf '\033[H\033[1;36m'
+		printf '  MICRONUX\n'
+		printf '\033[0;37m  Linux device controller\n\n'
+		printf '  Display   800x1280 RGB565\n'
+		printf '  Storage   %s\n' "$storage_state"
+		printf '  Network   %s\n\n' "$network_state"
+		printf '\033[1;32m  SYSTEM READY\033[0;37m\n'
+		printf '  USB shell: ttyGS0\n'
+	} >/dev/tty1
+	echo 'MICRONUX:M7:FB-CONSOLE state=ready tty=tty1 role=status usb=ttyGS0'
 fi
 
 echo 'MICRONUX:M6:COMBINED:SHELL ready console=ttyGS0 network=nonblocking device_api=1.0'

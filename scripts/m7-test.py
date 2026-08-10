@@ -23,6 +23,8 @@ REQUIRED_MARKERS = (
     "MICRONUX:M7:DMA-PMS state=pass region0=[4ff80000,4ff82000) "
     "sdmmc=rw:00000001 display=ch0:r:00000006:w:0000000c",
     "fifo=[50105000,50106000) other=deny",
+    "MICRONUX:M7:SPLASH state=ready title=MICRONUX "
+    "resolution=800x1280 format=rgb565",
     "MICRONUX:M7:DSI-BLANK state=ready backlight=off "
     "restore=linux-after-first-frame",
     "MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending "
@@ -42,6 +44,7 @@ REQUIRED_MARKERS = (
     "MICRONUX:M7:DSI-SCANOUT state=ready handoff=blanked-restart "
     "first-frame=confirmed scanout=hardware-reload-running "
     "backlight=restored",
+    "MICRONUX:M7:FB-CONSOLE state=ready tty=tty1 role=status usb=ttyGS0",
     "MICRONUX:M6:COMBINED:SHELL ready console=ttyGS0 network=nonblocking",
     "MICRONUX:M8:SERVICE state=ready abi=1.0",
     "MICRONUX:M7:JOB-SUPERVISOR state=ready uid=1000 gid=1000 "

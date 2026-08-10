@@ -32,7 +32,11 @@ one-shot transfer, and publishes a bounded, CRC-protected descriptor-ring
 contract. Linux validates and claims it as `/dev/fb0`, starts DW-GDMA hardware
 reload, confirms the first frame through the routed block-done IRQ, and only
 then restores the backlight. Linux owns the 100x80 framebuffer console and
-backlight control. A monitored 50-microsecond timer only
+backlight control. The loader displays a built-in MicroNUX boot splash while
+Linux starts, then `/init` replaces it with a local status console showing
+display, storage, network, and USB-shell readiness. Kernel logs and the
+interactive recovery shell remain on native USB `ttyGS0`. A monitored
+50-microsecond timer only
 checks the bridge underrun latch. Framebuffer writes are paced in 512-byte
 bursts to protect PSRAM scanout bandwidth, while userspace `mmap()` and the
 unsafe revision-1.3 hardware-pattern transition are denied. DMA permissions
