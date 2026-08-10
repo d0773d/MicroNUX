@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "sdkconfig.h"
+#include "esp_cache.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_lcd_mipi_dsi.h"
@@ -12,8 +13,13 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_ldo_regulator.h"
 #include "esp_log.h"
+#include "esp_private/periph_ctrl.h"
+#include "esp_rom_crc.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
+#include "hal/mipi_dsi_ll.h"
+#include "soc/i2c_reg.h"
+#include "soc/soc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -95,6 +101,10 @@ static esp_err_t probe_display_adapter(void)
 #define MICRONUX_DSI_BACKLIGHT_REGISTER UINT8_C(0x96)
 #define MICRONUX_DSI_LOADER_PSRAM_START UINT32_C(0x48000000)
 #define MICRONUX_DSI_LOADER_PSRAM_END UINT32_C(0x48400000)
+#define MICRONUX_DSI_INTERNAL_SRAM_START UINT32_C(0x4ff00000)
+#define MICRONUX_DSI_INTERNAL_SRAM_END UINT32_C(0x50000000)
+#define MICRONUX_DSI_NONCACHE_OFFSET UINT32_C(0x40000000)
+#define MICRONUX_DSI_DMA_DESCRIPTOR_ALIGNMENT UINT32_C(64)
 
 typedef struct {
     const char *name;
@@ -143,6 +153,8 @@ static esp_lcd_panel_io_handle_t s_panel_io;
 static esp_lcd_panel_handle_t s_panel;
 static i2c_master_bus_handle_t s_i2c_bus;
 static i2c_master_dev_handle_t s_backlight;
+static micronux_display_dma_policy_t s_dma_policy;
+static bool s_dma_policy_ready;
 
 static esp_err_t write_backlight_register(uint8_t reg, uint8_t value)
 {
@@ -160,6 +172,37 @@ static void release_backlight_bus(void)
         (void)i2c_del_master_bus(s_i2c_bus);
         s_i2c_bus = NULL;
     }
+}
+
+static esp_err_t release_backlight_device(void)
+{
+    if (s_backlight == NULL) {
+        return ESP_OK;
+    }
+
+    const esp_err_t result = i2c_master_bus_rm_device(s_backlight);
+    if (result == ESP_OK) {
+        s_backlight = NULL;
+    }
+    return result;
+}
+
+static uintptr_t dma_bus_address(uintptr_t address)
+{
+    if (address >= UINT32_C(0x80000000)) {
+        return address - MICRONUX_DSI_NONCACHE_OFFSET;
+    }
+    return address;
+}
+
+static uint32_t align_down_4k(uint32_t address)
+{
+    return address & ~UINT32_C(0xfff);
+}
+
+static uint32_t align_up_4k(uint32_t address)
+{
+    return (address + UINT32_C(0xfff)) & ~UINT32_C(0xfff);
 }
 
 static esp_err_t prepare_backlight_off(void)
@@ -360,17 +403,162 @@ esp_err_t micronux_mipi_dsi_prepare(void)
                   UINT32_C(100));
     esp_err_t result = write_backlight_register(
         MICRONUX_DSI_BACKLIGHT_REGISTER, brightness);
-    release_backlight_bus();
-    ESP_RETURN_ON_ERROR(result, TAG, "enable MIPI backlight");
+    if (result != ESP_OK) {
+        release_backlight_bus();
+        ESP_RETURN_ON_ERROR(result, TAG, "enable MIPI backlight");
+    }
+    result = release_backlight_device();
+    if (result != ESP_OK) {
+        release_backlight_bus();
+        ESP_RETURN_ON_ERROR(result, TAG,
+                            "release loader backlight device");
+    }
 
     ESP_LOGI(TAG,
              "MICRONUX:M6:DSI state=ready profile=%s resolution=%ux%u"
              " lanes=%u lane_mbps=%u format=rgb565 pattern=vertical-bars"
-             " fb=%p bytes=%zu ownership=loader backlight=%u",
+             " fb=%p bytes=%zu ownership=loader backlight=%u"
+             " i2c=retained-for-linux",
              s_profile.name, s_profile.width, s_profile.height,
              MICRONUX_DSI_LANES, s_profile.lane_mbps,
              framebuffer, framebuffer_size,
              CONFIG_MICRONUX_MIPI_BACKLIGHT_PERCENT);
     return ESP_OK;
+#endif
+}
+
+esp_err_t micronux_mipi_dsi_handoff(void)
+{
+#if !CONFIG_MICRONUX_M7_EARLY_UMODE_DENY || \
+    !CONFIG_MICRONUX_MIPI_DSI || CONFIG_MICRONUX_MIPI_PANEL_UNSELECTED
+    return ESP_OK;
+#else
+    if (s_panel == NULL) {
+        ESP_LOGE(TAG,
+                 "MICRONUX:M7:DSI-HANDOFF state=fail reason=panel-missing");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_i2c_bus == NULL || s_backlight != NULL) {
+        ESP_LOGE(TAG,
+                 "MICRONUX:M7:DSI-HANDOFF state=fail"
+                 " reason=i2c-not-transferable");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_lcd_dpi_panel_handoff_t dsi_handoff = {0};
+    ESP_RETURN_ON_ERROR(
+        esp_lcd_dpi_panel_prepare_handoff(s_panel, &dsi_handoff), TAG,
+        "prepare circular MIPI DPI handoff");
+
+    const uintptr_t framebuffer_start =
+        dma_bus_address((uintptr_t)dsi_handoff.frame_buffer);
+    const uintptr_t framebuffer_end =
+        framebuffer_start + dsi_handoff.frame_buffer_size;
+    const uintptr_t descriptor_start =
+        dma_bus_address((uintptr_t)dsi_handoff.dma_descriptor);
+    const uintptr_t descriptor_end =
+        descriptor_start + dsi_handoff.dma_descriptor_size;
+    if (framebuffer_end < framebuffer_start ||
+        framebuffer_start < MICRONUX_DSI_LOADER_PSRAM_START ||
+        framebuffer_end > MICRONUX_DSI_LOADER_PSRAM_END ||
+        descriptor_end < descriptor_start ||
+        descriptor_start < MICRONUX_DSI_INTERNAL_SRAM_START ||
+        descriptor_end > MICRONUX_DSI_INTERNAL_SRAM_END ||
+        (descriptor_start &
+         (MICRONUX_DSI_DMA_DESCRIPTOR_ALIGNMENT - 1U)) != 0 ||
+        dsi_handoff.dma_descriptor_size !=
+            MICRONUX_DSI_DMA_DESCRIPTOR_ALIGNMENT ||
+        dsi_handoff.dma_channel < 0 || dsi_handoff.dma_channel > 3) {
+        ESP_LOGE(TAG,
+                 "MICRONUX:M7:DSI-HANDOFF state=fail"
+                 " reason=resource-bounds fb=[%08" PRIxPTR ",%08" PRIxPTR
+                 ") desc=[%08" PRIxPTR ",%08" PRIxPTR ") channel=%d",
+                 framebuffer_start, framebuffer_end,
+                 descriptor_start, descriptor_end,
+                 dsi_handoff.dma_channel);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    REG_WRITE(I2C_INT_ENA_REG(MICRONUX_DSI_I2C_PORT), 0);
+    REG_WRITE(I2C_INT_CLR_REG(MICRONUX_DSI_I2C_PORT), UINT32_MAX);
+
+    micronux_display_handoff_v1_t *const handoff =
+        (micronux_display_handoff_v1_t *)
+            MICRONUX_DISPLAY_HANDOFF_ADDRESS;
+    *handoff = (micronux_display_handoff_v1_t) {
+        .magic = MICRONUX_DISPLAY_HANDOFF_MAGIC,
+        .abi_version = MICRONUX_DISPLAY_HANDOFF_ABI_VERSION,
+        .struct_size = sizeof(*handoff),
+        .flags = MICRONUX_DISPLAY_FLAG_ACTIVE |
+                 MICRONUX_DISPLAY_FLAG_RGB565 |
+                 MICRONUX_DISPLAY_FLAG_DMA_CIRCULAR |
+                 MICRONUX_DISPLAY_FLAG_I2C_TRANSFERRED,
+        .width = s_profile.width,
+        .height = s_profile.height,
+        .stride = (uint32_t)s_profile.width * sizeof(uint16_t),
+        .framebuffer_address = (uint32_t)framebuffer_start,
+        .framebuffer_size = (uint32_t)dsi_handoff.frame_buffer_size,
+        .dma_descriptor_address = (uint32_t)descriptor_start,
+        .dma_descriptor_size =
+            (uint32_t)dsi_handoff.dma_descriptor_size,
+        .dma_channel = (uint32_t)dsi_handoff.dma_channel,
+        .i2c_address = MICRONUX_DSI_BACKLIGHT_ADDRESS,
+        .backlight_register = MICRONUX_DSI_BACKLIGHT_REGISTER,
+        .backlight_brightness =
+            (UINT32_C(255) * CONFIG_MICRONUX_MIPI_BACKLIGHT_PERCENT) /
+            UINT32_C(100),
+    };
+    handoff->crc32 = esp_rom_crc32_le(
+        0, (const uint8_t *)handoff,
+        offsetof(micronux_display_handoff_v1_t, crc32));
+
+    ESP_RETURN_ON_ERROR(
+        esp_cache_msync(dsi_handoff.frame_buffer,
+                        dsi_handoff.frame_buffer_size,
+                        ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+                        ESP_CACHE_MSYNC_FLAG_TYPE_DATA),
+        TAG, "flush MIPI framebuffer for handoff");
+    ESP_RETURN_ON_ERROR(
+        esp_cache_msync(handoff, sizeof(*handoff),
+                        ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+                        ESP_CACHE_MSYNC_FLAG_TYPE_DATA |
+                        ESP_CACHE_MSYNC_FLAG_UNALIGNED),
+        TAG, "flush MIPI handoff contract");
+
+    s_dma_policy = (micronux_display_dma_policy_t) {
+        .framebuffer_start = align_down_4k((uint32_t)framebuffer_start),
+        .framebuffer_end = align_up_4k((uint32_t)framebuffer_end),
+        .descriptor_start = align_down_4k((uint32_t)descriptor_start),
+        .descriptor_end = align_up_4k((uint32_t)descriptor_end),
+        .dma_channel = (uint32_t)dsi_handoff.dma_channel,
+    };
+    s_dma_policy_ready = true;
+
+    ESP_LOGI(TAG,
+             "MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending"
+             " pattern=vertical-bars dma=circular channel=%d"
+             " fb=[%08" PRIxPTR ",%08" PRIxPTR ")"
+             " desc=[%08" PRIxPTR ",%08" PRIxPTR ") i2c=transferred"
+             " contract=%08" PRIx32 " crc32=%08" PRIx32,
+             dsi_handoff.dma_channel, framebuffer_start, framebuffer_end,
+             descriptor_start, descriptor_end,
+             MICRONUX_DISPLAY_HANDOFF_ADDRESS, handoff->crc32);
+    return ESP_OK;
+#endif
+}
+
+bool micronux_mipi_dsi_dma_policy(micronux_display_dma_policy_t *policy)
+{
+#if !CONFIG_MICRONUX_M7_EARLY_UMODE_DENY || \
+    !CONFIG_MICRONUX_MIPI_DSI || CONFIG_MICRONUX_MIPI_PANEL_UNSELECTED
+    (void)policy;
+    return false;
+#else
+    if (!s_dma_policy_ready || policy == NULL) {
+        return false;
+    }
+    *policy = s_dma_policy;
+    return true;
 #endif
 }

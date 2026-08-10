@@ -10,64 +10,53 @@ desktop Linux compatibility or MMU-backed process isolation.
 
 ## Current status
 
-Milestones M0 through M5 and the M8 device-service ABI v1 slice are complete;
-M6 now has a physical loader-owned display proof, while Linux-owned display
-scanout remains open. M7 WP0-WP5 are proven: the loader has a version-pinned
-early U-mode deny map, Linux routes userspace mappings through a dedicated,
-zero-on-allocation 8 MiB pool with one contiguous arena per `mm_struct`, and
-every U-mode return installs and verifies a fail-closed PMP boundary around
-the current process. Bounded `access_ok()` rejects syscall pointers outside
-the same interval. Physical read/write/execute, cross-process, arena-reuse,
-exec-failure, and malformed-pointer tests prove per-process CPU containment.
-Admitted native or IgniteVM jobs now run as locked UID/GID 1000 with zero
-capabilities, a seccomp allowlist, peripheral restrictions, and fixed process,
-descriptor, memory, time, and output budgets. DMA isolation and W^X remain
-open. The
-pinned `rv32imac`/`ilp32` NOMMU
-image boots a reduced BusyBox bFLT shell with 32 MiB RAM under QEMU. On the
-physical ESP32-P4 revision 1.3, the M3 loader validates and loads Linux and its
-device tree from flash, installs an exact PMP memory window, and hands off to a
-single-core machine-mode kernel. Linux initializes the revision-correct CLIC
-trap path and 360 MHz CLINT timer, transitions from polling early output to the
-native USB `ttyGS0` console, mounts its initramfs pseudo
-filesystems, and starts an interactive BusyBox shell. The M5 hardening image
-passed three independent ROM-reset boots with identical hashes. Each boot
-completed 64 `posix_spawn()`/exec/wait lifecycles, signal and timer return
-tests, a checked 4 MiB allocation, explicit stack canaries, and a 64-record
-console integrity burst while retaining 20,372 KiB free. The M6 microSD slice
-passed three ROM-reset read-only boots and an opt-in
-write/remount/verify/delete gate using a synchronous-polled IDMAC path with
-internal-SRAM bounce memory. ESP32-C6 networking is also live through the
-factory ESP-Hosted-MCU firmware: three boots produced stable SDIO function
-identities, C6 firmware `2.11.5`, MAC `b0:a6:04:8a:d3:78`, and an
-`UP,LOWER_UP` Linux interface. An optional P4-only loader profile now compiles
-Espressif phone provisioning over BLE with SoftAP fallback, mandatory Security
-2, and C6-resident Wi-Fi credentials. Physical phone onboarding passed: the
-loader accepted credentials over BLE, stored them through the C6 boundary,
-restarted the P4, and handed the provisioned C6 to Linux on the next boot.
-Linux then obtained a DHCP lease and default route and reached both `1.1.1.1`
-and `example.com`. `micronux-netctl status` and `wait` now query the C6's
-actual station association, while `micronux-online` provides a bounded
-ten-attempt association-and-DHCP recovery path with a five-second cooldown
-between attempts, without delaying the normal shell boot. The accepted
-combined image runs microSD slot 0 and C6 SDIO slot 1 simultaneously under
-Linux-serialized controller ownership. Its clean candidate passed 20-cycle
-and 120-cycle concurrent storage/network soaks and three independent ROM-reset
-boots with an unchanged SD hash, recovering from router reconnect holdoff as
-late as attempt 7. No C6 firmware is built or flashed. The Kit C display is
-the Waveshare 10.1-inch JD9365 panel: its exact 800x1280, two-lane,
-1500-Mbps/lane profile read panel ID `93 65 04` and displayed vertical color
-bars on the physical panel at 25% backlight. That is a loader diagnostic, not
-yet a Linux framebuffer or console. On
-revision 1.3, USB status is serviced once per kernel tick and every userspace
-return uses a two-stage CLIC `mret` sequence so task switches cannot retain an
-active interrupt level. Linux now also exposes the local, versioned
-`micronux-deviced` ABI to shell commands, native C, and the actual IgniteVM C
-runtime. The hardware gate ran direct-compiler Ignite bytecode as UID 65534,
-proved observe-only peer credentials, survived an intentional VM fault, and
-recovered both a killed client and killed service without losing Linux device
-ownership. The resulting Image is 5,761,632 bytes, including the 231,288-byte
-IgniteVM bFLT runner, and remains within the fixed 6 MiB partition.
+Milestones M0 through M6, M7 WP0-WP6, and the M8 device-service ABI v1 slice
+are complete on the reference board. The pinned `rv32imac`/`ilp32` NOMMU image
+boots a reduced BusyBox bFLT shell under QEMU and on physical ESP32-P4
+revision-1.3 hardware. The loader validates Linux and its device tree, installs
+a fail-closed early PMP map, and hands off to a single-core machine-mode
+kernel with native USB `ttyGS0` and a Linux framebuffer console.
+
+Linux owns the microSD card, the factory-firmware ESP32-C6 over SDIO, and the
+Kit C 10.1-inch JD9365 display after handoff. BLE/SoftAP provisioning uses
+Espressif Security 2 and stores Wi-Fi credentials in C6 NVS. Normal shell boot
+does not wait for Wi-Fi; `micronux-online` performs up to ten association and
+DHCP attempts with a five-second inter-attempt delay. Combined SD/C6 testing
+passed 20-cycle and 120-cycle soaks, three reset boots, controlled SD writes,
+external IPv4/DNS, and router reconnect holdoff through attempt 7. MicroNUX
+does not build or flash replacement C6 firmware.
+
+The loader initializes the exact 800x1280, two-lane, 1500-Mbps/lane JD9365
+panel, converts its scanout to bounded circular GDMA, and publishes a
+versioned CRC-protected contract. Linux validates and claims it as `/dev/fb0`,
+attaches a 100x80 framebuffer console, and owns patterns and backlight control.
+Userspace framebuffer `mmap()` is denied. DMA permissions grant only SDMMC and
+the exact display channel their bounded buffers/descriptors; all other channel
+access to those regions is denied.
+
+M7 routes userspace through a zero-on-allocation 8 MiB pool with one contiguous
+arena per `mm_struct`. Every U-mode return installs and verifies a per-process
+PMP boundary, `access_ok()` enforces the same interval, and bFLT text/data are
+split into RX and RW regions at the P4's 128-byte PMP granule. Admitted native
+or IgniteVM jobs run as locked UID/GID 1000 with zero capabilities,
+`no_new_privs`, a seccomp allowlist, restricted devices, and fixed process,
+descriptor, memory, time, and output budgets. Physical fault tests cover
+privilege, read/write/execute, cross-process access, arena reuse, failed exec,
+malformed pointers, and W^X.
+
+The accepted M7 image is 6,024,944 bytes, leaving 266,512 bytes in the fixed
+6 MiB partition. Its three-boot gate returned identical arena accounting and
+`MemFree` (8,176->8,176 KiB) on every boot while repeating SD, networking,
+display, fault, W^X, and supervisor workloads. SMP was compile-evaluated and
+is deliberately deferred because the two-hart image exceeds the partition and
+the current per-hart PMP contract is not safe for process migration. The Linux
+patch stack is review-separated into 6 platform, 16 peripheral, and 10
+MicroNUX isolation patches.
+
+Linux also exposes the local, versioned `micronux-deviced` ABI to shell tools,
+native C, and the actual IgniteVM C runtime. Direct-compiled Ignite bytecode
+runs unprivileged, receives only its declared service permissions, and cannot
+claim MMIO, DMA, or kernel ownership directly.
 
 ## Design baseline
 
@@ -97,6 +86,9 @@ userspace image and workload.
 - [M5 NOMMU hardening and stress gate](docs/m5-hardening.md)
 - [M6 storage and peripheral bring-up](docs/m6-peripherals.md)
 - [M7 user/kernel isolation results](docs/m7-user-kernel-isolation.md)
+- [M7 Linux-owned Kit C display](docs/m7-linux-display.md)
+- [M7 SMP evaluation](docs/m7-smp-evaluation.md)
+- [Linux patch organization](docs/linux-patch-organization.md)
 - [M8 Linux device service and application ABI](docs/m8-device-services.md)
 
 ## Project policy

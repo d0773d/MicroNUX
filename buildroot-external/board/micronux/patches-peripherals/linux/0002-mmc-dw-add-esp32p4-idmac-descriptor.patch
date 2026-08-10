@@ -1,0 +1,45 @@
+From 2d36d783c6f4e20fe3555fedfb7382c70d1c2636 Mon Sep 17 00:00:00 2001
+From: MicroNUX Project <micronux@example.invalid>
+Date: Sat, 8 Aug 2026 04:40:00 -0700
+Subject: [PATCH 02/16] mmc: dw: add ESP32-P4 IDMAC descriptor builder
+
+ESP32-P4 uses 64-byte IDMAC descriptors even in 32-bit address mode and
+keeps chained mode set on the terminal descriptor with a null next pointer.
+Build that layout directly in the reserved internal-SRAM descriptor page.
+
+Signed-off-by: MicroNUX Project <micronux@example.invalid>
+---
+ drivers/mmc/host/dw_mmc.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -480,3 +480,25 @@ static void dw_mci_esp32p4_complete_bounce(struct dw_mci *host,
+ }
++#define ESP32P4_IDMAC_DESC_SIZE		64
+ 
++static int dw_mci_esp32p4_prepare_desc(struct dw_mci *host)
++{
++	struct idmac_desc *desc = host->sg_cpu;
++	struct mmc_data *data = host->data;
++	size_t length = (size_t)data->blocks * data->blksz;
++
++	/*
++	 * ESP32-P4 uses the first four standard IDMAC words but requires each
++	 * descriptor to occupy one 64-byte cache line. Its IDF driver also
++	 * keeps chained mode set on the terminal descriptor with a null link.
++	 */
++	memset(desc, 0, ESP32P4_IDMAC_DESC_SIZE);
++	desc->des0 = cpu_to_le32(IDMAC_DES0_OWN | IDMAC_DES0_FD |
++				 IDMAC_DES0_LD | IDMAC_DES0_CH);
++	IDMAC_SET_BUFFER1_SIZE(desc, length);
++	desc->des2 = cpu_to_le32(ESP32P4_IDMAC_DATA_DMA_ADDR);
++	desc->des3 = 0;
++
++	return 0;
++}
++
+ /* DMA interface functions */
+-- 
+2.43.0

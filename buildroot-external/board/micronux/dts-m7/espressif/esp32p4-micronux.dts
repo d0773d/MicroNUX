@@ -109,6 +109,18 @@
 		};
 	};
 
+	display: display@500a0000 {
+		compatible = "espressif,esp32p4-micronux-dsi";
+		reg = <0x500a0000 0x00000800>,
+		      <0x500a0800 0x00000104>,
+		      <0x50081000 0x00001000>,
+		      <0x500c4000 0x00001000>;
+		reg-names = "dsi-host", "dsi-bridge", "gdma", "i2c";
+		espressif,handoff-address = <0x49f00000>;
+		espressif,uncached-offset = <0x40000000>;
+		status = "okay";
+	};
+
 	uart0: serial@500ca000 {
 		compatible = "espressif,esp32p4-uart";
 		reg = <0x500ca000 0x00000080>;

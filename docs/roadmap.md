@@ -95,7 +95,7 @@ free from a 20,400 KiB baseline.
 
 ## M6 - Storage, networking, and peripherals
 
-Status: **storage/network complete; loader display proof complete; Linux display pending**
+Status: **complete; Linux-owned display closure landed in the M7 profile**
 
 - Add storage only after its pin mux and DMA behavior are frozen.
 - Integrate ESP32-C6 networking through a narrow, documented transport.
@@ -128,12 +128,13 @@ reproduced the router's reconnect holdoff and recovered as late as attempt 7.
 MIPI-D0 has four compiled exact-controller color-bar profiles behind a
 default-off power gate. Kit C was identified as the 10.1-inch JD9365 panel;
 the exact profile read ID `93 65 04` and produced visible vertical bars at
-800x1280 over two 1500-Mbps lanes. Scanout is still loader-owned. Persistent
-Linux scanout, backlight ownership, and a Linux console remain separate gates.
+800x1280 over two 1500-Mbps lanes. The loader-owned result remains the M6
+electrical proof. The accepted M7 profile now transfers persistent circular
+scanout, I2C/backlight state, and framebuffer ownership to Linux.
 
 ## M7 - Isolation, SMP, and upstream evaluation
 
-Status: **in progress; WP5 supervised application containment proven**
+Status: **complete; WP0-WP6 and post-WP6 evaluations proven**
 
 - Use PMP to protect critical kernel, loader, and coprocessor regions where
   practical.
@@ -159,8 +160,21 @@ supervisor now launches admitted jobs as locked UID/GID 1000 with zero
 capabilities, `no_new_privs`, a seccomp allowlist, peripheral restrictions,
 and measured process, descriptor, memory, time, and output limits. Three more
 reset boots proved non-yielding/output-flood termination, shell and device
-service liveness, and exact pool/general-memory recovery. DMA isolation and
-W^X remain open.
+service liveness, and exact pool/general-memory recovery. WP6 adds a
+128-byte-granule RX/RW bFLT split, fixed read-only signal trampoline,
+kernel-to-user write checks, physical W^X fault tests, and fail-closed DMA
+permissions for the active SDMMC and display channels. The exact Kit C display
+is now Linux-owned as `/dev/fb0`, a 100x80 framebuffer console, sysfs pattern
+control, and a standard backlight device; framebuffer `mmap()` is denied.
+Three reset boots passed the complete SD/C6/display/isolation workload with
+identical arena accounting and `MemFree` at 8,176 KiB.
+
+SMP is explicitly deferred: the compile-only two-hart image exceeds the fixed
+partition and disables the per-hart isolation contract. The Linux changes are
+review-separated into 6 platform, 16 peripheral, and 10 isolation patches;
+they are categorized for review but not claimed upstream-ready. See the
+[SMP evaluation](m7-smp-evaluation.md), [patch organization](linux-patch-organization.md),
+and [Linux-owned display report](m7-linux-display.md).
 
 ## M8 - Linux device services and applications
 

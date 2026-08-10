@@ -59,8 +59,18 @@ make -C "${SOURCE_DIR}" \
 	BR2_DL_DIR="${DOWNLOAD_DIR}/buildroot-dl" \
 	"${DEFCONFIG}"
 
-# Local source packages are not content-addressed by Buildroot. Refresh the
-# accepted M6/M8 userspace before every isolated kernel build.
+# bFLT's link layout is part of the M7 hardware-protection contract.  Refresh
+# every executable-producing package so no binary can retain a pre-W^X link.
+make -C "${SOURCE_DIR}" \
+	O="${OUTPUT_DIR}" \
+	BR2_EXTERNAL="${EXTERNAL_DIR}" \
+	BR2_DL_DIR="${DOWNLOAD_DIR}/buildroot-dl" \
+	busybox-rebuild
+make -C "${SOURCE_DIR}" \
+	O="${OUTPUT_DIR}" \
+	BR2_EXTERNAL="${EXTERNAL_DIR}" \
+	BR2_DL_DIR="${DOWNLOAD_DIR}/buildroot-dl" \
+	micronux-selftest-rebuild
 make -C "${SOURCE_DIR}" \
 	O="${OUTPUT_DIR}" \
 	BR2_EXTERNAL="${EXTERNAL_DIR}" \
@@ -146,6 +156,9 @@ install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-isolation-fault" \
 	"${ARTIFACT_DIR}/micronux-isolation-fault"
 install -m 0755 "${OUTPUT_DIR}/target/usr/bin/micronux-arena-test" \
 	"${ARTIFACT_DIR}/micronux-arena-test"
+
+python3 "${REPO_DIR}/scripts/check-bflt-wx.py" \
+	--tree "${OUTPUT_DIR}/target"
 
 (
 	cd "${ARTIFACT_DIR}"

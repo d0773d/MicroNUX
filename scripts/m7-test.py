@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the MicroNUX M7 per-mm arena gate on ESP32-P4 hardware."""
+"""Exercise the complete MicroNUX M7 isolation/peripheral gate on hardware."""
 
 from __future__ import annotations
 
@@ -20,11 +20,17 @@ REQUIRED_MARKERS = (
     "MICRONUX:M3:JUMP",
     "MICRONUX:M7:PMP baseline=pass early-deny=pass "
     "handoff=13-14-unlocked overlay=13-14",
-    "MICRONUX:M7:PMP cached=7-9 direct=12-13 mode=per-mm+tor+napot "
+    "MICRONUX:M7:DMA-PMS state=pass region0=[4ff80000,4ff82000) "
+    "sdmmc=rw:00000001 display=ch",
+    "MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending "
+    "pattern=vertical-bars dma=circular channel=",
+    "MICRONUX:M7:PMP cached=7-10 direct=12-13 mode=per-mm+wx+tor+napot "
     "state=ready first=[",
     "MICRONUX:M7:POOL state=ready range=[49700000,49f00000) pages=2048 "
     "zero=on-arena+allocate ownership=per-mm",
     "Linux version 6.12.27",
+    "MICRONUX:M7:DSI-LINUX state=ready owner=linux fb=fb0 "
+    "resolution=800x1280 format=rgb565 dma=ch",
     "MICRONUX:M6:COMBINED:SHELL ready console=ttyGS0 network=nonblocking",
     "MICRONUX:M8:SERVICE state=ready abi=1.0",
     "MICRONUX:M7:JOB-SUPERVISOR state=ready uid=1000 gid=1000 "
@@ -32,10 +38,17 @@ REQUIRED_MARKERS = (
     "MICRONUX:M7:WARMUP:PASS",
     "MICRONUX:M7:POOL-PROBE:PASS",
     "MICRONUX:M7:POOL-TEST:PROBE:RC=0",
-    "MICRONUX:M7:FAULTS pass count=16 privilege=U memory_signal=11",
+    "MICRONUX:M7:FAULTS pass count=19 privilege=U memory_signal=11",
+    "MICRONUX:M7:WX pass text_write=SIGSEGV data_exec=SIGSEGV "
+    "stack_exec=SIGSEGV signal=return mmap_exec=EACCES code_copy=EFAULT",
     "MICRONUX:M7:UACCESS:PASS",
     "MICRONUX:M7:ISOLATION-FAULT:PASS",
     "MICRONUX:M7:POOL-TEST:FAULT:RC=0",
+    "MICRONUX:M7:DMA:STORAGE:RC=0",
+    "MICRONUX:M7:DMA:ONLINE:RC=0",
+    "MICRONUX:M7:DMA:NETWORK:RC=0",
+    "MICRONUX:M7:DISPLAY:PASS owner=linux fb=fb0 "
+    "pattern=framebuffer backlight=restored",
     "MICRONUX:M5:PASS",
     "MICRONUX:M7:POOL-TEST:SELFTEST:RC=0",
     "MICRONUX:M7:POOL-TEST:REPEAT:RC=0",
@@ -53,14 +66,21 @@ REQUIRED_MARKERS = (
     "MICRONUX:M7:POOL-TEST:JOB-WALL:RC=124",
     "MICRONUX:M7:POOL-TEST:JOB-OUTPUT:RC=125",
     "MICRONUX:M7:JOB-LIVENESS:PASS",
+    "MICRONUX:M7:WORKLOAD:DONE",
     "MICRONUX:M7:POOL-TEST:DONE",
 )
+
+WORKLOAD_REQUIRED_MARKERS = REQUIRED_MARKERS[13:-1]
 
 FORBIDDEN_MARKERS = (
     "MICRONUX:M3:FAIL",
     "MICRONUX:M6:FAIL",
     "MICRONUX:M7:PMP-AUDIT state=fail",
     "MICRONUX:M7:PMP-OVERLAY state=fail",
+    "MICRONUX:M7:DMA-PMS state=fail",
+    "MICRONUX:M7:DSI-HANDOFF state=fail",
+    "MICRONUX:M7:DSI-LINUX state=fail",
+    "MICRONUX:M7:DISPLAY:FAIL",
     "MICRONUX:M7:POOL state=fail",
     "MICRONUX:M7:POOL state=exhausted",
     "MICRONUX:M7:POOL-PROBE:FAIL",
@@ -90,6 +110,27 @@ def marker_seen(log: str, marker: str) -> bool:
     return any(marker in line for line in output_lines(log))
 
 
+def marker_count(log: str, marker: str) -> int:
+    return sum(marker in line for line in output_lines(log))
+
+
+def workload_runs(log: str) -> tuple[str, str, str]:
+    """Return prime, stabilization, and measured workload output."""
+    lines = output_lines(log)
+    starts = [
+        index
+        for index, line in enumerate(lines)
+        if line.strip() == "MICRONUX:M7:WORKLOAD:BEGIN"
+    ]
+    if len(starts) != 3:
+        raise ValueError(f"expected three workload runs, found {len(starts)}")
+    return (
+        "\n".join(lines[starts[0] : starts[1]]),
+        "\n".join(lines[starts[1] : starts[2]]),
+        "\n".join(lines[starts[2] :]),
+    )
+
+
 def rom_reset(port: str) -> None:
     subprocess.run(
         [
@@ -112,54 +153,58 @@ def rom_reset(port: str) -> None:
 
 
 def warmup_command() -> str:
-    repeats = " ".join(str(index) for index in range(1, 9))
     return (
-        "echo MICRONUX:M7:WARMUP:BEGIN; RC=0; "
-        "install -o root -g root -m 0755 /usr/libexec/micronux-job-test "
-        "/opt/micronux/apps/micronux-job-test || RC=1; "
-        "/usr/sbin/micronux-run -q -- /usr/libexec/micronux-job-test "
-        "contract >/dev/null 2>&1 && RC=1; "
-        "install -o root -g root -m 0777 /usr/libexec/micronux-job-test "
-        "/opt/micronux/apps/micronux-job-unsafe || RC=1; "
-        "/usr/sbin/micronux-run -q -- "
-        "/opt/micronux/apps/micronux-job-unsafe contract "
-        ">/dev/null 2>&1 && RC=1; "
-        "rm -f /opt/micronux/apps/micronux-job-unsafe; "
-        "/usr/bin/micronux-isolation-probe >/dev/null 2>&1 || RC=1; "
-        "/usr/bin/micronux-isolation-fault >/dev/null 2>&1 || RC=1; "
-        "/usr/bin/micronux-selftest >/dev/null 2>&1 || RC=1; "
-        "for I in "
-        f"{repeats}"
-        "; do /usr/bin/micronux-isolation-probe >/dev/null 2>&1 || RC=1; done; "
-        "/usr/bin/micronux-arena-test >/dev/null 2>&1 || RC=1; "
-        "/usr/sbin/micronux-run -- "
-        "/opt/micronux/apps/micronux-job-test contract "
-        ">/dev/null 2>&1 || RC=1; "
-        "/usr/sbin/micronux-run -q -- "
-        "/opt/micronux/apps/micronux-job-test spin "
-        ">/dev/null 2>&1; [ $? -eq 124 ] || RC=1; "
-        "/usr/sbin/micronux-run -q -- "
-        "/opt/micronux/apps/micronux-job-test flood "
-        ">/dev/null 2>&1; [ $? -eq 125 ] || RC=1; "
-        "/usr/bin/micronux-device api >/dev/null 2>&1 || RC=1; "
-        "sleep 1; if [ \"$RC\" -eq 0 ]; then "
-        "echo MICRONUX:M7:WARMUP:PASS; else "
-        "echo MICRONUX:M7:WARMUP:FAIL rc=$RC; fi\n"
+        "if install -o root -g root -m 0755 "
+        "/usr/libexec/micronux-job-test "
+        "/opt/micronux/apps/micronux-job-test; then "
+        "echo MICRONUX:M7:WARMUP:PREPARED; else "
+        "echo MICRONUX:M7:WARMUP:FAIL stage=prepare; fi\n"
     )
 
 
-def test_command() -> str:
-    repeats = " ".join(str(index) for index in range(1, 9))
+def measurement_before_command() -> str:
     return (
         "echo MICRONUX:M7:POOL-TEST:BEGIN; "
         "echo MICRONUX:M7:POOL-TEST:MEM-BEFORE; "
         "grep '^MemFree:' /proc/meminfo; "
         "echo MICRONUX:M7:POOL-TEST:ACCOUNT-BEFORE; "
         "cat /proc/micronux_user_pool; "
+        "echo MICRONUX:M7:POOL-TEST:BEFORE:DONE\n"
+    )
+
+
+def workload_command() -> str:
+    repeats = " ".join(str(index) for index in range(1, 9))
+    return (
+        "echo MICRONUX:M7:WORKLOAD:BEGIN; "
         "/usr/bin/micronux-isolation-probe; "
         "echo MICRONUX:M7:POOL-TEST:PROBE:RC=$?; "
         "/usr/bin/micronux-isolation-fault; "
         "echo MICRONUX:M7:POOL-TEST:FAULT:RC=$?; "
+        "/usr/bin/micronux-storage-test --write-test; "
+        "echo MICRONUX:M7:DMA:STORAGE:RC=$?; "
+        "/usr/bin/micronux-online; "
+        "echo MICRONUX:M7:DMA:ONLINE:RC=$?; "
+        "/bin/busybox ping 1.1.1.1; "
+        "echo MICRONUX:M7:DMA:NETWORK:RC=$?; "
+        "DISPLAY=/sys/bus/platform/devices/500a0000.display; "
+        "BACKLIGHT=/sys/class/backlight/micronux-backlight; "
+        "DISPLAY_RC=0; "
+        "[ -c /dev/fb0 ] || DISPLAY_RC=1; "
+        "grep -q '^linux fb0 .* circular=1 mmap=denied$' "
+        "$DISPLAY/ownership || DISPLAY_RC=1; "
+        "echo vertical >$DISPLAY/pattern || DISPLAY_RC=1; "
+        "grep -q '^vertical$' $DISPLAY/pattern || DISPLAY_RC=1; "
+        "echo framebuffer >$DISPLAY/pattern || DISPLAY_RC=1; "
+        "grep -q '^framebuffer$' $DISPLAY/pattern || DISPLAY_RC=1; "
+        "OLD_BRIGHTNESS=$(cat $BACKLIGHT/brightness) || DISPLAY_RC=1; "
+        "echo 64 >$BACKLIGHT/brightness || DISPLAY_RC=1; "
+        "[ \"$(cat $BACKLIGHT/brightness)\" = 64 ] || DISPLAY_RC=1; "
+        "echo $OLD_BRIGHTNESS >$BACKLIGHT/brightness || DISPLAY_RC=1; "
+        "if [ \"$DISPLAY_RC\" -eq 0 ]; then "
+        "echo MICRONUX:M7:DISPLAY:PASS owner=linux fb=fb0 "
+        "pattern=framebuffer backlight=restored; else "
+        "echo MICRONUX:M7:DISPLAY:FAIL rc=$DISPLAY_RC; fi; "
         "/usr/bin/micronux-selftest; "
         "echo MICRONUX:M7:POOL-TEST:SELFTEST:RC=$?; "
         "RC=0; for I in "
@@ -193,6 +238,12 @@ def test_command() -> str:
         "if /usr/bin/micronux-device api >/dev/null; then "
         "echo MICRONUX:M7:JOB-LIVENESS:PASS; else "
         "echo MICRONUX:M7:JOB-LIVENESS:FAIL; fi; "
+        "echo MICRONUX:M7:WORKLOAD:DONE\n"
+    )
+
+
+def measurement_after_command() -> str:
+    return (
         "echo MICRONUX:M7:POOL-TEST:ACCOUNT-AFTER; "
         "cat /proc/micronux_user_pool; "
         "echo MICRONUX:M7:POOL-TEST:MEM-AFTER; "
@@ -201,49 +252,144 @@ def test_command() -> str:
     )
 
 
-def capture_boot(port: str, timeout: float) -> str:
-    rom_reset(port)
-    device = serial.Serial(
-        port=port,
-        baudrate=115200,
-        timeout=0.1,
-        write_timeout=10.0,
-        dsrdtr=False,
-        rtscts=False,
-    )
-    device.dtr = False
-    device.rts = False
-    captured = bytearray()
+def open_serial(port: str, deadline: float) -> serial.Serial:
+    while True:
+        try:
+            device = serial.Serial(
+                port=port,
+                baudrate=115200,
+                timeout=0.05,
+                write_timeout=10.0,
+                dsrdtr=False,
+                rtscts=False,
+            )
+            device.dtr = False
+            device.rts = False
+            device.reset_input_buffer()
+            return device
+        except serial.SerialException:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
+
+
+def capture_boot(loader_port: str, linux_port: str, timeout: float) -> str:
+    rom_reset(loader_port)
     deadline = time.monotonic() + timeout
+    loader_device = open_serial(loader_port, deadline)
+    if linux_port == loader_port:
+        linux_device = loader_device
+    else:
+        linux_device = open_serial(linux_port, deadline)
+    loader_captured = bytearray()
+    linux_captured = (
+        loader_captured if linux_device is loader_device else bytearray()
+    )
+    # The first run initializes normal subsystem high-water state. The second
+    # establishes the memory baseline; the third must return to that baseline.
+    prepare_sent = False
     warmup_sent = False
+    warmup_quiesce_sent = False
+    stabilization_sent = False
+    stabilization_quiesce_sent = False
+    before_sent = False
     command_sent = False
+    measured_quiesce_sent = False
+    after_sent = False
     done_seen_at: float | None = None
 
     try:
-        device.reset_input_buffer()
         while time.monotonic() < deadline:
-            captured.extend(device.read(4096))
-            text = captured.decode("utf-8", errors="replace")
+            loader_captured.extend(loader_device.read(4096))
+            if linux_device is not loader_device:
+                linux_captured.extend(linux_device.read(4096))
+            loader_text = loader_captured.decode("utf-8", errors="replace")
+            linux_text = linux_captured.decode("utf-8", errors="replace")
+            text = f"{loader_text}\n{linux_text}"
             if (
-                not warmup_sent
+                not prepare_sent
                 and "MICRONUX:M6:COMBINED:SHELL ready" in text
                 and "MICRONUX:M7:POOL state=ready" in text
                 and "MICRONUX:M8:SERVICE state=ready" in text
             ):
                 time.sleep(0.2)
-                device.write(warmup_command().encode("ascii"))
-                device.flush()
+                linux_device.write(warmup_command().encode("ascii"))
+                linux_device.flush()
+                prepare_sent = True
+            if (
+                prepare_sent
+                and not warmup_sent
+                and marker_seen(text, "MICRONUX:M7:WARMUP:PREPARED")
+            ):
+                time.sleep(0.2)
+                linux_device.write(workload_command().encode("ascii"))
+                linux_device.flush()
                 warmup_sent = True
             if (
                 warmup_sent
-                and not command_sent
-                and marker_seen(text, "MICRONUX:M7:WARMUP:PASS")
+                and not warmup_quiesce_sent
+                and marker_count(text, "MICRONUX:M7:WORKLOAD:DONE") == 1
             ):
                 time.sleep(0.2)
-                device.write(test_command().encode("ascii"))
-                device.flush()
+                linux_device.write(b"echo MICRONUX:M7:WARMUP:QUIESCED\n")
+                linux_device.flush()
+                warmup_quiesce_sent = True
+            if (
+                warmup_quiesce_sent
+                and not stabilization_sent
+                and marker_seen(text, "MICRONUX:M7:WARMUP:QUIESCED")
+            ):
+                time.sleep(0.2)
+                linux_device.write(b"echo MICRONUX:M7:WARMUP:PASS\n")
+                linux_device.write(workload_command().encode("ascii"))
+                linux_device.flush()
+                stabilization_sent = True
+            if (
+                stabilization_sent
+                and not stabilization_quiesce_sent
+                and marker_count(text, "MICRONUX:M7:WORKLOAD:DONE") == 2
+            ):
+                time.sleep(0.2)
+                linux_device.write(b"echo MICRONUX:M7:STABILIZATION:QUIESCED\n")
+                linux_device.flush()
+                stabilization_quiesce_sent = True
+            if (
+                stabilization_quiesce_sent
+                and not before_sent
+                and marker_seen(text, "MICRONUX:M7:STABILIZATION:QUIESCED")
+            ):
+                time.sleep(0.2)
+                linux_device.write(measurement_before_command().encode("ascii"))
+                linux_device.flush()
+                before_sent = True
+            if (
+                before_sent
+                and not command_sent
+                and marker_seen(text, "MICRONUX:M7:POOL-TEST:BEFORE:DONE")
+            ):
+                time.sleep(0.2)
+                linux_device.write(workload_command().encode("ascii"))
+                linux_device.flush()
                 command_sent = True
-            if marker_seen(text, "MICRONUX:M7:POOL-TEST:DONE"):
+            if (
+                command_sent
+                and not measured_quiesce_sent
+                and marker_count(text, "MICRONUX:M7:WORKLOAD:DONE") == 3
+            ):
+                time.sleep(0.2)
+                linux_device.write(b"echo MICRONUX:M7:WORKLOAD:QUIESCED\n")
+                linux_device.flush()
+                measured_quiesce_sent = True
+            if (
+                measured_quiesce_sent
+                and not after_sent
+                and marker_seen(text, "MICRONUX:M7:WORKLOAD:QUIESCED")
+            ):
+                time.sleep(0.2)
+                linux_device.write(measurement_after_command().encode("ascii"))
+                linux_device.flush()
+                after_sent = True
+            if after_sent and marker_seen(text, "MICRONUX:M7:POOL-TEST:DONE"):
                 if done_seen_at is None:
                     done_seen_at = time.monotonic()
                 elif time.monotonic() - done_seen_at >= 0.5:
@@ -251,13 +397,24 @@ def capture_boot(port: str, timeout: float) -> str:
             if any(marker_seen(text, marker) for marker in FORBIDDEN_MARKERS):
                 time.sleep(0.2)
                 break
-        return captured.decode("utf-8", errors="replace")
+        if linux_device is loader_device:
+            return loader_text
+        return (
+            f"--- loader console {loader_port} ---\n{loader_text}\n"
+            f"--- Linux console {linux_port} ---\n{linux_text}"
+        )
     finally:
-        device.dtr = False
-        device.rts = False
-        device.cancel_read()
-        device.cancel_write()
-        device.close()
+        devices = (
+            (loader_device,)
+            if linux_device is loader_device
+            else (loader_device, linux_device)
+        )
+        for device in devices:
+            device.dtr = False
+            device.rts = False
+            device.cancel_read()
+            device.cancel_write()
+            device.close()
 
 
 def artifact_hashes(directory: Path) -> tuple[str, str]:
@@ -281,6 +438,10 @@ def artifact_hashes(directory: Path) -> tuple[str, str]:
         if fields[0] != 4 or fields[8] & 0x1 == 0:
             raise ValueError(
                 f"{binary.name} must be bFLT v4 FLAT_FLAG_RAM"
+            )
+        if fields[2] % 128 != 0:
+            raise ValueError(
+                f"{binary.name} data_start is not 128-byte aligned"
             )
     return (
         hashlib.sha256(image.read_bytes()).hexdigest(),
@@ -353,15 +514,26 @@ def job_policy_results(log: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", required=True)
+    parser.add_argument(
+        "--port",
+        help="legacy single-port mode; use --loader-port and --linux-port",
+    )
+    parser.add_argument("--loader-port")
+    parser.add_argument("--linux-port")
     parser.add_argument("--boots", type=int, default=3)
-    parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--timeout", type=float, default=420.0)
     parser.add_argument("--artifact-dir", type=Path, required=True)
     parser.add_argument("--log", type=Path)
     parser.add_argument("--expect-mipi-profile", choices=("jd9365",))
     args = parser.parse_args()
     if args.boots < 1:
         parser.error("--boots must be at least 1")
+    loader_port = args.loader_port or args.port
+    linux_port = args.linux_port or args.port
+    if loader_port is None or linux_port is None:
+        parser.error(
+            "provide --loader-port and --linux-port, or use legacy --port"
+        )
 
     try:
         expected_payload = artifact_hashes(args.artifact_dir.resolve())
@@ -374,17 +546,18 @@ def main() -> int:
     for boot in range(1, args.boots + 1):
         log = ""
         try:
-            log = capture_boot(args.port, args.timeout)
+            log = capture_boot(loader_port, linux_port, args.timeout)
             complete_log.append(log)
             if args.log is not None:
                 args.log.parent.mkdir(parents=True, exist_ok=True)
                 args.log.write_text("\n".join(complete_log), encoding="utf-8")
+            warmup_log, stabilization_log, measured_log = workload_runs(log)
             payload = boot_hashes(log)
             before = accounting(log, "BEFORE")
             after = accounting(log, "AFTER")
             memory_before = free_memory(log, "BEFORE")
             memory_after = free_memory(log, "AFTER")
-            job_policy_results(log)
+            job_policy_results(measured_log)
         except (OSError, subprocess.CalledProcessError, ValueError) as error:
             if log:
                 print(log, file=sys.stderr)
@@ -392,6 +565,21 @@ def main() -> int:
             return 1
 
         missing = [marker for marker in REQUIRED_MARKERS if not marker_seen(log, marker)]
+        missing.extend(
+            f"warmup:{marker}"
+            for marker in WORKLOAD_REQUIRED_MARKERS
+            if not marker_seen(warmup_log, marker)
+        )
+        missing.extend(
+            f"stabilization:{marker}"
+            for marker in WORKLOAD_REQUIRED_MARKERS
+            if not marker_seen(stabilization_log, marker)
+        )
+        missing.extend(
+            f"measured:{marker}"
+            for marker in WORKLOAD_REQUIRED_MARKERS
+            if not marker_seen(measured_log, marker)
+        )
         if args.expect_mipi_profile == "jd9365" and not marker_seen(
             log,
             "MICRONUX:M6:DSI state=ready profile=jd9365-800x1280 "

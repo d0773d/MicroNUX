@@ -1,0 +1,36 @@
+From b5640b5344540b88028b6526add481a7ca1d4231 Mon Sep 17 00:00:00 2001
+From: MicroNUX contributors <micronux@users.noreply.github.com>
+Date: Sat, 8 Aug 2026 16:55:00 -0700
+Subject: [PATCH 11/16] mmc: dw: use ESP32-P4 bounce for short aligned I/O
+
+Generic DesignWare MMC sends transfers shorter than 16 bytes through PIO to
+avoid DMA setup overhead.  ESP-Hosted's interrupt handler reads three 32-bit
+registers with one 12-byte CMD53, and that PIO transfer does not complete on
+the current ESP32-P4 integration.
+
+The ESP32-P4 quirk already owns fixed SRAM descriptors and a bounce buffer,
+so setup cost and cache ownership are deterministic.  Permit its word-aligned
+short requests to use that path while retaining the generic threshold for all
+other platforms.  Unaligned one-byte SDIO accesses continue to use PIO.
+
+Signed-off-by: MicroNUX contributors <micronux@users.noreply.github.com>
+---
+ drivers/mmc/host/dw_mmc.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+index 186e67a948cd..281f10db5b50 100644
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -997,7 +997,8 @@ static int dw_mci_pre_dma_transfer(struct dw_mci *host,
+ 	 * non-word-aligned buffers or lengths. Also, we don't bother
+ 	 * with all the DMA setup overhead for short transfers.
+ 	 */
+-	if (data->blocks * data->blksz < DW_MCI_DMA_THRESHOLD)
++	if (data->blocks * data->blksz < DW_MCI_DMA_THRESHOLD &&
++	    !(host->quirks & DW_MMC_QUIRK_ESP32P4_POLLED_IDMAC))
+ 		return -EINVAL;
+ 
+ 	if (data->blksz & 3)
+-- 
+2.43.0

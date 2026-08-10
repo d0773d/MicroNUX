@@ -1,0 +1,61 @@
+From 6a70f7f0f7ea1ad14e32a92ba923018a5f69aef4 Mon Sep 17 00:00:00 2001
+From: MicroNUX contributors <micronux@users.noreply.github.com>
+Date: Sun, 9 Aug 2026 01:12:00 -0700
+Subject: [PATCH 14/16] mmc: dw: reload ESP32-P4 IDMAC descriptor
+
+ESP-IDF's ESP32-P4 SDMMC driver programs DBADDR for every transfer and never
+refills a descriptor while IDMAC still owns it.  MicroNUX retained the IDMAC
+engine between requests to avoid a controller reset race, but consequently
+left its internal current-descriptor pointer at the end of the previous
+transfer and overwrote the fixed descriptor without checking OWN.  Thousands
+of alternating SD and SDIO transfers can eventually lock the atomic request
+path in that state.
+
+Wait for the fixed descriptor to return to the CPU before rebuilding it, then
+reload DBADDR and clear stale IDMAC status before each poll-demand operation.
+This preserves the no-reset ESP32-P4 contract while matching the native
+driver's per-transfer descriptor lifecycle.
+
+Signed-off-by: MicroNUX contributors <micronux@users.noreply.github.com>
+---
+ drivers/mmc/host/dw_mmc.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+index d11f834ef15a..1ac0d568bdf1 100644
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -522,6 +522,19 @@ static int dw_mci_esp32p4_prepare_desc(struct dw_mci *host)
+ 	struct idmac_desc *desc = host->sg_cpu;
+ 	struct mmc_data *data = host->data;
+ 	size_t length = (size_t)data->blocks * data->blksz;
++	u32 des0;
++
++	/*
++	 * The retained IDMAC engine clears OWN after consuming the descriptor.
++	 * Do not rewrite the fixed cache-line descriptor until that handoff is
++	 * visible through its uncached CPU alias.
++	 */
++	if (readl_poll_timeout_atomic((void __iomem *)&desc->des0, des0,
++				      !(des0 & IDMAC_DES0_OWN), 1,
++				      100 * USEC_PER_MSEC)) {
++		dev_err(host->dev, "ESP32-P4 IDMAC descriptor remained owned\n");
++		return -EBUSY;
++	}
+ 
+ 	/*
+ 	 * ESP32-P4 uses the first four standard IDMAC words but requires each
+@@ -863,6 +874,11 @@ static int dw_mci_idmac_start_dma(struct dw_mci *host, unsigned int sg_len)
+ 	/* drain writebuffer */
+ 	wmb();
+ 
++	if (host->quirks & DW_MMC_QUIRK_ESP32P4_POLLED_IDMAC) {
++		mci_writel(host, IDSTS, IDMAC_INT_CLR);
++		mci_writel(host, DBADDR, host->sg_dma);
++	}
++
+ 	/*
+ 	 * The ESP32-P4 controller retains IDMAC ownership across requests, as
+ 	 * used by its native driver. Resetting both DMA blocks for every Linux
+-- 
+2.50.1

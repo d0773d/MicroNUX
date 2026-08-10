@@ -1,0 +1,625 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MicroNUX <micronux@example.invalid>
+Date: Sun, 9 Aug 2026 00:00:00 -0700
+Subject: [PATCH 16/16] video: fbdev: add ESP32-P4 MicroNUX DSI handoff
+
+Claim the loader-initialized Kit C panel through a versioned, bounded
+handoff. Validate the circular DMA descriptor, expose RGB565 fbdev and
+backlight class devices, retain standard console drawing, and deny
+userspace mmap of loader-reserved memory.
+
+Signed-off-by: MicroNUX <micronux@example.invalid>
+---
+diff --git a/drivers/video/fbdev/Kconfig b/drivers/video/fbdev/Kconfig
+--- a/drivers/video/fbdev/Kconfig
++++ b/drivers/video/fbdev/Kconfig
+@@ -1789,6 +1789,18 @@
+ 	  Configuration re: surface address, size, and format must be provided
+ 	  through device tree, or plain old platform data.
+ 
++config FB_ESP32P4_MICRONUX_DSI
++	bool "ESP32-P4 MicroNUX MIPI-DSI handoff framebuffer"
++	depends on FB && OF && RISCV
++	select BACKLIGHT_CLASS_DEVICE
++	select CRC32
++	select FB_IOMEM_HELPERS
++	help
++	  Claim a panel, DSI host, circular DW-GDMA scanout, and retained I2C
++	  backlight state explicitly transferred by the MicroNUX ESP32-P4
++	  loader. The driver exposes /dev/fb0 and a standard backlight class
++	  device while denying userspace framebuffer mmap of loader memory.
++
+ config FB_SSD1307
+ 	tristate "Solomon SSD1307 framebuffer support"
+ 	depends on FB && I2C
+diff --git a/drivers/video/fbdev/Makefile b/drivers/video/fbdev/Makefile
+--- a/drivers/video/fbdev/Makefile
++++ b/drivers/video/fbdev/Makefile
+@@ -123,6 +123,7 @@
+ obj-$(CONFIG_FB_OF)               += offb.o
+ obj-$(CONFIG_FB_SSD1307)	  += ssd1307fb.o
+ obj-$(CONFIG_FB_SIMPLE)           += simplefb.o
++obj-$(CONFIG_FB_ESP32P4_MICRONUX_DSI) += esp32p4-dsi.o
+ 
+ # the test framebuffer is last
+ obj-$(CONFIG_FB_VIRTUAL)          += vfb.o
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+--- /dev/null
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -0,0 +1,576 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * ESP32-P4 MIPI-DSI ownership-transfer framebuffer for MicroNUX.
++ *
++ * The loader performs the panel-specific DBI sequence, then leaves a bounded
++ * circular DW-GDMA scanout and a versioned contract.  This driver validates
++ * that contract, claims all persistent controller resources, switches the DSI
++ * host from its diagnostic pattern to framebuffer video, and exposes standard
++ * fbdev and backlight interfaces.  No loader callback remains live.
++ */
++
++#include <linux/backlight.h>
++#include <linux/bitops.h>
++#include <linux/crc32.h>
++#include <linux/delay.h>
++#include <linux/fb.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++
++#define MICRONUX_DISPLAY_MAGIC		0x4d4e5844
++#define MICRONUX_DISPLAY_ABI_VERSION	1
++
++#define MICRONUX_DISPLAY_ACTIVE		BIT(0)
++#define MICRONUX_DISPLAY_RGB565		BIT(1)
++#define MICRONUX_DISPLAY_DMA_CIRCULAR	BIT(2)
++#define MICRONUX_DISPLAY_I2C_TRANSFERRED BIT(3)
++#define MICRONUX_DISPLAY_REQUIRED_FLAGS	(MICRONUX_DISPLAY_ACTIVE | \
++					 MICRONUX_DISPLAY_RGB565 | \
++					 MICRONUX_DISPLAY_DMA_CIRCULAR | \
++					 MICRONUX_DISPLAY_I2C_TRANSFERRED)
++
++#define ESP32P4_LOADER_PSRAM_START	0x48000000
++#define ESP32P4_LOADER_PSRAM_END		0x48400000
++#define ESP32P4_INTERNAL_SRAM_START	0x4ff00000
++#define ESP32P4_INTERNAL_SRAM_END	0x50000000
++#define ESP32P4_DSI_FIFO_ADDRESS		0x50105000
++
++#define DSI_HOST_VID_MODE_CFG		0x38
++#define DSI_HOST_VPG_EN			BIT(16)
++#define DSI_HOST_VPG_MODE		BIT(20)
++#define DSI_HOST_VPG_ORIENTATION	BIT(24)
++#define DSI_HOST_VPG_MASK		(DSI_HOST_VPG_EN | \
++					 DSI_HOST_VPG_MODE | \
++					 DSI_HOST_VPG_ORIENTATION)
++
++#define DSI_BRG_DPI_MISC_CONFIG		0x40
++#define DSI_BRG_DPI_EN			BIT(0)
++#define DSI_BRG_DPI_CONFIG_UPDATE	0x44
++#define DSI_BRG_INT_ENA			0x50
++#define DSI_BRG_INT_CLR			0x54
++
++#define DW_GDMA_CHEN			0x18
++
++#define I2C_CTR				0x04
++#define I2C_SR				0x08
++#define I2C_FIFO_CONF			0x18
++#define I2C_DATA			0x1c
++#define I2C_INT_RAW			0x20
++#define I2C_INT_CLR			0x24
++#define I2C_INT_ENA			0x28
++#define I2C_COMMAND(index)		(0x58 + (index) * 4)
++
++#define I2C_BUS_BUSY			BIT(4)
++#define I2C_MS_MODE			BIT(4)
++#define I2C_TRANS_START			BIT(5)
++#define I2C_FSM_RST			BIT(10)
++#define I2C_CONF_UPGATE			BIT(11)
++#define I2C_RX_FIFO_RST			BIT(12)
++#define I2C_TX_FIFO_RST			BIT(13)
++#define I2C_COMMAND_DONE		BIT(31)
++#define I2C_ERROR_MASK			(BIT(5) | BIT(8) | BIT(10))
++
++#define I2C_CMD_RESTART			6
++#define I2C_CMD_WRITE			1
++#define I2C_CMD_STOP			2
++#define I2C_CMD(opcode, bytes, ack_check)	\
++	((bytes) | ((ack_check) ? BIT(8) : 0) | ((opcode) << 11))
++
++#define DMA_LLI_SAR			0x00
++#define DMA_LLI_DAR			0x08
++#define DMA_LLI_LLP			0x18
++#define DMA_LLI_CTRL_HI		0x24
++#define DMA_LLI_VALID			BIT(31)
++#define DMA_LLI_LAST			BIT(30)
++#define DMA_LLI_INTERRUPT		BIT(26)
++
++enum micronux_pattern {
++	MICRONUX_PATTERN_FRAMEBUFFER,
++	MICRONUX_PATTERN_VERTICAL,
++	MICRONUX_PATTERN_HORIZONTAL,
++	MICRONUX_PATTERN_BER,
++};
++
++struct micronux_display_handoff_v1 {
++	u32 magic;
++	u16 abi_version;
++	u16 struct_size;
++	u32 flags;
++	u32 width;
++	u32 height;
++	u32 stride;
++	u32 framebuffer_address;
++	u32 framebuffer_size;
++	u32 dma_descriptor_address;
++	u32 dma_descriptor_size;
++	u32 dma_channel;
++	u32 i2c_address;
++	u32 backlight_register;
++	u32 backlight_brightness;
++	u32 crc32;
++};
++
++struct micronux_dsi {
++	struct device *dev;
++	void __iomem *host;
++	void __iomem *bridge;
++	void __iomem *gdma;
++	void __iomem *i2c;
++	struct fb_info *info;
++	struct backlight_device *backlight;
++	struct mutex lock;
++	struct micronux_display_handoff_v1 handoff;
++	u32 uncached_offset;
++	u32 palette[16];
++	enum micronux_pattern pattern;
++};
++
++static int micronux_i2c_write(struct micronux_dsi *dsi, u8 reg, u8 value)
++{
++	u32 command, fifo, raw, status;
++	u8 bytes[3] = {
++		(u8)(dsi->handoff.i2c_address << 1), reg, value,
++	};
++	int ret;
++
++	mutex_lock(&dsi->lock);
++	if (!(readl(dsi->i2c + I2C_CTR) & I2C_MS_MODE)) {
++		ret = -EIO;
++		goto out;
++	}
++	if (readl(dsi->i2c + I2C_SR) & I2C_BUS_BUSY) {
++		writel(readl(dsi->i2c + I2C_CTR) | I2C_FSM_RST,
++		       dsi->i2c + I2C_CTR);
++		udelay(10);
++		if (readl(dsi->i2c + I2C_SR) & I2C_BUS_BUSY) {
++			ret = -EBUSY;
++			goto out;
++		}
++	}
++
++	writel(0, dsi->i2c + I2C_INT_ENA);
++	writel(~0U, dsi->i2c + I2C_INT_CLR);
++	fifo = readl(dsi->i2c + I2C_FIFO_CONF);
++	writel(fifo | I2C_RX_FIFO_RST | I2C_TX_FIFO_RST,
++	       dsi->i2c + I2C_FIFO_CONF);
++	writel(fifo & ~(I2C_RX_FIFO_RST | I2C_TX_FIFO_RST),
++	       dsi->i2c + I2C_FIFO_CONF);
++
++	writel(bytes[0], dsi->i2c + I2C_DATA);
++	writel(bytes[1], dsi->i2c + I2C_DATA);
++	writel(bytes[2], dsi->i2c + I2C_DATA);
++	writel(I2C_CMD(I2C_CMD_RESTART, 0, false),
++	       dsi->i2c + I2C_COMMAND(0));
++	writel(I2C_CMD(I2C_CMD_WRITE, ARRAY_SIZE(bytes), true),
++	       dsi->i2c + I2C_COMMAND(1));
++	writel(I2C_CMD(I2C_CMD_STOP, 0, false),
++	       dsi->i2c + I2C_COMMAND(2));
++	command = readl(dsi->i2c + I2C_CTR);
++	writel(command | I2C_CONF_UPGATE, dsi->i2c + I2C_CTR);
++	writel(command | I2C_TRANS_START, dsi->i2c + I2C_CTR);
++
++	ret = readl_poll_timeout(dsi->i2c + I2C_COMMAND(2), status,
++				 status & I2C_COMMAND_DONE, 10, 20000);
++	raw = readl(dsi->i2c + I2C_INT_RAW);
++	writel(raw, dsi->i2c + I2C_INT_CLR);
++	if (!ret && (raw & I2C_ERROR_MASK))
++		ret = -EIO;
++out:
++	mutex_unlock(&dsi->lock);
++	return ret;
++}
++
++static int micronux_backlight_update(struct backlight_device *backlight)
++{
++	struct micronux_dsi *dsi = bl_get_data(backlight);
++	u8 brightness = backlight_get_brightness(backlight);
++
++	if (backlight_is_blank(backlight))
++		brightness = 0;
++	return micronux_i2c_write(dsi, dsi->handoff.backlight_register,
++				  brightness);
++}
++
++static int micronux_backlight_get(struct backlight_device *backlight)
++{
++	return backlight->props.brightness;
++}
++
++static const struct backlight_ops micronux_backlight_ops = {
++	.options = BL_CORE_SUSPENDRESUME,
++	.update_status = micronux_backlight_update,
++	.get_brightness = micronux_backlight_get,
++};
++
++static int micronux_setcolreg(unsigned int regno, unsigned int red,
++			     unsigned int green, unsigned int blue,
++			     unsigned int transp, struct fb_info *info)
++{
++	struct micronux_dsi *dsi = info->par;
++	u32 value;
++
++	if (regno >= ARRAY_SIZE(dsi->palette))
++		return -EINVAL;
++	value = ((red >> 11) << 11) | ((green >> 10) << 5) | (blue >> 11);
++	dsi->palette[regno] = value;
++	return 0;
++}
++
++static int micronux_fb_mmap(struct fb_info *info, struct vm_area_struct *vma)
++{
++	/* U-mode must use bounded writes; it never receives loader-memory MMIO. */
++	return -EPERM;
++}
++
++static int micronux_fb_blank(int blank, struct fb_info *info)
++{
++	struct micronux_dsi *dsi = info->par;
++
++	if (!dsi->backlight)
++		return 0;
++	dsi->backlight->props.power = blank;
++	return backlight_update_status(dsi->backlight);
++}
++
++static const struct fb_ops micronux_fb_ops = {
++	.owner = THIS_MODULE,
++	.fb_read = fb_io_read,
++	.fb_write = fb_io_write,
++	.fb_fillrect = cfb_fillrect,
++	.fb_copyarea = cfb_copyarea,
++	.fb_imageblit = cfb_imageblit,
++	.fb_mmap = micronux_fb_mmap,
++	.fb_blank = micronux_fb_blank,
++	.fb_setcolreg = micronux_setcolreg,
++};
++
++static int micronux_set_pattern(struct micronux_dsi *dsi,
++				enum micronux_pattern pattern)
++{
++	u32 bridge, host;
++
++	mutex_lock(&dsi->lock);
++	bridge = readl(dsi->bridge + DSI_BRG_DPI_MISC_CONFIG);
++	host = readl(dsi->host + DSI_HOST_VID_MODE_CFG);
++
++	if (pattern == MICRONUX_PATTERN_FRAMEBUFFER) {
++		host &= ~DSI_HOST_VPG_EN;
++		writel(host, dsi->host + DSI_HOST_VID_MODE_CFG);
++		writel(bridge | DSI_BRG_DPI_EN,
++		       dsi->bridge + DSI_BRG_DPI_MISC_CONFIG);
++		writel(1, dsi->bridge + DSI_BRG_DPI_CONFIG_UPDATE);
++	} else {
++		writel(bridge & ~DSI_BRG_DPI_EN,
++		       dsi->bridge + DSI_BRG_DPI_MISC_CONFIG);
++		writel(1, dsi->bridge + DSI_BRG_DPI_CONFIG_UPDATE);
++		host &= ~DSI_HOST_VPG_MASK;
++		host |= DSI_HOST_VPG_EN;
++		if (pattern == MICRONUX_PATTERN_HORIZONTAL)
++			host |= DSI_HOST_VPG_ORIENTATION;
++		else if (pattern == MICRONUX_PATTERN_BER)
++			host |= DSI_HOST_VPG_MODE;
++		writel(host, dsi->host + DSI_HOST_VID_MODE_CFG);
++	}
++	dsi->pattern = pattern;
++	mutex_unlock(&dsi->lock);
++	return 0;
++}
++
++static const char *micronux_pattern_name(enum micronux_pattern pattern)
++{
++	switch (pattern) {
++	case MICRONUX_PATTERN_FRAMEBUFFER:
++		return "framebuffer";
++	case MICRONUX_PATTERN_VERTICAL:
++		return "vertical";
++	case MICRONUX_PATTERN_HORIZONTAL:
++		return "horizontal";
++	case MICRONUX_PATTERN_BER:
++		return "ber";
++	}
++	return "unknown";
++}
++
++static ssize_t pattern_show(struct device *dev,
++			    struct device_attribute *attribute, char *buf)
++{
++	struct micronux_dsi *dsi = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%s\n", micronux_pattern_name(dsi->pattern));
++}
++
++static ssize_t pattern_store(struct device *dev,
++			     struct device_attribute *attribute,
++			     const char *buf, size_t count)
++{
++	struct micronux_dsi *dsi = dev_get_drvdata(dev);
++	enum micronux_pattern pattern;
++
++	if (sysfs_streq(buf, "framebuffer"))
++		pattern = MICRONUX_PATTERN_FRAMEBUFFER;
++	else if (sysfs_streq(buf, "vertical"))
++		pattern = MICRONUX_PATTERN_VERTICAL;
++	else if (sysfs_streq(buf, "horizontal"))
++		pattern = MICRONUX_PATTERN_HORIZONTAL;
++	else if (sysfs_streq(buf, "ber"))
++		pattern = MICRONUX_PATTERN_BER;
++	else
++		return -EINVAL;
++
++	micronux_set_pattern(dsi, pattern);
++	return count;
++}
++static DEVICE_ATTR_RW(pattern);
++
++static ssize_t ownership_show(struct device *dev,
++			      struct device_attribute *attribute, char *buf)
++{
++	struct micronux_dsi *dsi = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "linux fb%d dma-channel=%u circular=1 mmap=denied\n",
++			  dsi->info->node, dsi->handoff.dma_channel);
++}
++static DEVICE_ATTR_RO(ownership);
++
++static struct attribute *micronux_display_attrs[] = {
++	&dev_attr_pattern.attr,
++	&dev_attr_ownership.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(micronux_display);
++
++static int micronux_validate_handoff(struct micronux_dsi *dsi, u32 address)
++{
++	struct micronux_display_handoff_v1 *handoff = &dsi->handoff;
++	void __iomem *source;
++	void __iomem *descriptor;
++	u32 descriptor_control, descriptor_link;
++	u32 expected_size, crc;
++	u64 end;
++
++	source = (void __iomem *)(uintptr_t)(address + dsi->uncached_offset);
++	memcpy_fromio(handoff, source, sizeof(*handoff));
++	crc = crc32_le(~0U, (u8 *)handoff,
++		       offsetof(struct micronux_display_handoff_v1, crc32)) ^ ~0U;
++	if (handoff->magic != MICRONUX_DISPLAY_MAGIC ||
++	    handoff->abi_version != MICRONUX_DISPLAY_ABI_VERSION ||
++	    handoff->struct_size != sizeof(*handoff) ||
++	    crc != handoff->crc32 ||
++	    (handoff->flags & MICRONUX_DISPLAY_REQUIRED_FLAGS) !=
++		MICRONUX_DISPLAY_REQUIRED_FLAGS)
++		return -EINVAL;
++
++	if (!handoff->width || !handoff->height ||
++	    handoff->width > U32_MAX / 2 ||
++	    handoff->stride != handoff->width * 2)
++		return -EINVAL;
++	expected_size = handoff->stride * handoff->height;
++	if (handoff->height > U32_MAX / handoff->stride ||
++	    handoff->framebuffer_size != expected_size)
++		return -EINVAL;
++	end = (u64)handoff->framebuffer_address + handoff->framebuffer_size;
++	if (handoff->framebuffer_address < ESP32P4_LOADER_PSRAM_START ||
++	    end > ESP32P4_LOADER_PSRAM_END)
++		return -EINVAL;
++	end = (u64)handoff->dma_descriptor_address +
++	      handoff->dma_descriptor_size;
++	if (handoff->dma_descriptor_address < ESP32P4_INTERNAL_SRAM_START ||
++	    end > ESP32P4_INTERNAL_SRAM_END ||
++	    handoff->dma_descriptor_size != 64 ||
++	    !IS_ALIGNED(handoff->dma_descriptor_address, 64) ||
++	    handoff->dma_channel >= 4 || handoff->i2c_address != 0x45 ||
++	    handoff->backlight_register != 0x96 ||
++	    handoff->backlight_brightness > 255)
++		return -EINVAL;
++
++	descriptor = (void __iomem *)(uintptr_t)
++		(handoff->dma_descriptor_address + dsi->uncached_offset);
++	descriptor_link = readl(descriptor + DMA_LLI_LLP);
++	descriptor_control = readl(descriptor + DMA_LLI_CTRL_HI);
++	if (readl(descriptor + DMA_LLI_SAR) != handoff->framebuffer_address ||
++	    readl(descriptor + DMA_LLI_DAR) != ESP32P4_DSI_FIFO_ADDRESS ||
++	    (descriptor_link & ~0x3fU) != handoff->dma_descriptor_address ||
++	    !(descriptor_control & DMA_LLI_VALID) ||
++	    descriptor_control & (DMA_LLI_LAST | DMA_LLI_INTERRUPT))
++		return -EINVAL;
++
++	return 0;
++}
++
++static int micronux_register_backlight(struct micronux_dsi *dsi)
++{
++	struct backlight_properties properties = {
++		.type = BACKLIGHT_RAW,
++		.max_brightness = 255,
++		.brightness = dsi->handoff.backlight_brightness,
++	};
++
++	dsi->backlight = devm_backlight_device_register(
++		dsi->dev, "micronux-backlight", dsi->dev, dsi,
++		&micronux_backlight_ops, &properties);
++	if (IS_ERR(dsi->backlight))
++		return PTR_ERR(dsi->backlight);
++	return backlight_update_status(dsi->backlight);
++}
++
++static int micronux_register_framebuffer(struct micronux_dsi *dsi)
++{
++	struct fb_info *info = dsi->info;
++
++	strscpy(info->fix.id, "esp32p4-dsi", sizeof(info->fix.id));
++	info->fix.smem_start = dsi->handoff.framebuffer_address;
++	info->fix.smem_len = dsi->handoff.framebuffer_size;
++	info->fix.type = FB_TYPE_PACKED_PIXELS;
++	info->fix.visual = FB_VISUAL_TRUECOLOR;
++	info->fix.line_length = dsi->handoff.stride;
++	info->fix.accel = FB_ACCEL_NONE;
++	info->var.xres = dsi->handoff.width;
++	info->var.yres = dsi->handoff.height;
++	info->var.xres_virtual = dsi->handoff.width;
++	info->var.yres_virtual = dsi->handoff.height;
++	info->var.bits_per_pixel = 16;
++	info->var.red.offset = 11;
++	info->var.red.length = 5;
++	info->var.green.offset = 5;
++	info->var.green.length = 6;
++	info->var.blue.offset = 0;
++	info->var.blue.length = 5;
++	info->var.activate = FB_ACTIVATE_NOW;
++	info->var.vmode = FB_VMODE_NONINTERLACED;
++	info->screen_base = (char __iomem *)(uintptr_t)
++		(dsi->handoff.framebuffer_address + dsi->uncached_offset);
++	info->screen_size = dsi->handoff.framebuffer_size;
++	info->fbops = &micronux_fb_ops;
++	info->pseudo_palette = dsi->palette;
++	info->flags = 0;
++	return register_framebuffer(info);
++}
++
++static int micronux_dsi_probe(struct platform_device *pdev)
++{
++	struct backlight_device *backlight;
++	struct micronux_dsi *dsi;
++	struct fb_info *info;
++	u32 channel_enable, handoff_address;
++	int ret;
++
++	info = framebuffer_alloc(sizeof(*dsi), &pdev->dev);
++	if (!info)
++		return -ENOMEM;
++	dsi = info->par;
++	dsi->dev = &pdev->dev;
++	dsi->info = info;
++	mutex_init(&dsi->lock);
++
++	dsi->host = devm_platform_ioremap_resource_byname(pdev, "dsi-host");
++	if (IS_ERR(dsi->host)) {
++		ret = PTR_ERR(dsi->host);
++		goto release;
++	}
++	dsi->bridge = devm_platform_ioremap_resource_byname(pdev, "dsi-bridge");
++	if (IS_ERR(dsi->bridge)) {
++		ret = PTR_ERR(dsi->bridge);
++		goto release;
++	}
++	dsi->gdma = devm_platform_ioremap_resource_byname(pdev, "gdma");
++	if (IS_ERR(dsi->gdma)) {
++		ret = PTR_ERR(dsi->gdma);
++		goto release;
++	}
++	dsi->i2c = devm_platform_ioremap_resource_byname(pdev, "i2c");
++	if (IS_ERR(dsi->i2c)) {
++		ret = PTR_ERR(dsi->i2c);
++		goto release;
++	}
++	ret = of_property_read_u32(pdev->dev.of_node,
++				   "espressif,handoff-address",
++				   &handoff_address);
++	if (ret)
++		goto release;
++	ret = of_property_read_u32(pdev->dev.of_node,
++				   "espressif,uncached-offset",
++				   &dsi->uncached_offset);
++	if (ret)
++		goto release;
++	ret = micronux_validate_handoff(dsi, handoff_address);
++	if (ret) {
++		dev_err(&pdev->dev, "invalid loader display handoff: %d\n", ret);
++		goto release;
++	}
++
++	writel(0, dsi->bridge + DSI_BRG_INT_ENA);
++	writel(~0U, dsi->bridge + DSI_BRG_INT_CLR);
++	channel_enable = readl(dsi->gdma + DW_GDMA_CHEN);
++	if (!(channel_enable & BIT(dsi->handoff.dma_channel)))
++		writel(BIT(dsi->handoff.dma_channel) |
++		       BIT(dsi->handoff.dma_channel + 8),
++		       dsi->gdma + DW_GDMA_CHEN);
++	if (!(readl(dsi->gdma + DW_GDMA_CHEN) &
++	      BIT(dsi->handoff.dma_channel))) {
++		ret = -EIO;
++		goto release;
++	}
++
++	platform_set_drvdata(pdev, dsi);
++	ret = micronux_register_backlight(dsi);
++	if (ret)
++		goto release;
++	backlight = dsi->backlight;
++	ret = micronux_register_framebuffer(dsi);
++	if (ret)
++		goto darken;
++	ret = sysfs_create_groups(&pdev->dev.kobj, micronux_display_groups);
++	if (ret)
++		goto unregister_fb;
++
++	micronux_set_pattern(dsi, MICRONUX_PATTERN_FRAMEBUFFER);
++	dev_info(&pdev->dev,
++		 "MICRONUX:M7:DSI-LINUX state=ready owner=linux fb=fb%d resolution=%ux%u format=rgb565 dma=ch%u:circular backlight=linux mmap=denied\n",
++		 info->node, dsi->handoff.width, dsi->handoff.height,
++		 dsi->handoff.dma_channel);
++	return 0;
++
++unregister_fb:
++	unregister_framebuffer(info);
++darken:
++	backlight->props.power = FB_BLANK_POWERDOWN;
++	backlight_update_status(backlight);
++release:
++	framebuffer_release(info);
++	return ret;
++}
++
++static void micronux_dsi_remove(struct platform_device *pdev)
++{
++	struct micronux_dsi *dsi = platform_get_drvdata(pdev);
++
++	sysfs_remove_groups(&pdev->dev.kobj, micronux_display_groups);
++	unregister_framebuffer(dsi->info);
++	dsi->backlight->props.power = FB_BLANK_POWERDOWN;
++	backlight_update_status(dsi->backlight);
++	framebuffer_release(dsi->info);
++}
++
++static const struct of_device_id micronux_dsi_of_match[] = {
++	{ .compatible = "espressif,esp32p4-micronux-dsi" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, micronux_dsi_of_match);
++
++static struct platform_driver micronux_dsi_driver = {
++	.probe = micronux_dsi_probe,
++	.remove = micronux_dsi_remove,
++	.driver = {
++		.name = "esp32p4-micronux-dsi",
++		.of_match_table = micronux_dsi_of_match,
++	},
++};
++module_platform_driver(micronux_dsi_driver);
++
++MODULE_DESCRIPTION("ESP32-P4 MicroNUX MIPI-DSI framebuffer handoff");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,90 @@
+From 6c54a7ab9f8610a0506c2363fe59fdcb4a73c85a Mon Sep 17 00:00:00 2001
+From: MicroNUX Contributors <micronux@example.invalid>
+Date: Sat, 8 Aug 2026 12:00:00 -0700
+Subject: [PATCH 08/16] mmc: dw_mmc: support ESP32-P4 slot selection
+
+Modern dw_mmc exposes one logical MMC host and assumes DesignWare slot 0,
+although the ESP32-P4 controller routes the onboard wireless coprocessor
+through hardware slot 1.  Allow the ESP32-P4 device tree profile to select
+that one physical slot and include the slot number in every command.
+
+This does not restore the old multi-slot host model.  Storage and wireless
+remain independent MicroNUX profiles because one dw_mci instance still owns
+one logical slot at a time.
+
+Signed-off-by: MicroNUX Contributors <micronux@example.invalid>
+---
+ drivers/mmc/host/dw_mmc.c | 16 ++++++++++++++--
+ drivers/mmc/host/dw_mmc.h |  1 +
+ 2 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+index d6e8439fc7dd..4781490d50ed 100644
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -247,7 +247,8 @@ static void mci_send_cmd(struct dw_mci_slot *slot, u32 cmd, u32 arg)
+ 	mci_writel(host, CMDARG, arg);
+ 	wmb(); /* drain writebuffer */
+ 	dw_mci_wait_while_busy(host, cmd);
+-	mci_writel(host, CMD, SDMMC_CMD_START | cmd);
++	mci_writel(host, CMD, SDMMC_CMD_START | cmd |
++		   SDMMC_CMD_CARD_NUMBER(slot->id));
+ 
+ 	if (readl_poll_timeout_atomic(host->regs + SDMMC_CMD, cmd_status,
+ 				      !(cmd_status & SDMMC_CMD_START),
+@@ -323,6 +324,7 @@ static u32 dw_mci_prepare_command(struct mmc_host *mmc, struct mmc_command *cmd)
+ 	if (!test_bit(DW_MMC_CARD_NO_USE_HOLD, &slot->flags))
+ 		cmdr |= SDMMC_CMD_USE_HOLD_REG;
+ 
++	cmdr |= SDMMC_CMD_CARD_NUMBER(slot->id);
+ 	return cmdr;
+ }
+ 
+@@ -363,6 +365,7 @@ static u32 dw_mci_prep_stop_abort(struct dw_mci *host, struct mmc_command *cmd)
+ 	if (!test_bit(DW_MMC_CARD_NO_USE_HOLD, &host->slot->flags))
+ 		cmdr |= SDMMC_CMD_USE_HOLD_REG;
+ 
++	cmdr |= SDMMC_CMD_CARD_NUMBER(host->slot->id);
+ 	return cmdr;
+ }
+ 
+@@ -3124,6 +3127,7 @@ static int dw_mci_init_slot(struct dw_mci *host)
+ 	struct mmc_host *mmc;
+ 	struct dw_mci_slot *slot;
+ 	int ret;
++	u32 slot_id = 0;
+ 
+ 	mmc = mmc_alloc_host(sizeof(struct dw_mci_slot), host->dev);
+ 	if (!mmc)
+@@ -3131,6 +3135,16 @@ static int dw_mci_init_slot(struct dw_mci *host)
+ 
+ 	slot = mmc_priv(mmc);
+-	slot->id = 0;
++	if (host->dev->of_node)
++		of_property_read_u32(host->dev->of_node,
++				     "espressif,slot-id", &slot_id);
++	if (slot_id > 1) {
++		dev_err(host->dev,
++			"invalid ESP32-P4 physical slot %u\n", slot_id);
++		ret = -EINVAL;
++		goto err_host_allocated;
++	}
++
++	slot->id = slot_id;
+ 	slot->sdio_id = host->sdio_id0 + slot->id;
+ 	slot->mmc = mmc;
+ 	slot->host = host;
+diff --git a/drivers/mmc/host/dw_mmc.h b/drivers/mmc/host/dw_mmc.h
+index b812a1270426..0ee16116b697 100644
+--- a/drivers/mmc/host/dw_mmc.h
++++ b/drivers/mmc/host/dw_mmc.h
+@@ -406,6 +406,7 @@
+ #define SDMMC_CMD_CCS_EXP		BIT(23)
+ #define SDMMC_CMD_CEATA_RD		BIT(22)
+ #define SDMMC_CMD_UPD_CLK		BIT(21)
++#define SDMMC_CMD_CARD_NUMBER(n)	(((n) & 0x1f) << 16)
+ #define SDMMC_CMD_INIT			BIT(15)
+ #define SDMMC_CMD_STOP			BIT(14)
+ #define SDMMC_CMD_PRV_DAT_WAIT		BIT(13)
+-- 
+2.50.1

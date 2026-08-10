@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -45,7 +46,14 @@ static const struct fault_case fault_cases[] = {
 	{ "clint-exec", "exec", UINT32_C(0x02000000), SIGSEGV },
 	{ "mmio-write", "write", UINT32_C(0x50000000), SIGSEGV },
 	{ "mmio-exec", "exec", UINT32_C(0x50000000), SIGSEGV },
+	{ "text-write", "text-write", 0, SIGSEGV },
+	{ "data-exec", "data-exec", 0, SIGSEGV },
+	{ "stack-exec", "stack-exec", 0, SIGSEGV },
 };
+
+static volatile uint32_t data_instruction __attribute__((aligned(4))) =
+	UINT32_C(0x00008067); /* ret */
+static volatile sig_atomic_t signal_returned;
 
 static const struct pointer_case pointer_cases[] = {
 	{ "kernel", UINT32_C(0x48400000), 1U },
@@ -66,6 +74,18 @@ static int fail(const char *stage, const char *name, unsigned long detail)
 	return 1;
 }
 
+__attribute__((noinline, used))
+static void text_write_target(void)
+{
+	__asm__ __volatile__("" ::: "memory");
+}
+
+static void signal_handler(int signal_number)
+{
+	if (signal_number == SIGUSR1)
+		signal_returned = 1;
+}
+
 __attribute__((noinline, noreturn))
 static void perform_fault(const char *operation, uintptr_t address)
 {
@@ -84,6 +104,23 @@ static void perform_fault(const char *operation, uintptr_t address)
 		*pointer = UINT32_C(0x4d375750);
 	} else if (strcmp(operation, "exec") == 0) {
 		void (*const target)(void) = (void (*)(void))address;
+
+		target();
+	} else if (strcmp(operation, "text-write") == 0) {
+		volatile uint32_t *const target =
+			(volatile uint32_t *)(uintptr_t)&text_write_target;
+
+		*target = UINT32_C(0x00008067);
+	} else if (strcmp(operation, "data-exec") == 0) {
+		void (*const target)(void) =
+			(void (*)(void))(uintptr_t)&data_instruction;
+
+		target();
+	} else if (strcmp(operation, "stack-exec") == 0) {
+		volatile uint32_t stack_instruction __attribute__((aligned(4))) =
+			UINT32_C(0x00008067);
+		void (*const target)(void) =
+			(void (*)(void))(uintptr_t)&stack_instruction;
 
 		target();
 	} else {
@@ -271,6 +308,58 @@ static int test_uaccess(void)
 	return 0;
 }
 
+static int test_wx(void)
+{
+	struct sigaction action;
+	void *mapping;
+	int sink;
+	int source;
+	ssize_t result;
+
+	source = open("/dev/zero", O_RDONLY);
+	if (source < 0)
+		return fail("wx-open", "zero", 0);
+	sink = open("/dev/null", O_WRONLY);
+	if (sink < 0) {
+		(void)close(source);
+		return fail("wx-open", "null", 0);
+	}
+
+	errno = 0;
+	result = read(source, (void *)(uintptr_t)&text_write_target, 1);
+	if (result != -1 || errno != EFAULT) {
+		(void)close(sink);
+		(void)close(source);
+		return fail("wx-code-copy", "read-text", (unsigned long)result);
+	}
+	result = write(sink, (const void *)(uintptr_t)&text_write_target, 1);
+	if (result != 1) {
+		(void)close(sink);
+		(void)close(source);
+		return fail("wx-code-read", "write-text", (unsigned long)result);
+	}
+	if (close(sink) != 0 || close(source) != 0)
+		return fail("wx-close", "devices", 0);
+
+	errno = 0;
+	mapping = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (mapping != MAP_FAILED || errno != EACCES) {
+		if (mapping != MAP_FAILED)
+			(void)munmap(mapping, 4096);
+		return fail("wx-mmap", "executable", (unsigned long)mapping);
+	}
+
+	memset(&action, 0, sizeof(action));
+	action.sa_handler = signal_handler;
+	if (sigemptyset(&action.sa_mask) != 0 ||
+	    sigaction(SIGUSR1, &action, NULL) != 0 || raise(SIGUSR1) != 0 ||
+	    signal_returned != 1)
+		return fail("wx-signal", "fixed-trampoline", signal_returned);
+
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -279,8 +368,11 @@ int main(int argc, char **argv)
 	if (argc != 1)
 		return fail("arguments", "parent", argc);
 
-	if (test_uaccess() != 0 || test_faults(argv[0]) != 0)
+	if (test_uaccess() != 0 || test_wx() != 0 || test_faults(argv[0]) != 0)
 		return 1;
+	puts("MICRONUX:M7:WX pass text_write=SIGSEGV data_exec=SIGSEGV "
+	     "stack_exec=SIGSEGV signal=return mmap_exec=EACCES "
+	     "code_copy=EFAULT");
 	puts("MICRONUX:M7:ISOLATION-FAULT:PASS");
 	return 0;
 }

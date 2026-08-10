@@ -129,8 +129,8 @@ works through one application surface by bypassing that contract.
 Loader-owned bring-up code becomes a Linux driver or trusted Linux service
 before it is exposed as a general application feature. In particular:
 
-- the loader MIPI color-bar path is only an electrical diagnostic; Linux must
-  own production display scanout and backlight control;
+- the loader MIPI color-bar path is only an electrical diagnostic; the M7
+  profile now transfers persistent scanout and backlight control to Linux;
 - the provisioning loader may prepare C6 credentials before boot, but Linux
   owns normal SDIO networking, connection state, retry policy, and application
   network access;
@@ -171,13 +171,22 @@ representative workflow, Linux-owned microSD/C6 device-status observation:
 
 | Criterion | Physical evidence |
 | --- | --- |
-| Linux ownership | Linux enumerated `mmcblk0` and C6-backed `ethsta0`; the loader attachment probe left MIPI D-PHY off and performed zero target writes. |
+| Linux ownership | Linux enumerated `mmcblk0` and C6-backed `ethsta0`; the loader attachment probe left MIPI D-PHY off and performed zero target writes. The later M7 display contract transfers initialized Kit C scanout to Linux-owned `fb0` and backlight devices. |
 | Three surfaces | Shell, native C, and direct-compiled Ignite bytecode returned the same ABI 1.0 device state. |
 | One API and policy | All three used `libmicronux` and `/run/micronux/device-v1.sock`; `SO_PEERCRED` granted the Ignite runner only `observe`. |
 | Caller-only blocking | A two-second device wait timed out while an unrelated ABI query completed successfully. |
 | Fail closed | UID 65534 was denied `ADMIN_PROBE`; `/dev/mem`, `/dev/kmem`, and loadable modules were absent. |
 | Fault recovery | A killed waiting client, an intentional IgniteVM fault, and a killed daemon all left or returned the service to a responsive state. |
 
-This closes the application-boundary acceptance gate, not the remaining MIPI
-or M7 work. New device-control operations must repeat the same checks rather
-than inheriting acceptance from this read-only workflow.
+This closes the application-boundary acceptance gate for the read-only
+representative workflow. M7 separately closes persistent display ownership:
+Linux validates the loader contract, owns circular scanout as `/dev/fb0`,
+attaches the framebuffer console, and owns pattern and backlight controls.
+Direct framebuffer `mmap()` remains denied, and ordinary jobs remain blocked
+from raw display MMIO and DMA.
+
+Display ownership does not yet provide the three application surfaces with a
+versioned drawing/control API. A future display service, shell command,
+IgniteVM binding, and native C wrapper must repeat the M8 permission,
+nonblocking, fault-recovery, and versioning checks rather than inheriting them
+from the low-level driver gate.

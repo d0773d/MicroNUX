@@ -37,6 +37,7 @@
 #include "sha/sha_core.h"
 
 #include "micronux_handoff.h"
+#include "micronux_dma_pms.h"
 #include "micronux_mipi_dsi.h"
 #include "micronux_payload.h"
 #include "micronux_provisioning.h"
@@ -883,6 +884,14 @@ void app_main(void)
              MICRONUX_SDMMC_PARK_CLIC_ID,
              MICRONUX_SDMMC_IRQ_PLACEHOLDER_ID);
 
+    if (micronux_mipi_dsi_handoff() != ESP_OK) {
+        fail("mipi-dsi-handoff");
+    }
+    prepare_sdmmc_for_linux();
+    if (micronux_dma_pms_prepare() != ESP_OK) {
+        fail("dma-pms");
+    }
+
     fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(100));
 
@@ -895,7 +904,6 @@ void app_main(void)
     portDISABLE_INTERRUPTS();
     esp_cpu_intr_disable(UINT32_MAX);
     prepare_usb_serial_jtag_for_linux();
-    prepare_sdmmc_for_linux();
     prepare_clic_for_linux();
 
     micronux_handoff_jump(0, dtb, s_payload.kernel_load_vaddr);

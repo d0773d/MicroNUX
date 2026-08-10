@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$Port = "COM14",
+    [string]$Port = "COM13",
+    [string]$LinuxPort = "COM14",
     [int]$Boots = 3,
     [switch]$SkipLinuxBuild,
     [switch]$Flash,
@@ -157,8 +158,10 @@ $image = Get-Item -LiteralPath $loaderImagePath
 $digest = (Get-FileHash -LiteralPath $loaderImagePath -Algorithm SHA256).Hash.ToLowerInvariant()
 $strings = (& riscv32-esp-elf-strings $elfPath | Out-String)
 if ($strings -notmatch "MICRONUX:M7:PMP baseline=pass early-deny=pass" -or
-    $strings -notmatch "MICRONUX:M7:PMP-AUDIT state=fail") {
-    throw "M7 PMP audit markers are missing from the linked loader."
+    $strings -notmatch "MICRONUX:M7:PMP-AUDIT state=fail" -or
+    $strings -notmatch "MICRONUX:M7:DMA-PMS state=pass" -or
+    $strings -notmatch "MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending") {
+    throw "M7 security or display handoff markers are missing from the linked loader."
 }
 Write-Host "M7 loader built: image=$($image.Length)B sha256=$digest idf=v6.0.1 early-deny=tracked kit-c=jd9365"
 
@@ -180,11 +183,12 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) {
     throw "M7 isolated Linux payload flash failed."
 }
-Write-Host "M7 loader and isolated Linux payload flashed: port=$Port pmp=early-deny pool=8MiB kit-c=confirmed"
+Write-Host "M7 loader and isolated Linux payload flashed: loader-port=$Port linux-port=$LinuxPort pmp=early-deny pool=8MiB kit-c=confirmed"
 
 if ($Test) {
     & $idfPython (Join-Path $PSScriptRoot "m7-test.py") `
-        --port $Port --boots $Boots --timeout 300 `
+        --loader-port $Port --linux-port $LinuxPort `
+        --boots $Boots --timeout 420 `
         --artifact-dir $artifactPath --expect-mipi-profile jd9365 `
         --log $logPath
     if ($LASTEXITCODE -ne 0) {

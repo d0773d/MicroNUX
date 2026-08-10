@@ -1,7 +1,7 @@
 # M6 Storage and Peripheral Bring-up
 
 Status: **simultaneous microSD and ESP32-C6 networking stable; physical Kit C
-JD9365 loader scanout proven; Linux display ownership pending**
+JD9365 loader scanout proven; Linux ownership completed in M7**
 
 M6 starts with the Waveshare board's onboard microSD interface. Storage can be
 isolated from the minimal USB console and from the ESP32-C6 wireless transport,
@@ -484,8 +484,13 @@ Enabling DSI with the Kconfig `unselected` choice fails before any display rail,
 D-PHY, or backlight is powered.
 
 The framebuffer is RGB565 and must fit entirely in the loader-owned PSRAM
-reservation `[0x48000000,0x48400000)`, which Linux already excludes. This is
-an electrical and timing proof only: it is not an emulator, Linux framebuffer,
-terminal, or DRM/KMS driver. M6-D0 is now physically complete. M6-D1 will move
-persistent scanout and backlight ownership into Linux; M6-D2 can then evaluate
-a minimal Linux console.
+reservation `[0x48000000,0x48400000)`, which Linux excludes from ordinary
+allocation. M6-D0 remains the electrical and timing proof; it is not an
+emulator or an application-facing display path.
+
+M6-D1 and the minimal M6-D2 console gate are now complete in the isolated M7
+profile. The loader converts the initialized scanout to circular DMA and
+publishes a versioned contract, then Linux validates and claims `/dev/fb0`,
+the 100x80 framebuffer console, pattern selection, and backlight control. See
+the [M7 Linux-owned Kit C display report](m7-linux-display.md) for the exact
+ownership, DMA, security, and three-boot evidence.

@@ -301,7 +301,7 @@ accounting and general `MemFree` returned exactly to baseline on all three
 boots; no panic, oops, reset, stale grant, pool exhaustion, or policy-failure
 marker occurred.
 
-## Exact guarantee and remaining work
+## WP6 W^X and DMA closure
 
 WP5 establishes **supervised per-process CPU containment**: an admitted job
 runs as a non-root, capability-free identity inside its own bounded arena and
@@ -310,6 +310,41 @@ write, or execute kernel RAM, loader RAM, direct aliases, protected platform
 regions, or another live process's arena. The M-mode kernel and root supervisor
 remain fully trusted.
 
-Arena pages remain RWX, and PMP does not act as an IOMMU for peripheral DMA.
-WP6 audits every enabled DMA path and either implements the planned W^X split
-or retains it as an explicit measured limitation.
+WP6 removes the former RWX limitation. The M7-specific `elf2flt` link layout
+aligns the bFLT data boundary to the ESP32-P4's 128-byte PMP granule. Linux
+finalizes each exec image as immutable RX text plus RW, non-executable data and
+stack, with a fixed read-only signal-return trampoline. It rejects executable
+post-exec mappings and applies the writable bound to every kernel-to-user copy.
+Four verified PMP TOR entries install the split before every U-mode return.
+
+The physical fault suite now reports 19 cases and proves:
+
+- writes to text fault with `SIGSEGV`;
+- execution from data or stack faults with `SIGSEGV`;
+- normal signal return still succeeds through the fixed trampoline;
+- executable `mmap()` returns `EACCES`; and
+- kernel copy-to-user attempts targeting immutable code return `EFAULT`.
+
+`scripts/check-bflt-wx.py` independently audited all 14 generated user
+executables for the required 128-byte boundary.
+
+WP6 also audits every DMA master enabled by the accepted image. The loader's
+P4 DMA permission controller grants SDMMC read/write access only to its
+internal bounce/descriptor window. The exact display GDMA channel can read
+only the rounded framebuffer range and read/write only its descriptor page;
+other DMA channels are denied. Linux verifies the versioned circular-display
+contract before claiming `/dev/fb0`, and userspace framebuffer `mmap()` is
+disabled. See the [Linux-owned display report](m7-linux-display.md).
+
+The final WP6/display candidate passed three independent ROM resets with the
+same payload hash, complete SD/C6/display workloads, exact arena accounting,
+and `MemFree` stable at 8,176 KiB before and after every measured workload.
+
+## Exact guarantee and remaining limits
+
+MicroNUX still has no MMU or general IOMMU. The M-mode kernel, approved loader,
+root supervisor, and enabled drivers remain trusted. Every future DMA master
+needs its own permission-controller audit; the existing rules do not confer a
+blanket guarantee. SMP remains disabled because PMP is hart-local and the
+current two-hart experiment does not preserve the proven boundary. These are
+explicit platform limits rather than open WP6 implementation items.
