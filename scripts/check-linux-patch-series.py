@@ -14,10 +14,13 @@ BOARD = ROOT / "buildroot-external" / "board" / "micronux"
 CONFIGS = ROOT / "buildroot-external" / "configs"
 SERIES = (
     ("patches-platform", 6),
-    ("patches-peripherals", 16),
+    ("patches-peripherals", 17),
     ("patches-isolation", 10),
 )
-ISOLATION_CONFIG = CONFIGS / "micronux_esp32p4_isolation_defconfig"
+ISOLATION_CONFIGS = {
+    CONFIGS / "micronux_esp32p4_isolation_defconfig",
+    CONFIGS / "micronux_esp32p4_gui_foundation_defconfig",
+}
 SUBJECT_RE = re.compile(r"^Subject: \[PATCH (\d+)/(\d+)\] ", re.MULTILINE)
 
 
@@ -61,9 +64,9 @@ def validate_config_boundaries() -> None:
     for config in sorted(CONFIGS.glob("micronux_esp32p4*_defconfig")):
         content = config.read_text(encoding="utf-8")
         has_isolation = isolation_token in content
-        if config == ISOLATION_CONFIG and not has_isolation:
-            fail("isolation-config-missing-series")
-        if config != ISOLATION_CONFIG and has_isolation:
+        if config in ISOLATION_CONFIGS and not has_isolation:
+            fail(f"isolation-config-missing-series-{config.name}")
+        if config not in ISOLATION_CONFIGS and has_isolation:
             fail(f"isolation-series-leaked-{config.name}")
         for required in ("patches-platform", "patches-peripherals"):
             if f"board/micronux/{required}" not in content:
@@ -83,7 +86,7 @@ def main() -> int:
     manifest_hash = hashlib.sha256(("\n".join(manifest) + "\n").encode()).hexdigest()
     print(
         "MICRONUX:PATCH-SERIES state=pass "
-        "platform=6 peripherals=16 isolation=10 total=32 "
+        "platform=6 peripherals=17 isolation=10 total=33 "
         f"manifest_sha256={manifest_hash}"
     )
     return 0

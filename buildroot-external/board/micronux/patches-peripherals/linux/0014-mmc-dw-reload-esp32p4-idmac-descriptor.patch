@@ -1,7 +1,7 @@
 From 6a70f7f0f7ea1ad14e32a92ba923018a5f69aef4 Mon Sep 17 00:00:00 2001
 From: MicroNUX contributors <micronux@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 01:12:00 -0700
-Subject: [PATCH 14/16] mmc: dw: reload ESP32-P4 IDMAC descriptor
+Subject: [PATCH 14/17] mmc: dw: reload ESP32-P4 IDMAC descriptor
 
 ESP-IDF's ESP32-P4 SDMMC driver programs DBADDR for every transfer and never
 refills a descriptor while IDMAC still owns it.  MicroNUX retained the IDMAC

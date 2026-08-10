@@ -175,7 +175,7 @@ arena accounting and `MemFree`.
 
 SMP is explicitly deferred: the compile-only two-hart image exceeds the fixed
 partition and disables the per-hart isolation contract. The Linux changes are
-review-separated into 6 platform, 16 peripheral, and 10 isolation patches;
+review-separated into 6 platform, 17 peripheral, and 10 isolation patches;
 they are categorized for review but not claimed upstream-ready. See the
 [SMP evaluation](m7-smp-evaluation.md), [patch organization](linux-patch-organization.md),
 and [Linux-owned display report](m7-linux-display.md).

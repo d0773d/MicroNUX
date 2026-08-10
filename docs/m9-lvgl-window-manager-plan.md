@@ -1,6 +1,29 @@
 # M9 Optional LVGL Window and Session Manager Plan
 
-Status: **architecture plan; implementation not started**
+Status: **IMPLEMENTING**
+
+Current section: **M9.1 - Linux input and presentation foundation (TESTING)**
+
+Last status update: **2026-08-10**
+
+## Live implementation status
+
+This document is the authoritative M9 implementation ledger. A feature moves
+through `PLANNED`, `IMPLEMENTING`, `VALIDATING`, `TESTING`, and `COMPLETED`.
+`COMPLETED` means the implementation exists, its required validation and tests
+passed, and the evidence is recorded here. A work-package section is completed
+only after every required feature and its exit criterion are completed.
+
+| Work package | Section status | Current evidence |
+| --- | --- | --- |
+| M9.0 Contract freeze | **COMPLETED** | Plan approved for implementation on 2026-08-10; architecture commit `b3d011f` |
+| M9.1 Linux input and presentation | **TESTING** | Clean M9 build passed; physical Kit C display, touch, underrun, responsiveness, and terminal-return gate pending |
+| M9.2 Optional LVGL service | **PLANNED** | Starts only after the M9.1 Linux gate passes |
+| M9.3 UI-v1 and native C SDK | **PLANNED** | Starts only after the M9.2 service gate passes |
+| M9.4 Window and session manager | **PLANNED** | Starts only after the M9.3 ABI gate passes |
+| M9.5 Ignite target separation | **PLANNED** | Starts only after the M9.4 lifecycle gate passes |
+| M9.6 Language and shell surfaces | **PLANNED** | Starts only after the M9.5 dependency gate passes |
+| M9.7 Packaging and physical acceptance | **PLANNED** | Final integration and physical gate |
 
 This document is the implementation contract for the optional MicroNUX GUI.
 It separates LVGL from applications, keeps Linux as the sole device owner,
@@ -421,26 +444,60 @@ gate, but M9 documentation and layouts must not prevent it.
 
 ### M9.0 - Contract freeze
 
+Section status: **COMPLETED**
+
 Deliverables:
 
-- this approved plan;
-- the explicit three-mode LVGL ownership matrix;
-- the two-flavor Ignite dependency boundary;
-- an initial memory and image-size baseline; and
-- a testable list of non-goals and completion gates.
+- [x] **COMPLETED** - this approved plan;
+- [x] **COMPLETED** - the explicit three-mode LVGL ownership matrix;
+- [x] **COMPLETED** - the two-flavor Ignite dependency boundary;
+- [x] **COMPLETED** - an initial memory and image-size baseline; and
+- [x] **COMPLETED** - a testable list of non-goals and completion gates.
 
 Exit criterion: the plan is committed and approved before implementation
 begins.
 
 ### M9.1 - Linux input and presentation foundation
 
+Section status: **TESTING**
+
 Deliverables:
 
-- GT9271 Linux probe and input events;
-- accepted reset, interrupt, and coordinate-transform device-tree contract;
-- a safe foreground GUI ownership transition for fbcon and `/dev/fb0`;
-- positioned, paced partial-rectangle presentation; and
-- a no-LVGL C diagnostic that proves display and primary touch input.
+- [ ] **TESTING** - GT9271 Linux probe and input events;
+- [ ] **TESTING** - accepted reset, interrupt, and coordinate-transform
+  device-tree contract;
+- [ ] **TESTING** - a safe foreground GUI ownership transition for fbcon and
+  `/dev/fb0`;
+- [ ] **TESTING** - positioned, paced partial-rectangle presentation; and
+- [ ] **TESTING** - a no-LVGL C diagnostic that proves display and primary
+  touch input.
+
+Validation evidence recorded 2026-08-10:
+
+- `scripts/check-linux-patch-series.py` passed the ordered 33-patch contract
+  with manifest SHA-256
+  `8b81443dd04ba72ced44bbced7e0641b707d089948ab86c89977d7f4b9af0ba4`;
+- a clean `scripts/m9-build.sh` integration build passed with Linux 6.12.27,
+  `CONFIG_INPUT_EVDEV=y`, the M7 isolation contract retained, bFLT W^X
+  validation passing, and no LVGL artifact in the M9.1 image;
+- the generated DTB contains the polling-only Kit C touch contract at address
+  `0x5d`, 10 ms polling, and unrotated 800x1280 coordinates. The Waveshare Kit
+  C wiring has no connected GT9271 reset or interrupt GPIO, so their deliberate
+  absence and Linux polling are part of the accepted contract;
+- `micronux-display-test` cross-compiled with `-Werror` as a 90,160-byte bFLT
+  executable and exposes check, draw, terminal restoration, and five-point
+  touch acceptance markers; and
+- the complete Linux image is 6,090,608 bytes, below the 6 MiB partition limit
+  by 200,848 bytes.
+
+Physical testing still required before any item or this section may be marked
+`COMPLETED`:
+
+- probe/status and event-device check on the connected GT9271;
+- visible positioned draw and five-point primary-touch test;
+- zero DSI underruns during the test;
+- responsive USB shell and unrelated background task during presentation; and
+- clean restoration of the framebuffer console after normal exit and signal.
 
 Exit criterion: the diagnostic draws a target, receives correctly transformed
 touch, returns to the terminal cleanly, and produces zero DSI underruns while
@@ -448,15 +505,17 @@ USB shell and unrelated tasks remain responsive.
 
 ### M9.2 - Optional LVGL service
 
+Section status: **PLANNED**
+
 Deliverables:
 
-- Buildroot package and GUI defconfig;
-- pinned LVGL 9.5.0 configuration;
-- partial-buffer display port;
-- Linux input port;
-- serialized event loop;
-- supervisor and safe-mode behavior; and
-- minimal system/recovery scene.
+- [ ] **PLANNED** - Buildroot package and GUI defconfig;
+- [ ] **PLANNED** - pinned LVGL 9.5.0 configuration;
+- [ ] **PLANNED** - partial-buffer display port;
+- [ ] **PLANNED** - Linux input port;
+- [ ] **PLANNED** - serialized event loop;
+- [ ] **PLANNED** - supervisor and safe-mode behavior; and
+- [ ] **PLANNED** - minimal system/recovery scene.
 
 Exit criterion: the service starts, renders, receives touch, stops, restarts,
 and restores terminal access. The terminal-only image contains no LVGL
@@ -464,15 +523,17 @@ artifact.
 
 ### M9.3 - UI-v1 and native C SDK
 
+Section status: **PLANNED**
+
 Deliverables:
 
-- frozen UI-v1 headers and protocol documentation;
-- `SO_PEERCRED` authorization and capability mapping;
-- session quotas and bounded parser;
-- object, transaction, resource, and event operations;
-- `<micronux/ui.h>` and `libmicronux-ui.a`;
-- CLI inspection client; and
-- protocol unit, malformed-input, and multi-client tests.
+- [ ] **PLANNED** - frozen UI-v1 headers and protocol documentation;
+- [ ] **PLANNED** - `SO_PEERCRED` authorization and capability mapping;
+- [ ] **PLANNED** - session quotas and bounded parser;
+- [ ] **PLANNED** - object, transaction, resource, and event operations;
+- [ ] **PLANNED** - `<micronux/ui.h>` and `libmicronux-ui.a`;
+- [ ] **PLANNED** - CLI inspection client; and
+- [ ] **PLANNED** - protocol unit, malformed-input, and multi-client tests.
 
 Exit criterion: an unprivileged native C application creates an interactive
 scene and receives events without LVGL headers, framebuffer access, or special
@@ -480,15 +541,17 @@ device permissions.
 
 ### M9.4 - Window and session manager
 
+Section status: **PLANNED**
+
 Deliverables:
 
-- foreground lifecycle;
-- focus and input routing;
-- trusted system overlay;
-- virtual keyboard;
-- launcher/recovery scene;
-- suspend/resume/close behavior; and
-- deterministic cleanup after client faults.
+- [ ] **PLANNED** - foreground lifecycle;
+- [ ] **PLANNED** - focus and input routing;
+- [ ] **PLANNED** - trusted system overlay;
+- [ ] **PLANNED** - virtual keyboard;
+- [ ] **PLANNED** - launcher/recovery scene;
+- [ ] **PLANNED** - suspend/resume/close behavior; and
+- [ ] **PLANNED** - deterministic cleanup after client faults.
 
 Exit criterion: two applications can be launched and switched one at a time;
 only the foreground application receives input; killing either client returns
@@ -496,15 +559,17 @@ to a valid scene without restarting Linux.
 
 ### M9.5 - Ignite target separation and MicroNUX adapter
 
+Section status: **PLANNED**
+
 Deliverables:
 
-- explicit standalone-firmware and MicroNUX build targets;
-- shared compiler, bytecode, VM, GC, and package contracts;
-- retained firmware LVGL backend;
-- LVGL-free MicroNUX UI-v1 backend;
-- `.igniteui` object/event translation;
-- typed GUI-unavailable behavior; and
-- negative dependency checks for the MicroNUX artifact.
+- [ ] **PLANNED** - explicit standalone-firmware and MicroNUX build targets;
+- [ ] **PLANNED** - shared compiler, bytecode, VM, GC, and package contracts;
+- [ ] **PLANNED** - retained firmware LVGL backend;
+- [ ] **PLANNED** - LVGL-free MicroNUX UI-v1 backend;
+- [ ] **PLANNED** - `.igniteui` object/event translation;
+- [ ] **PLANNED** - typed GUI-unavailable behavior; and
+- [ ] **PLANNED** - negative dependency checks for the MicroNUX artifact.
 
 Exit criterion: the same representative `.ignite` and `.igniteui` sources run
 through embedded LVGL on standalone firmware and through UI-v1 on MicroNUX.
@@ -512,27 +577,33 @@ The MicroNUX binary contains no LVGL, ESP-LVGL, or ESP-IDF GUI symbol.
 
 ### M9.6 - Language and shell surfaces
 
+Section status: **PLANNED**
+
 Deliverables:
 
-- complete public C example;
-- documented foreign-function and direct-protocol binding rules;
-- shell status and lifecycle commands;
-- bounded canvas example; and
-- API compatibility and automation-output tests.
+- [ ] **PLANNED** - complete public C example;
+- [ ] **PLANNED** - documented foreign-function and direct-protocol binding
+  rules;
+- [ ] **PLANNED** - shell status and lifecycle commands;
+- [ ] **PLANNED** - bounded canvas example; and
+- [ ] **PLANNED** - API compatibility and automation-output tests.
 
 Exit criterion: C, Ignite for MicroNUX, and a protocol-level test client create
 equivalent scenes under the same permission and quota rules.
 
 ### M9.7 - Packaging, security, and physical acceptance
 
+Section status: **PLANNED**
+
 Deliverables:
 
-- GUI enable/disable/restart workflow;
-- crash-loop safe mode;
-- terminal and GUI image-size comparison;
-- memory, CPU, input-latency, and frame-time measurements;
-- security and fault-injection tests; and
-- combined display, touch, microSD, C6 network, and USB-console soak.
+- [ ] **PLANNED** - GUI enable/disable/restart workflow;
+- [ ] **PLANNED** - crash-loop safe mode;
+- [ ] **PLANNED** - terminal and GUI image-size comparison;
+- [ ] **PLANNED** - memory, CPU, input-latency, and frame-time measurements;
+- [ ] **PLANNED** - security and fault-injection tests; and
+- [ ] **PLANNED** - combined display, touch, microSD, C6 network, and
+  USB-console soak.
 
 Exit criterion: every acceptance gate below passes on the reference Kit C and
 the evidence is recorded in the repository.

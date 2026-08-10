@@ -1,7 +1,7 @@
 From 6c54a7ab9f8610a0506c2363fe59fdcb4a73c85a Mon Sep 17 00:00:00 2001
 From: MicroNUX Contributors <micronux@example.invalid>
 Date: Sat, 8 Aug 2026 12:00:00 -0700
-Subject: [PATCH 08/16] mmc: dw_mmc: support ESP32-P4 slot selection
+Subject: [PATCH 08/17] mmc: dw_mmc: support ESP32-P4 slot selection
 
 Modern dw_mmc exposes one logical MMC host and assumes DesignWare slot 0,
 although the ESP32-P4 controller routes the onboard wireless coprocessor

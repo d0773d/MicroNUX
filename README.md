@@ -62,7 +62,7 @@ The accepted M7 image is 6,025,008 bytes, leaving 266,448 bytes in the fixed
 display, fault, W^X, and supervisor workloads. SMP was compile-evaluated and
 is deliberately deferred because the two-hart image exceeds the partition and
 the current per-hart PMP contract is not safe for process migration. The Linux
-patch stack is review-separated into 6 platform, 16 peripheral, and 10
+patch stack is review-separated into 6 platform, 17 peripheral, and 10
 MicroNUX isolation patches.
 
 Linux also exposes the local, versioned `micronux-deviced` ABI to shell tools,

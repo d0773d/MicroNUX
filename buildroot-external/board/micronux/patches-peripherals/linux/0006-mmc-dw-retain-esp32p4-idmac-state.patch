@@ -1,7 +1,7 @@
 From 6a91bda0eaa652e53a8604b9e2d16b186ac439a1 Mon Sep 17 00:00:00 2001
 From: MicroNUX Project <micronux@example.invalid>
 Date: Sat, 8 Aug 2026 04:46:00 -0700
-Subject: [PATCH 06/16] mmc: dw: retain ESP32-P4 IDMAC state between requests
+Subject: [PATCH 06/17] mmc: dw: retain ESP32-P4 IDMAC state between requests
 
 The ESP32-P4 controller retains its IDMAC setup between requests. Resetting
 the DMA blocks immediately before every request leaves the second descriptor
