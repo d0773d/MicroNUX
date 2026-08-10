@@ -109,6 +109,9 @@ static esp_err_t probe_display_adapter(void)
 #define MICRONUX_SPLASH_BACKGROUND UINT16_C(0x0842)
 #define MICRONUX_SPLASH_FOREGROUND UINT16_C(0xffff)
 #define MICRONUX_SPLASH_ACCENT UINT16_C(0x05ff)
+#define MICRONUX_SPLASH_BAR_HEIGHT 28U
+#define MICRONUX_SPLASH_PROGRESS_GAP 36U
+#define MICRONUX_SPLASH_PERCENT_GAP 18U
 
 typedef struct {
     const char *name;
@@ -161,6 +164,7 @@ static micronux_display_dma_policy_t s_dma_policy;
 static bool s_dma_policy_ready;
 static void *s_framebuffer;
 static size_t s_framebuffer_size;
+static uint8_t s_progress_percent;
 
 static esp_err_t write_backlight_register(uint8_t reg, uint8_t value)
 {
@@ -217,6 +221,17 @@ typedef struct {
 } micronux_splash_glyph_t;
 
 static const micronux_splash_glyph_t s_splash_glyphs[] = {
+    {'%', {0x11, 0x02, 0x04, 0x08, 0x11, 0x00, 0x00}},
+    {'0', {0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e}},
+    {'1', {0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e}},
+    {'2', {0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f}},
+    {'3', {0x1e, 0x01, 0x01, 0x0e, 0x01, 0x01, 0x1e}},
+    {'4', {0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02}},
+    {'5', {0x1f, 0x10, 0x10, 0x1e, 0x01, 0x01, 0x1e}},
+    {'6', {0x0e, 0x10, 0x10, 0x1e, 0x11, 0x11, 0x0e}},
+    {'7', {0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}},
+    {'8', {0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e}},
+    {'9', {0x0e, 0x11, 0x11, 0x0f, 0x01, 0x01, 0x0e}},
     {'B', {0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e}},
     {'C', {0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e}},
     {'G', {0x0e, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0f}},
@@ -298,22 +313,86 @@ static void splash_draw_text(uint16_t *framebuffer, uint32_t width,
     }
 }
 
+static uint32_t splash_title_scale(uint32_t width)
+{
+    const uint32_t scale = width / 56U;
+    return scale < 4U ? 4U : scale;
+}
+
+static uint32_t splash_group_height(uint32_t width)
+{
+    const uint32_t title_scale = splash_title_scale(width);
+    const uint32_t subtitle_scale = title_scale / 3U;
+    return 7U * title_scale + 34U + 7U * subtitle_scale +
+           MICRONUX_SPLASH_PROGRESS_GAP + MICRONUX_SPLASH_BAR_HEIGHT +
+           MICRONUX_SPLASH_PERCENT_GAP + 7U * subtitle_scale;
+}
+
+static uint32_t render_boot_progress(uint16_t *framebuffer, uint32_t width,
+                                     uint32_t height, uint8_t percent)
+{
+    const uint32_t title_scale = splash_title_scale(width);
+    const uint32_t subtitle_scale = title_scale / 3U;
+    const uint32_t title_y = (height - splash_group_height(width)) / 2U;
+    const uint32_t bar_width = width * 3U / 4U;
+    const uint32_t bar_x = (width - bar_width) / 2U;
+    const uint32_t bar_y = title_y + 7U * title_scale + 34U +
+                           7U * subtitle_scale +
+                           MICRONUX_SPLASH_PROGRESS_GAP;
+    const uint32_t border = 3U;
+    const uint32_t inner_width = bar_width - 2U * border;
+    const uint32_t inner_height = MICRONUX_SPLASH_BAR_HEIGHT - 2U * border;
+    const uint32_t filled_width = inner_width * percent / 100U;
+
+    splash_fill_rect(framebuffer, width, height, bar_x, bar_y, bar_width,
+                     MICRONUX_SPLASH_BAR_HEIGHT,
+                     MICRONUX_SPLASH_FOREGROUND);
+    splash_fill_rect(framebuffer, width, height, bar_x + border,
+                     bar_y + border, inner_width, inner_height,
+                     MICRONUX_SPLASH_BACKGROUND);
+    splash_fill_rect(framebuffer, width, height, bar_x + border,
+                     bar_y + border, filled_width, inner_height,
+                     MICRONUX_SPLASH_ACCENT);
+
+    char percent_text[5];
+    size_t length = 0;
+    if (percent == 100U) {
+        percent_text[length++] = '1';
+        percent_text[length++] = '0';
+        percent_text[length++] = '0';
+    } else {
+        if (percent >= 10U) {
+            percent_text[length++] = (char)('0' + percent / 10U);
+        }
+        percent_text[length++] = (char)('0' + percent % 10U);
+    }
+    percent_text[length++] = '%';
+    percent_text[length] = '\0';
+
+    const uint32_t percent_y = bar_y + MICRONUX_SPLASH_BAR_HEIGHT +
+                               MICRONUX_SPLASH_PERCENT_GAP;
+    const uint32_t percent_width =
+        splash_text_width(percent_text, subtitle_scale);
+    splash_fill_rect(framebuffer, width, height, 0, percent_y, width,
+                     7U * subtitle_scale, MICRONUX_SPLASH_BACKGROUND);
+    splash_draw_text(framebuffer, width, height,
+                     (width - percent_width) / 2U, percent_y, percent_text,
+                     subtitle_scale, MICRONUX_SPLASH_FOREGROUND);
+    return bar_y;
+}
+
 static void render_boot_splash(uint16_t *framebuffer, uint32_t width,
                                uint32_t height)
 {
     static const char title[] = "MICRONUX";
     static const char subtitle[] = "BOOTING LINUX";
-    uint32_t title_scale = width / 56U;
-    if (title_scale < 4U) {
-        title_scale = 4U;
-    }
+    const uint32_t title_scale = splash_title_scale(width);
     const uint32_t subtitle_scale = title_scale / 3U;
     const uint32_t title_width = splash_text_width(title, title_scale);
     const uint32_t subtitle_width =
         splash_text_width(subtitle, subtitle_scale);
     const uint32_t title_height = 7U * title_scale;
-    const uint32_t group_height = title_height + 34U +
-                                  7U * subtitle_scale + 44U;
+    const uint32_t group_height = splash_group_height(width);
     const uint32_t title_x = (width - title_width) / 2U;
     const uint32_t title_y = (height - group_height) / 2U;
 
@@ -329,13 +408,7 @@ static void render_boot_splash(uint16_t *framebuffer, uint32_t width,
                      title_y + title_height + 34U, subtitle,
                      subtitle_scale, MICRONUX_SPLASH_ACCENT);
 
-    const uint32_t indicator_y = title_y + group_height - 10U;
-    const uint32_t indicator_x = width / 2U - 38U;
-    for (uint32_t index = 0; index < 5U; ++index) {
-        splash_fill_rect(framebuffer, width, height,
-                         indicator_x + index * 18U, indicator_y,
-                         10U, 10U, MICRONUX_SPLASH_ACCENT);
-    }
+    (void)render_boot_progress(framebuffer, width, height, 0);
 }
 
 static esp_err_t prepare_backlight_off(void)
@@ -534,9 +607,10 @@ esp_err_t micronux_mipi_dsi_prepare(void)
         TAG, "flush initial MIPI framebuffer");
     s_framebuffer = framebuffer;
     s_framebuffer_size = framebuffer_size;
+    s_progress_percent = 0;
     ESP_LOGI(TAG,
              "MICRONUX:M7:SPLASH state=ready title=MICRONUX"
-             " resolution=%ux%u format=rgb565",
+             " resolution=%ux%u format=rgb565 progress=0 mode=staged",
              s_profile.width, s_profile.height);
 
     const uint8_t brightness =
@@ -558,6 +632,47 @@ esp_err_t micronux_mipi_dsi_prepare(void)
              framebuffer, framebuffer_size,
              CONFIG_MICRONUX_MIPI_BACKLIGHT_PERCENT);
     return ESP_OK;
+#endif
+}
+
+void micronux_mipi_dsi_progress(uint8_t percent)
+{
+#if !CONFIG_MICRONUX_MIPI_DSI || CONFIG_MICRONUX_MIPI_PANEL_UNSELECTED
+    (void)percent;
+#else
+    if (s_framebuffer == NULL || percent <= s_progress_percent) {
+        return;
+    }
+    if (percent > 100U) {
+        percent = 100U;
+    }
+
+    const uint32_t first_row = render_boot_progress(
+        s_framebuffer, s_profile.width, s_profile.height, percent);
+    uint8_t *const flush_start =
+        (uint8_t *)s_framebuffer +
+        (size_t)first_row * s_profile.width * sizeof(uint16_t);
+    const uint32_t progress_rows = MICRONUX_SPLASH_BAR_HEIGHT +
+                                   MICRONUX_SPLASH_PERCENT_GAP +
+                                   7U * (splash_title_scale(
+                                       s_profile.width) / 3U);
+    const size_t flush_size =
+        (size_t)progress_rows * s_profile.width *
+        sizeof(uint16_t);
+    const esp_err_t result = esp_cache_msync(
+        flush_start, flush_size,
+        ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+        ESP_CACHE_MSYNC_FLAG_TYPE_DATA |
+        ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "MICRONUX:M7:SPLASH progress=%u state=stale error=%s",
+                 percent, esp_err_to_name(result));
+        return;
+    }
+    s_progress_percent = percent;
+    ESP_LOGI(TAG, "MICRONUX:M7:SPLASH progress=%u state=visible",
+             percent);
 #endif
 }
 

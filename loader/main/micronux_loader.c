@@ -53,6 +53,7 @@
 #define MICRONUX_LOADER_RESERVE_SIZE UINT32_C(0x00400000)
 #define MICRONUX_COMMS_RESERVE_SIZE UINT32_C(0x00100000)
 #define MICRONUX_KERNEL_ALIGNMENT UINT32_C(0x00400000)
+#define MICRONUX_KERNEL_READ_CHUNK (512U * 1024U)
 #define MICRONUX_CACHE_ALIGNMENT UINT32_C(128)
 
 #define MICRONUX_CONSOLE_TYPE_USB_SERIAL_JTAG UINT32_C(2)
@@ -315,6 +316,23 @@ static void verify_hash(const char *name, const void *data, size_t size,
         digest_to_hex(actual, actual_hex);
         ESP_LOGE(TAG, "%s SHA-256 mismatch: %s", name, actual_hex);
         fail("payload-sha256");
+    }
+}
+
+static void load_kernel(const esp_partition_t *partition, uint8_t *kernel,
+                        size_t size)
+{
+    size_t offset = 0;
+    while (offset < size) {
+        const size_t remaining = size - offset;
+        const size_t chunk = remaining < MICRONUX_KERNEL_READ_CHUNK ?
+                             remaining : MICRONUX_KERNEL_READ_CHUNK;
+        ESP_ERROR_CHECK(esp_partition_read(partition, offset,
+                                           kernel + offset, chunk));
+        offset += chunk;
+        const uint8_t percent = (uint8_t)(30U +
+            (uint64_t)offset * 50U / size);
+        micronux_mipi_dsi_progress(percent);
     }
 }
 
@@ -726,6 +744,7 @@ void app_main(void)
         (esp_partition_subtype_t)MICRONUX_METADATA_PARTITION_SUBTYPE,
         "metadata");
     validate_manifest(metadata_partition);
+    micronux_mipi_dsi_progress(10);
 
     const esp_partition_t *linux_partition = find_partition(
         (esp_partition_subtype_t)MICRONUX_LINUX_PARTITION_SUBTYPE, "linux");
@@ -756,6 +775,7 @@ void app_main(void)
         fail("dtb-magic");
     }
     verify_hash("DTB", dtb, s_payload.dtb_size, s_payload.dtb_sha256);
+    micronux_mipi_dsi_progress(20);
 
     const size_t kernel_allocation_size =
         align_up(s_payload.kernel_memory_size, MICRONUX_CACHE_ALIGNMENT);
@@ -770,15 +790,18 @@ void app_main(void)
                  kernel, s_payload.kernel_load_vaddr);
         fail("kernel-load-address");
     }
+    micronux_mipi_dsi_progress(25);
     if (!test_kernel_buffer((uint32_t *)kernel, kernel_allocation_size)) {
         fail("psram-integrity");
     }
-    ESP_ERROR_CHECK(esp_partition_read(linux_partition, 0, kernel,
-                                       s_payload.kernel_file_size));
+    micronux_mipi_dsi_progress(30);
+    load_kernel(linux_partition, kernel, s_payload.kernel_file_size);
     memset(kernel + s_payload.kernel_file_size, 0,
            kernel_allocation_size - s_payload.kernel_file_size);
+    micronux_mipi_dsi_progress(85);
     verify_hash("kernel", kernel, s_payload.kernel_file_size,
                 s_payload.kernel_sha256);
+    micronux_mipi_dsi_progress(90);
 
     esp_paddr_t kernel_paddr = 0;
     esp_paddr_t dtb_paddr = 0;
@@ -793,6 +816,7 @@ void app_main(void)
         dtb_paddr >= MICRONUX_LOADER_RESERVE_SIZE) {
         fail("psram-map-contract");
     }
+    micronux_mipi_dsi_progress(92);
 
     char kernel_sha_hex[65];
     char dtb_sha_hex[65];
@@ -875,6 +899,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_cache_msync(
         dtb, dtb_allocation_size,
         ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA));
+    micronux_mipi_dsi_progress(100);
 
     ESP_LOGI(TAG,
              "MICRONUX:M3:HANDOFF abi=%" PRIu32 " crc32=%08" PRIx32

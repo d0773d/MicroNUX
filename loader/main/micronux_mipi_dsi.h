@@ -58,6 +58,9 @@ typedef struct {
  */
 esp_err_t micronux_mipi_dsi_prepare(void);
 
+/* Update the loader splash with a monotonic, real-work progress value. */
+void micronux_mipi_dsi_progress(uint8_t percent);
+
 /*
  * Blank the backlight, quiesce loader scanout, publish the bounded ownership
  * contract, and leave DPI/framebuffer mode ready for Linux to restart.

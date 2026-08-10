@@ -33,8 +33,10 @@ contract. Linux validates and claims it as `/dev/fb0`, starts DW-GDMA hardware
 reload, confirms the first frame through the routed block-done IRQ, and only
 then restores the backlight. Linux owns the 100x80 framebuffer console and
 backlight control. The loader displays a built-in MicroNUX boot splash while
-Linux starts, then `/init` replaces it with a local status console showing
-display, storage, network, and USB-shell readiness. Kernel logs and the
+Linux starts. Its percentage bar advances only at validated boot milestones;
+the 30–80% interval is calculated from kernel bytes actually read from flash.
+`/init` then replaces it with a local status console showing display, storage,
+network, and USB-shell readiness. Kernel logs and the
 interactive recovery shell remain on native USB `ttyGS0`. A monitored
 50-microsecond timer only
 checks the bridge underrun latch. Framebuffer writes are paced in 512-byte

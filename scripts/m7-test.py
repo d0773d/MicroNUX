@@ -25,6 +25,7 @@ REQUIRED_MARKERS = (
     "fifo=[50105000,50106000) other=deny",
     "MICRONUX:M7:SPLASH state=ready title=MICRONUX "
     "resolution=800x1280 format=rgb565",
+    "MICRONUX:M7:SPLASH progress=100 state=visible",
     "MICRONUX:M7:DSI-BLANK state=ready backlight=off "
     "restore=linux-after-first-frame",
     "MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending "

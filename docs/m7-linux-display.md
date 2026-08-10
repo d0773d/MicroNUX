@@ -80,9 +80,16 @@ The framebuffer console attached as a 100x80 color console. The native USB
 
 The loader renders a dependency-free RGB565 splash directly into the
 ESP-IDF-allocated scanout buffer before cache writeback and backlight enable.
-It shows `MICRONUX`, `BOOTING LINUX`, and a simple progress indicator while
-the kernel starts. The splash has no decoder, filesystem, task, or callback
-dependency and is part of the same framebuffer handed to Linux.
+It shows `MICRONUX`, `BOOTING LINUX`, and a percentage bar while the kernel
+starts. The value is stage-weighted rather than time-based: 10% follows
+manifest validation, 20% follows DTB validation, 25–30% covers kernel-buffer
+allocation and PSRAM testing, 30–80% is calculated from kernel bytes actually
+read from flash, 85–90% brackets SHA-256 verification, 92% follows address-map
+validation, and 100% is drawn only after handoff construction and cache
+synchronization. There is no artificial boot delay. Each update writes back
+only the bar and percentage rows using ESP-IDF's unaligned cache-sync path.
+The splash has no decoder, filesystem, task, or callback dependency and is
+part of the same framebuffer handed to Linux.
 
 After storage and the C6-backed network interface have been probed, `/init`
 writes a compact status page to `/dev/tty1`. It reports the fixed display
@@ -101,7 +108,8 @@ running frames=3812->3816 error=00000000 underruns=0 chen=1
 The corresponding acceptance markers are:
 
 ```text
-MICRONUX:M7:SPLASH state=ready title=MICRONUX resolution=800x1280 format=rgb565
+MICRONUX:M7:SPLASH state=ready title=MICRONUX resolution=800x1280 format=rgb565 progress=0 mode=staged
+MICRONUX:M7:SPLASH progress=100 state=visible
 MICRONUX:M7:FB-CONSOLE state=ready tty=tty1 role=status usb=ttyGS0
 ```
 
@@ -156,18 +164,21 @@ kernel leak while retaining the original 16 KiB loss limit.
 
 ## Accepted artifacts and hardware result
 
-The 2026-08-10 clean build and physical three-boot gate produced:
+The 2026-08-10 accepted Linux artifacts and current physically gated loader
+are:
 
 | Artifact | Size | SHA-256 |
 | --- | ---: | --- |
 | Linux `Image` | 6,025,008 B | `7ab85bdc6a0a7761db2f326c5798b697206ec11952b109cac2925589663ab776` |
 | Device tree | 2,453 B | `3c31c2d81ad6c2a4017d20fc8364732eb829097291150a4894609b383f39a703` |
 | Metadata | 128 B | `d747b1bea5585ecdac07a88ec6ec6a08f891a62c945a329b4783358a6c3756a6` |
-| ESP-IDF loader | 280,016 B | `18358b4f3835f511ae8a8433823a7fd2be3801a928468e5df4f4c7e5120195e4` |
+| ESP-IDF loader | 281,152 B | `61bec5aadf74bab502a3f73ae14dbe8ef74c67cbc0a3fba2633458db6e9beb36` |
 
 The Linux image leaves 266,448 bytes in the fixed 6 MiB partition. The bFLT
-W^X audit passed all 14 userspace executables. Every boot returned identical
-arena accounting and general memory:
+W^X audit passed all 14 userspace executables. The staged-progress loader
+passed one complete physical M7 gate, including the mandatory visible 100%
+marker and zero display underruns. The previously accepted three-boot workload
+returned identical arena accounting and general memory:
 
 ```text
 M7 arena boot 1/3 passed: reserved=472 mapped=402 free=1576 arenas=5 mem_kib=8176->8176

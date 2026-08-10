@@ -160,6 +160,7 @@ $strings = (& riscv32-esp-elf-strings $elfPath | Out-String)
 if ($strings -notmatch "MICRONUX:M7:PMP baseline=pass early-deny=pass" -or
     $strings -notmatch "MICRONUX:M7:PMP-AUDIT state=fail" -or
     $strings -notmatch "MICRONUX:M7:DMA-PMS state=pass" -or
+    $strings -notmatch "MICRONUX:M7:SPLASH progress=%u state=visible" -or
     $strings -notmatch "MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending") {
     throw "M7 security or display handoff markers are missing from the linked loader."
 }
