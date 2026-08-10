@@ -330,7 +330,7 @@ def main() -> int:
             display_marker = (
                 "MICRONUX:M6:DSI state=ready profile=jd9365-800x1280 "
                 "resolution=800x1280 lanes=2 lane_mbps=1500 format=rgb565 "
-                "pattern=vertical-bars"
+                "pattern=framebuffer"
             )
         elif args.expect_mipi_adapter is not None:
             display_marker = (

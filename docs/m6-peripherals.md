@@ -472,7 +472,7 @@ py -3 scripts\m6-combined-test.py --port COM14 --boots 3 --timeout 420 --artifac
 
 The exact Kit C loader was flashed on revision-1.3 hardware. It read panel ID
 `93 65 04`, reported the stable marker below, and the physical panel visibly
-showed vertical color bars:
+showed vertical color bars during the M6 electrical diagnostic:
 
 ```text
 MICRONUX:M6:DSI state=ready profile=jd9365-800x1280 resolution=800x1280 lanes=2 lane_mbps=1500 format=rgb565 pattern=vertical-bars
@@ -489,8 +489,11 @@ allocation. M6-D0 remains the electrical and timing proof; it is not an
 emulator or an application-facing display path.
 
 M6-D1 and the minimal M6-D2 console gate are now complete in the isolated M7
-profile. The loader converts the initialized scanout to circular DMA and
-publishes a versioned contract, then Linux validates and claims `/dev/fb0`,
-the 100x80 framebuffer console, pattern selection, and backlight control. See
+profile. The production loader leaves DPI/framebuffer mode selected, quiesces
+scanout, and publishes a versioned descriptor-ring contract. Linux validates
+and claims `/dev/fb0`, programs hardware auto-reload, counts frames through the
+routed GDMA interrupt, and owns the 100x80 framebuffer console and backlight.
+The runtime hardware-pattern switch is intentionally disabled on P4 revision
+1.3 because returning from VPG can stall the external DPI stream. See
 the [M7 Linux-owned Kit C display report](m7-linux-display.md) for the exact
 ownership, DMA, security, and three-boot evidence.

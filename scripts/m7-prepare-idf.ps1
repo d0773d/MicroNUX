@@ -11,9 +11,9 @@ $expectedSourceHashes = [ordered]@{
     "components/esp_hw_support/port/esp32p4/cpu_region_protect.c" =
         "26c4c6a1fed3aa64ef7b331fab905f54bb33674fe71db561412a157dc9db131f"
     "components/esp_lcd/dsi/esp_lcd_panel_dpi.c" =
-        "c29522f024a49c950f124ea9908b9f3459cfce05d3fd6505ccf9abbd901e8466"
+        "f5f5ce836267020d72f5f9a7591647cc6606d8729fc26a12197889d03b3eeeb1"
     "components/esp_lcd/dsi/include/esp_lcd_mipi_dsi.h" =
-        "7ae53702e7337a0dafccbeeadd7a37ec4d32959843a711a6bb1afd3f50bd4bdb"
+        "eb60e0441b65229424eb55f9ffae4638186d4785a0279296c1b53c452dc44ba6"
 }
 $repoPath = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $patchPaths = @(

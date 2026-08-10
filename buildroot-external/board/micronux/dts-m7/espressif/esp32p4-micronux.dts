@@ -116,6 +116,8 @@
 		      <0x50081000 0x00001000>,
 		      <0x500c4000 0x00001000>;
 		reg-names = "dsi-host", "dsi-bridge", "gdma", "i2c";
+		interrupt-parent = <&cpu0_intc>;
+		interrupts = <18>;
 		espressif,handoff-address = <0x49f00000>;
 		espressif,uncached-offset = <0x40000000>;
 		status = "okay";

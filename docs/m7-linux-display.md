@@ -4,37 +4,54 @@ Status: **complete on the Waveshare Kit C JD9365 panel**
 
 MicroNUX now transfers the initialized 10.1-inch, 800x1280 JD9365 MIPI-DSI
 display from the ESP-IDF loader to Linux. Linux owns persistent scanout,
-framebuffer access, the framebuffer console, diagnostic-pattern selection,
-and backlight control after handoff. No loader callback or FreeRTOS task
-remains active.
+framebuffer access, the framebuffer console, and backlight control after
+handoff. The production path is framebuffer-only; hardware diagnostic-pattern
+selection is read-only because the ESP32-P4 revision-1.3 VPG-to-DPI transition
+can leave the panel blue. No loader callback or FreeRTOS task remains active.
 
 ## Ownership transfer
 
 The loader performs the controller-specific panel initialization because the
 upstream Linux tree does not contain this ESP32-P4/JD9365 bring-up path. It
-then disconnects the DPI producer, stops the one-shot GDMA transfer, converts
-the live descriptor into a non-interrupting circular list, and restarts only
-the display GDMA channel. I2C is left in a stable hardware state and all
-software ownership is dropped.
+leaves DPI/framebuffer mode selected, quiesces the ESP-IDF one-shot transfer,
+and publishes a four-descriptor ring as a validated handoff template. I2C is
+left in a stable hardware state and all software ownership is dropped; the
+loader does not restart scanout or enable a hardware VPG pattern.
+
+Linux validates the complete ring, claims the channel, copies the first
+descriptor's transfer parameters into the DW-GDMA channel registers, and sets
+source and destination multiblock mode to hardware reload (`CFG_LO=0x5`). The
+loader routes GDMA source 24 to CLIC input 18, which Linux receives as IRQ 3.
+Each block-done interrupt increments the frame counter and reloads the DSI
+bridge raw-word counter. A 50 microsecond high-resolution timer only monitors
+the bridge underrun latch; it does not restart frames. Linux begins scanout
+immediately and remains the sole controller.
+
+The fbdev write path uses one 512-byte bounce buffer per system call and a
+2 microsecond PSRAM-bus gap between bursts. This keeps ordinary writes bounded
+without exposing the reserved framebuffer through `mmap()`. Three consecutive
+2,048,000-byte writes completed in 0.529 seconds on hardware while frame IRQs
+continued, with zero GDMA errors and zero bridge underruns.
 
 A versioned, CRC-protected handoff structure at `0x49f00000` records:
 
 - ABI version and required ownership flags;
 - 800x1280 RGB565 geometry and 1,600-byte stride;
 - framebuffer address and exact 2,048,000-byte size;
-- the 64-byte circular GDMA descriptor and channel number; and
+- the 256-byte, four-entry GDMA descriptor ring and channel number; and
 - backlight I2C address, register, and last brightness.
 
-Linux validates every field, the CRC, all address ranges, descriptor source,
-DSI FIFO destination, circular link, valid/last/interrupt bits, and running
-channel before registering the device. A malformed or stale contract fails
-closed without exposing a framebuffer.
+Linux validates every field, the CRC, all address ranges, each descriptor's
+source, DSI FIFO destination, circular link, and valid/last/interrupt bits
+before registering the device. A malformed or stale contract fails closed
+without exposing a framebuffer.
 
 The accepted hardware handoff was:
 
 ```text
-MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending pattern=vertical-bars dma=circular channel=0 fb=[48040a80,48234a80) desc=[4ff3b5c0,4ff3b600) i2c=transferred contract=49f00000 crc32=3eac9698
-MICRONUX:M7:DSI-LINUX state=ready owner=linux fb=fb0 resolution=800x1280 format=rgb565 dma=ch0:circular backlight=linux mmap=denied
+MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending pattern=framebuffer dma=descriptor-ring channel=0 rearm=linux fb=[48040a80,48234a80) desc=[4ff3ba80,4ff3bb80) i2c=transferred contract=49f00000 crc32=8c6a97eb
+MICRONUX:M7:IRQ source=24 matrix=500d6060 clic=18 handoff=armed
+MICRONUX:M7:DSI-LINUX state=ready owner=linux fb=fb0 resolution=800x1280 format=rgb565 dma=ch0:auto-reload event=block-done-irq irq=3 health_poll_us=50 enable_delay_ms=0 underrun=monitored write_chunk=512 write_gap_us=2 backlight=linux mmap=denied
 ```
 
 ## Linux interfaces
@@ -44,8 +61,10 @@ The fixed-mode fbdev driver exposes:
 | Interface | Purpose |
 | --- | --- |
 | `/dev/fb0` | 800x1280 RGB565 framebuffer; ordinary `mmap()` is denied |
-| `/sys/bus/platform/devices/500a0000.display/ownership` | read-only ownership, channel, circular-DMA, and mmap policy |
-| `/sys/bus/platform/devices/500a0000.display/pattern` | `framebuffer`, `vertical`, `horizontal`, or `ber` |
+| `/sys/bus/platform/devices/500a0000.display/ownership` | read-only ownership, DMA channel, frame IRQ, and mmap policy |
+| `/sys/bus/platform/devices/500a0000.display/pattern` | read-only `framebuffer`; hardware VPG switching is disabled |
+| `/sys/bus/platform/devices/500a0000.display/scanout` | live frame-counter delta, DMA error, bridge-underrun count, and sampled channel-enable state |
+| `/sys/bus/platform/devices/500a0000.display/diagnostics` | raw handoff, descriptor, GDMA, and bridge-underrun state for privileged diagnosis |
 | `/sys/class/backlight/micronux-backlight/brightness` | Linux-owned 0-255 backlight level |
 
 The framebuffer console attached as a 100x80 color console. The native USB
@@ -61,12 +80,13 @@ MMIO.
 
 The P4 DMA permission controller grants the SDMMC master only its internal
 bounce/descriptor region. The exact display GDMA channel can read the rounded
-framebuffer range and read/write its rounded descriptor page; other DMA
-channels receive no access to those ranges. CPU PMP continues to exclude the
-loader/display reservation from U-mode. The accepted marker was:
+framebuffer range, read/write its rounded descriptor page, and write only the
+4 KiB DSI FIFO MMIO page. Other DMA channels receive no access to those
+ranges. CPU PMP continues to exclude the loader/display reservation from
+U-mode. The accepted marker was:
 
 ```text
-MICRONUX:M7:DMA-PMS state=pass region0=[4ff80000,4ff82000) sdmmc=rw:00000001 display=ch0:r:00000006:w:00000004 fb=[48040000,48235000) desc=[4ff3b000,4ff3c000) other=deny
+MICRONUX:M7:DMA-PMS state=pass region0=[4ff80000,4ff82000) sdmmc=rw:00000001 display=ch0:r:00000006:w:0000000c fb=[48040000,48235000) desc=[4ff3b000,4ff3c000) fifo=[50105000,50106000) other=deny
 ```
 
 This is a channel-scoped DMA boundary, not a general IOMMU. Each newly enabled
@@ -91,8 +111,13 @@ For an already-built and flashed image, run the serial gate directly:
 
 The gate executes identical full workloads until allocator high-water state is
 stable, then compares arena accounting and `MemFree` across another complete
-workload. This avoids counting the interactive shell's command-parser storage
-as a kernel leak while retaining the original 16 KiB loss limit.
+workload. Its display phase writes the complete 2,048,000-byte framebuffer,
+requires a positive `scanout` frame-counter delta with no GDMA error or bridge
+underrun, verifies that hardware test-pattern writes are rejected, and changes
+then restores brightness.
+This avoids treating successful RAM readback as proof of panel scanout. It
+also avoids counting the interactive shell's command-parser storage as a
+kernel leak while retaining the original 16 KiB loss limit.
 
 ## Accepted artifacts and hardware result
 
@@ -100,22 +125,23 @@ The 2026-08-09 clean build and physical three-boot gate produced:
 
 | Artifact | Size | SHA-256 |
 | --- | ---: | --- |
-| Linux `Image` | 6,024,944 B | `e88a4789e62f066d8893b6f40b274e098d63015b5dac37814e7f6ea34c749fd9` |
-| Device tree | 2,421 B | `86522efaf831c555b83218753c9a2449d4900784091beafc9e245a19d424feab` |
-| Metadata | 128 B | `8c5354fcf4d40f46e9c80b645495777dcf362d63b4c5cd01b39e4b3a7692fedc` |
-| ESP-IDF loader | 278,576 B | `4a9da9a53fea10812d4e67979ea755caedcf6ca85fd67beae149f1011867dcff` |
+| Linux `Image` | 6,025,008 B | `14181d0ad0fff782c5f039e25f863323851f83730818a2ef6223e7d524124f35` |
+| Device tree | 2,453 B | `3c31c2d81ad6c2a4017d20fc8364732eb829097291150a4894609b383f39a703` |
+| Metadata | 128 B | `b7f494fc602ad08db3699ede37e3461af8b877246052959977228b02044ec529` |
+| ESP-IDF loader | 278,464 B | `f6f4ef6974e74278430ddacb58abafd9fbe7392113169d73458bd5ff68025786` |
 
-The Linux image leaves 266,512 bytes in the fixed 6 MiB partition. The bFLT
+The Linux image leaves 266,448 bytes in the fixed 6 MiB partition. The bFLT
 W^X audit passed all 14 userspace executables. Every boot returned identical
 arena accounting and general memory:
 
 ```text
 M7 arena boot 1/3 passed: reserved=472 mapped=402 free=1576 arenas=5 mem_kib=8176->8176
 M7 arena boot 2/3 passed: reserved=472 mapped=402 free=1576 arenas=5 mem_kib=8176->8176
-M7 arena boot 3/3 passed: reserved=472 mapped=402 free=1576 arenas=5 mem_kib=8176->8176
+M7 arena boot 3/3 passed: reserved=472 mapped=402 free=1576 arenas=5 mem_kib=8168->8168
 ```
 
 Each boot also passed controlled SD writes, C6 association/DHCP and external
-ping, framebuffer and pattern checks, brightness change/restore, 19 U-mode
+ping, paced framebuffer writes with zero underruns, rejection of unsafe
+pattern switching, brightness change/restore, 19 U-mode
 fault cases, W^X, arena reuse, supervisor admission, timeout/output limits,
 and post-fault device-service liveness.

@@ -1,24 +1,25 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@example.invalid>
 Date: Sun, 9 Aug 2026 00:00:00 -0700
-Subject: [PATCH] esp_lcd: add quiescent DPI ownership handoff
+Subject: [PATCH] esp_lcd: add circular-ring DPI ownership handoff
 
-Allow a boot loader to replace the interrupt-restarted one-frame DSI transfer
-with a self-contained circular descriptor before transferring ownership to an
-operating system.  The returned addresses let the next owner program a narrow
-DMA-PMS policy instead of granting the channel access to all memory.
+Allow a boot loader to quiesce the interrupt-restarted DSI transfer, replace
+it with a four-descriptor circular ring, and publish its resources before
+transferring ownership to an operating system. The returned addresses let the
+next owner program a narrow DMA-PMS policy instead of granting the channel
+access to all memory.
 
 This API is intentionally carried as an exact-version MicroNUX integration
 patch; it is not presented as an upstream ESP-IDF interface.
 
 Signed-off-by: MicroNUX <micronux@example.invalid>
 ---
- components/esp_lcd/dsi/esp_lcd_panel_dpi.c     | 67 +++++++++++++++++++++
+ components/esp_lcd/dsi/esp_lcd_panel_dpi.c     | 80 +++++++++++++++++++++++
  .../dsi/include/esp_lcd_mipi_dsi.h             | 35 +++++++++++
- 2 files changed, 102 insertions(+)
+ 2 files changed, 115 insertions(+)
 
 diff --git a/components/esp_lcd/dsi/esp_lcd_panel_dpi.c b/components/esp_lcd/dsi/esp_lcd_panel_dpi.c
-index cba926b0..61263cbf 100644
+index cba926b0..706a74fe 100644
 --- a/components/esp_lcd/dsi/esp_lcd_panel_dpi.c
 +++ b/components/esp_lcd/dsi/esp_lcd_panel_dpi.c
 @@ -12,8 +12,10 @@
@@ -32,7 +33,7 @@ index cba926b0..61263cbf 100644
  
  typedef struct esp_lcd_dpi_panel_t esp_lcd_dpi_panel_t;
  
-@@ -711,6 +713,71 @@ esp_err_t esp_lcd_dpi_panel_set_pattern(esp_lcd_panel_handle_t panel, mipi_dsi_p
+@@ -711,6 +713,84 @@ esp_err_t esp_lcd_dpi_panel_set_pattern(esp_lcd_panel_handle_t panel, mipi_dsi_p
      return ESP_OK;
  }
  
@@ -47,7 +48,12 @@ index cba926b0..61263cbf 100644
 +
 +    dw_gdma_channel_handle_t chan = dpi_panel->dma_chan;
 +    dw_gdma_link_list_handle_t link_list = dpi_panel->link_lists[0];
++    dw_gdma_link_list_handle_t handoff_list = NULL;
 +    dw_gdma_lli_handle_t lli = dw_gdma_link_list_get_item(link_list, 0);
++    const dw_gdma_link_list_config_t handoff_list_config = {
++        .num_items = 4,
++        .link_type = DW_GDMA_LINKED_LIST_TYPE_SINGLY,
++    };
 +    int channel_id = -1;
 +
 +    ESP_RETURN_ON_ERROR(dw_gdma_channel_get_id(chan, &channel_id), TAG,
@@ -77,25 +83,33 @@ index cba926b0..61263cbf 100644
 +                        TAG, "DPI DMA channel did not quiesce");
 +    dw_gdma_ll_channel_clear_intr(dma, channel_id, UINT32_MAX);
 +
-+    ESP_RETURN_ON_ERROR(dw_gdma_lli_set_next(lli, lli), TAG,
-+                        "make DPI DMA list circular");
 +    const dw_gdma_block_markers_t markers = {
 +        .en_trans_done_intr = false,
 +        .is_valid = true,
 +        .is_last = false,
 +    };
-+    ESP_RETURN_ON_ERROR(dw_gdma_lli_set_block_markers(lli, markers), TAG,
-+                        "mark circular DPI descriptor");
-+    ESP_RETURN_ON_ERROR(dw_gdma_channel_use_link_list(chan, link_list), TAG,
-+                        "install circular DPI descriptor");
-+    ESP_RETURN_ON_ERROR(dw_gdma_channel_enable_ctrl(chan, true), TAG,
-+                        "start circular DPI DMA channel");
++    ESP_RETURN_ON_ERROR(dw_gdma_new_link_list(&handoff_list_config,
++                                               &handoff_list), TAG,
++                        "allocate DPI handoff descriptor ring");
++    for (size_t i = 0; i < handoff_list_config.num_items; i++) {
++        dw_gdma_lli_handle_t item =
++            dw_gdma_link_list_get_item(handoff_list, i);
++        dw_gdma_lli_handle_t next = dw_gdma_link_list_get_item(
++            handoff_list, (i + 1) % handoff_list_config.num_items);
 +
++        memcpy(item, lli, 64);
++        ESP_RETURN_ON_ERROR(dw_gdma_lli_set_next(item, next), TAG,
++                            "link DPI handoff descriptor ring");
++        ESP_RETURN_ON_ERROR(dw_gdma_lli_set_block_markers(item, markers), TAG,
++                            "mark DPI handoff ring descriptor");
++    }
++    ESP_RETURN_ON_ERROR(dw_gdma_channel_use_link_list(chan, handoff_list), TAG,
++                        "install DPI handoff descriptor ring");
 +    *handoff = (esp_lcd_dpi_panel_handoff_t) {
 +        .frame_buffer = dpi_panel->fbs[0],
 +        .frame_buffer_size = dpi_panel->fb_size,
-+        .dma_descriptor = lli,
-+        .dma_descriptor_size = 64,
++        .dma_descriptor = dw_gdma_link_list_get_item(handoff_list, 0),
++        .dma_descriptor_size = handoff_list_config.num_items * 64,
 +        .dma_channel = channel_id,
 +    };
 +    return ESP_OK;
@@ -105,15 +119,15 @@ index cba926b0..61263cbf 100644
  {
      ESP_RETURN_ON_FALSE(panel && cbs, ESP_ERR_INVALID_ARG, TAG, "invalid argument");
 diff --git a/components/esp_lcd/dsi/include/esp_lcd_mipi_dsi.h b/components/esp_lcd/dsi/include/esp_lcd_mipi_dsi.h
-index 99887f93..0a08e1c6 100644
+index 99887f93..4ad996c1 100644
 --- a/components/esp_lcd/dsi/include/esp_lcd_mipi_dsi.h
 +++ b/components/esp_lcd/dsi/include/esp_lcd_mipi_dsi.h
-@@ -142,6 +142,41 @@ esp_err_t esp_lcd_dpi_panel_get_frame_buffer(esp_lcd_panel_handle_t dpi_panel, u
+@@ -141,6 +141,41 @@ esp_err_t esp_lcd_dpi_panel_get_frame_buffer(esp_lcd_panel_handle_t dpi_panel, u
   */
  esp_err_t esp_lcd_dpi_panel_set_pattern(esp_lcd_panel_handle_t dpi_panel, mipi_dsi_pattern_type_t pattern);
  
 +/**
-+ * @brief Resources transferred by a circular DPI handoff
++ * @brief Resources transferred by a circular DMA-ring DPI handoff
 + *
 + * @note This exact-version extension is intended for a boot loader which
 + *       transfers a running display to an operating system. The caller must
@@ -130,10 +144,10 @@ index 99887f93..0a08e1c6 100644
 +/**
 + * @brief Prepare one DPI framebuffer for operating-system ownership
 + *
-+ * Stops the current one-shot transfer, changes its single descriptor into a
-+ * no-interrupt circular list, and restarts the channel. The DSI host pattern
-+ * state is not changed, so the operating system can claim the registers before
-+ * selecting framebuffer scanout.
++ * Stops the current transfer, constructs a valid no-interrupt descriptor ring
++ * whose entries repeat the framebuffer, and returns the resources needed to
++ * start it. The DSI host pattern state is not changed, so the operating system
++ * can claim the registers before selecting framebuffer scanout.
 + *
 + * @param[in] dpi_panel MIPI DPI panel handle
 + * @param[out] handoff Resources which must remain reserved for the new owner

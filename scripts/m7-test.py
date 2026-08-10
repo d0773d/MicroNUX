@@ -21,16 +21,21 @@ REQUIRED_MARKERS = (
     "MICRONUX:M7:PMP baseline=pass early-deny=pass "
     "handoff=13-14-unlocked overlay=13-14",
     "MICRONUX:M7:DMA-PMS state=pass region0=[4ff80000,4ff82000) "
-    "sdmmc=rw:00000001 display=ch",
+    "sdmmc=rw:00000001 display=ch0:r:00000006:w:0000000c",
+    "fifo=[50105000,50106000) other=deny",
     "MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending "
-    "pattern=vertical-bars dma=circular channel=",
+    "pattern=framebuffer dma=descriptor-ring channel=0 rearm=linux",
+    "MICRONUX:M7:IRQ source=24 matrix=500d6060 clic=18 handoff=armed",
     "MICRONUX:M7:PMP cached=7-10 direct=12-13 mode=per-mm+wx+tor+napot "
     "state=ready first=[",
     "MICRONUX:M7:POOL state=ready range=[49700000,49f00000) pages=2048 "
     "zero=on-arena+allocate ownership=per-mm",
     "Linux version 6.12.27",
     "MICRONUX:M7:DSI-LINUX state=ready owner=linux fb=fb0 "
-    "resolution=800x1280 format=rgb565 dma=ch",
+    "resolution=800x1280 format=rgb565 dma=ch0:auto-reload "
+    "event=block-done-irq irq=3 health_poll_us=50 enable_delay_ms=0 "
+    "underrun=monitored write_chunk=512 write_gap_us=2 "
+    "backlight=linux mmap=denied",
     "MICRONUX:M6:COMBINED:SHELL ready console=ttyGS0 network=nonblocking",
     "MICRONUX:M8:SERVICE state=ready abi=1.0",
     "MICRONUX:M7:JOB-SUPERVISOR state=ready uid=1000 gid=1000 "
@@ -48,7 +53,8 @@ REQUIRED_MARKERS = (
     "MICRONUX:M7:DMA:ONLINE:RC=0",
     "MICRONUX:M7:DMA:NETWORK:RC=0",
     "MICRONUX:M7:DISPLAY:PASS owner=linux fb=fb0 "
-    "pattern=framebuffer backlight=restored",
+    "pattern=framebuffer-only scanout=auto-reload writes=paced "
+    "backlight=restored",
     "MICRONUX:M5:PASS",
     "MICRONUX:M7:POOL-TEST:SELFTEST:RC=0",
     "MICRONUX:M7:POOL-TEST:REPEAT:RC=0",
@@ -70,7 +76,10 @@ REQUIRED_MARKERS = (
     "MICRONUX:M7:POOL-TEST:DONE",
 )
 
-WORKLOAD_REQUIRED_MARKERS = REQUIRED_MARKERS[13:-1]
+WORKLOAD_FIRST_REQUIRED = "MICRONUX:M7:POOL-PROBE:PASS"
+WORKLOAD_REQUIRED_MARKERS = REQUIRED_MARKERS[
+    REQUIRED_MARKERS.index(WORKLOAD_FIRST_REQUIRED):-1
+]
 
 FORBIDDEN_MARKERS = (
     "MICRONUX:M3:FAIL",
@@ -191,19 +200,24 @@ def workload_command() -> str:
         "BACKLIGHT=/sys/class/backlight/micronux-backlight; "
         "DISPLAY_RC=0; "
         "[ -c /dev/fb0 ] || DISPLAY_RC=1; "
-        "grep -q '^linux fb0 .* circular=1 mmap=denied$' "
+        "grep -q '^linux fb0 dma-channel=0 frame-irq=3 mmap=denied$' "
         "$DISPLAY/ownership || DISPLAY_RC=1; "
-        "echo vertical >$DISPLAY/pattern || DISPLAY_RC=1; "
-        "grep -q '^vertical$' $DISPLAY/pattern || DISPLAY_RC=1; "
-        "echo framebuffer >$DISPLAY/pattern || DISPLAY_RC=1; "
         "grep -q '^framebuffer$' $DISPLAY/pattern || DISPLAY_RC=1; "
+        "if echo vertical 2>/dev/null >$DISPLAY/pattern; then "
+        "DISPLAY_RC=1; fi; "
+        "grep -q '^framebuffer$' $DISPLAY/pattern || DISPLAY_RC=1; "
+        "dd if=/dev/zero of=/dev/fb0 bs=4096 count=500 "
+        "2>/dev/null || DISPLAY_RC=1; "
+        "grep -q '^running frames=.* error=00000000 underruns=0 chen=' "
+        "$DISPLAY/scanout || DISPLAY_RC=1; "
         "OLD_BRIGHTNESS=$(cat $BACKLIGHT/brightness) || DISPLAY_RC=1; "
         "echo 64 >$BACKLIGHT/brightness || DISPLAY_RC=1; "
         "[ \"$(cat $BACKLIGHT/brightness)\" = 64 ] || DISPLAY_RC=1; "
         "echo $OLD_BRIGHTNESS >$BACKLIGHT/brightness || DISPLAY_RC=1; "
         "if [ \"$DISPLAY_RC\" -eq 0 ]; then "
         "echo MICRONUX:M7:DISPLAY:PASS owner=linux fb=fb0 "
-        "pattern=framebuffer backlight=restored; else "
+        "pattern=framebuffer-only scanout=auto-reload writes=paced "
+        "backlight=restored; else "
         "echo MICRONUX:M7:DISPLAY:FAIL rc=$DISPLAY_RC; fi; "
         "/usr/bin/micronux-selftest; "
         "echo MICRONUX:M7:POOL-TEST:SELFTEST:RC=$?; "
@@ -584,7 +598,7 @@ def main() -> int:
             log,
             "MICRONUX:M6:DSI state=ready profile=jd9365-800x1280 "
             "resolution=800x1280 lanes=2 lane_mbps=1500 format=rgb565 "
-            "pattern=vertical-bars",
+            "pattern=framebuffer",
         ):
             missing.append("MICRONUX:M6:DSI exact Kit C JD9365 profile")
         forbidden = [marker for marker in FORBIDDEN_MARKERS if marker_seen(log, marker)]

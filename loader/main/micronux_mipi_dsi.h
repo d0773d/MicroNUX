@@ -11,10 +11,13 @@
 #define MICRONUX_DISPLAY_HANDOFF_ADDRESS UINT32_C(0x49f00000)
 #define MICRONUX_DISPLAY_HANDOFF_MAGIC UINT32_C(0x4d4e5844)
 #define MICRONUX_DISPLAY_HANDOFF_ABI_VERSION UINT16_C(1)
+#define MICRONUX_DSI_FIFO_ADDRESS UINT32_C(0x50105000)
+#define MICRONUX_DSI_FIFO_WINDOW_START UINT32_C(0x50105000)
+#define MICRONUX_DSI_FIFO_WINDOW_END UINT32_C(0x50106000)
 
 #define MICRONUX_DISPLAY_FLAG_ACTIVE (UINT32_C(1) << 0)
 #define MICRONUX_DISPLAY_FLAG_RGB565 (UINT32_C(1) << 1)
-#define MICRONUX_DISPLAY_FLAG_DMA_CIRCULAR (UINT32_C(1) << 2)
+#define MICRONUX_DISPLAY_FLAG_DMA_RING (UINT32_C(1) << 2)
 #define MICRONUX_DISPLAY_FLAG_I2C_TRANSFERRED (UINT32_C(1) << 3)
 
 typedef struct {
@@ -41,6 +44,8 @@ typedef struct {
     uint32_t framebuffer_end;
     uint32_t descriptor_start;
     uint32_t descriptor_end;
+    uint32_t fifo_start;
+    uint32_t fifo_end;
     uint32_t dma_channel;
 } micronux_display_dma_policy_t;
 
@@ -53,9 +58,9 @@ typedef struct {
 esp_err_t micronux_mipi_dsi_prepare(void);
 
 /*
- * Convert the loader's one-shot scanout into an interrupt-free circular DMA
- * transfer, publish its bounded ownership contract, and leave the diagnostic
- * pattern active until the Linux driver claims the controller.
+ * Quiesce the loader's scanout, publish its bounded descriptor-ring ownership
+ * contract, and leave DPI/framebuffer mode active for Linux to restart with
+ * hardware GDMA reload. No loader callback remains active after this call.
  */
 esp_err_t micronux_mipi_dsi_handoff(void);
 

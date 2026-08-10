@@ -102,6 +102,22 @@ readonly IMAGE_DIR="${OUTPUT_DIR}/images"
 readonly KERNEL_DIR="${OUTPUT_DIR}/build/linux-${LINUX_VERSION}"
 readonly DTB="${IMAGE_DIR}/esp32p4-micronux.dtb"
 readonly LINUX_PARTITION_SIZE=$((0x600000))
+
+# Buildroot does not always invalidate an already-configured kernel when an
+# out-of-tree DTS changes. Refresh the canonical board source and build its
+# exact target explicitly so incremental builds cannot package a stale DTB.
+install -m 0644 \
+	"${EXTERNAL_DIR}/board/micronux/dts-m7/espressif/esp32p4-micronux.dts" \
+	"${KERNEL_DIR}/arch/riscv/boot/dts/espressif/esp32p4-micronux.dts"
+make -C "${KERNEL_DIR}" \
+	ARCH=riscv \
+	CROSS_COMPILE="${OUTPUT_DIR}/host/bin/riscv32-buildroot-linux-uclibc-" \
+	-j"${JOBS}" \
+	espressif/esp32p4-micronux.dtb
+install -m 0644 \
+	"${KERNEL_DIR}/arch/riscv/boot/dts/espressif/esp32p4-micronux.dtb" \
+	"${DTB}"
+
 readonly image_size="$(stat --format='%s' "${IMAGE_DIR}/Image")"
 if ((image_size > LINUX_PARTITION_SIZE)); then
 	printf 'M7 Image is too large for the Linux partition: %s > %s bytes\n' \
@@ -115,6 +131,12 @@ if ! grep -qx 'CONFIG_MICRONUX_ESP32P4_ISOLATION=y' "${KERNEL_DIR}/.config"; the
 fi
 if ! grep -aq 'micronux,esp32p4-user-pool' "${DTB}"; then
 	printf 'M7 DTB is missing the dedicated user-pool contract.\n' >&2
+	exit 1
+fi
+if ! "${OUTPUT_DIR}/host/bin/dtc" -I dtb -O dts "${DTB}" 2>/dev/null |
+	sed -n '/display@500a0000 {/,/};/p' |
+	grep -q 'interrupts = <0x12>;'; then
+	printf 'M7 DTB did not route the display GDMA interrupt to CLIC 18.\n' >&2
 	exit 1
 fi
 

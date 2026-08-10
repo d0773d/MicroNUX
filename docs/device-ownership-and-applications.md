@@ -130,7 +130,8 @@ Loader-owned bring-up code becomes a Linux driver or trusted Linux service
 before it is exposed as a general application feature. In particular:
 
 - the loader MIPI color-bar path is only an electrical diagnostic; the M7
-  profile now transfers persistent scanout and backlight control to Linux;
+  profile now transfers the display contract and backlight control to Linux,
+  which owns hardware-reload GDMA scanout and rejects runtime VPG switching;
 - the provisioning loader may prepare C6 credentials before boot, but Linux
   owns normal SDIO networking, connection state, retry policy, and application
   network access;
@@ -180,10 +181,12 @@ representative workflow, Linux-owned microSD/C6 device-status observation:
 
 This closes the application-boundary acceptance gate for the read-only
 representative workflow. M7 separately closes persistent display ownership:
-Linux validates the loader contract, owns circular scanout as `/dev/fb0`,
-attaches the framebuffer console, and owns pattern and backlight controls.
-Direct framebuffer `mmap()` remains denied, and ordinary jobs remain blocked
-from raw display MMIO and DMA.
+Linux validates the loader's circular handoff contract, owns `/dev/fb0`,
+programs hardware reload, counts block-done frame interrupts, attaches the
+framebuffer console, paces writes, and owns backlight control. The pattern
+interface is read-only `framebuffer` because runtime VPG-to-DPI transitions are
+unsafe on revision-1.3 silicon. Direct framebuffer `mmap()` remains denied,
+and ordinary jobs remain blocked from raw display MMIO and DMA.
 
 Display ownership does not yet provide the three application surfaces with a
 versioned drawing/control API. A future display service, shell command,

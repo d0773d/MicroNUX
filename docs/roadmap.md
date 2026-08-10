@@ -130,7 +130,9 @@ default-off power gate. Kit C was identified as the 10.1-inch JD9365 panel;
 the exact profile read ID `93 65 04` and produced visible vertical bars at
 800x1280 over two 1500-Mbps lanes. The loader-owned result remains the M6
 electrical proof. The accepted M7 profile now transfers persistent circular
-scanout, I2C/backlight state, and framebuffer ownership to Linux.
+handoff state, I2C/backlight state, and framebuffer ownership to Linux. Linux
+programs P4 display GDMA hardware reload, counts block-done frames through the
+routed interrupt, paces framebuffer writes, and monitors bridge underruns.
 
 ## M7 - Isolation, SMP, and upstream evaluation
 
@@ -165,9 +167,11 @@ service liveness, and exact pool/general-memory recovery. WP6 adds a
 kernel-to-user write checks, physical W^X fault tests, and fail-closed DMA
 permissions for the active SDMMC and display channels. The exact Kit C display
 is now Linux-owned as `/dev/fb0`, a 100x80 framebuffer console, sysfs pattern
-control, and a standard backlight device; framebuffer `mmap()` is denied.
-Three reset boots passed the complete SD/C6/display/isolation workload with
-identical arena accounting and `MemFree` at 8,176 KiB.
+control, live scanout/diagnostic state, and a standard backlight device;
+framebuffer `mmap()` is denied. The display DMA boundary covers only its
+framebuffer reads, descriptor read/write access, and DSI FIFO writes. Three
+reset boots passed the complete SD/C6/display/isolation workload with identical
+arena accounting and `MemFree`.
 
 SMP is explicitly deferred: the compile-only two-hart image exceeds the fixed
 partition and disables the per-hart isolation contract. The Linux changes are

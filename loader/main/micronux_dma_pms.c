@@ -21,6 +21,7 @@ static const char *const TAG = "micronux_dma";
 #define MICRONUX_DMA_REGION0_MASK UINT32_C(1)
 #define MICRONUX_DMA_REGION1_MASK (UINT32_C(1) << 1)
 #define MICRONUX_DMA_REGION2_MASK (UINT32_C(1) << 2)
+#define MICRONUX_DMA_REGION3_MASK (UINT32_C(1) << 3)
 #define MICRONUX_DMA_WINDOW_START UINT32_C(0x4ff80000)
 #define MICRONUX_DMA_WINDOW_END UINT32_C(0x4ff82000)
 #define MICRONUX_DMA_EMPTY_LOW UINT32_C(0xfffff000)
@@ -162,8 +163,10 @@ esp_err_t micronux_dma_pms_prepare(void)
                      display.framebuffer_end);
         write_region(2, display.descriptor_start,
                      display.descriptor_end);
+        write_region(3, display.fifo_start,
+                     display.fifo_end);
     }
-    for (uint32_t region = display_active ? 3U : 1U;
+    for (uint32_t region = display_active ? 4U : 1U;
          region < MICRONUX_DMA_REGION_COUNT;
          ++region) {
         write_region(region, MICRONUX_DMA_EMPTY_LOW,
@@ -177,7 +180,8 @@ esp_err_t micronux_dma_pms_prepare(void)
                   MICRONUX_DMA_REGION1_MASK |
                       MICRONUX_DMA_REGION2_MASK);
         REG_WRITE(s_gdma_write_permission_registers[display.dma_channel],
-                  MICRONUX_DMA_REGION2_MASK);
+                  MICRONUX_DMA_REGION2_MASK |
+                      MICRONUX_DMA_REGION3_MASK);
     }
     __asm__ __volatile__("fence iorw, iorw" ::: "memory");
 
@@ -194,13 +198,15 @@ esp_err_t micronux_dma_pms_prepare(void)
         (!region_matches(1, display.framebuffer_start,
                          display.framebuffer_end) ||
          !region_matches(2, display.descriptor_start,
-                         display.descriptor_end))) {
+                         display.descriptor_end) ||
+         !region_matches(3, display.fifo_start,
+                         display.fifo_end))) {
         ESP_LOGE(TAG,
                  "MICRONUX:M7:DMA-PMS state=fail"
                  " reason=display-regions");
         return ESP_ERR_INVALID_STATE;
     }
-    for (uint32_t region = display_active ? 3U : 1U;
+    for (uint32_t region = display_active ? 4U : 1U;
          region < MICRONUX_DMA_REGION_COUNT;
          ++region) {
         if (!region_matches(region, MICRONUX_DMA_EMPTY_LOW,
@@ -230,7 +236,8 @@ esp_err_t micronux_dma_pms_prepare(void)
         } else if (display_active &&
                    reg == s_gdma_write_permission_registers[
                               display.dma_channel]) {
-            expected = MICRONUX_DMA_REGION2_MASK;
+            expected = MICRONUX_DMA_REGION2_MASK |
+                       MICRONUX_DMA_REGION3_MASK;
         }
 
         if (REG_READ(reg) != expected) {
@@ -250,13 +257,15 @@ esp_err_t micronux_dma_pms_prepare(void)
                  " sdmmc=rw:%08" PRIx32
                  " display=ch%" PRIu32 ":r:%08" PRIx32 ":w:%08" PRIx32
                  " fb=[%08" PRIx32 ",%08" PRIx32 ")"
-                 " desc=[%08" PRIx32 ",%08" PRIx32 ") other=deny",
+                 " desc=[%08" PRIx32 ",%08" PRIx32 ")"
+                 " fifo=[%08" PRIx32 ",%08" PRIx32 ") other=deny",
                  MICRONUX_DMA_WINDOW_START, MICRONUX_DMA_WINDOW_END,
                  MICRONUX_DMA_REGION0_MASK, display.dma_channel,
                  MICRONUX_DMA_REGION1_MASK | MICRONUX_DMA_REGION2_MASK,
-                 MICRONUX_DMA_REGION2_MASK,
+                 MICRONUX_DMA_REGION2_MASK | MICRONUX_DMA_REGION3_MASK,
                  display.framebuffer_start, display.framebuffer_end,
-                 display.descriptor_start, display.descriptor_end);
+                 display.descriptor_start, display.descriptor_end,
+                 display.fifo_start, display.fifo_end);
     } else {
         ESP_LOGI(TAG,
                  "MICRONUX:M7:DMA-PMS state=pass"

@@ -27,12 +27,17 @@ external IPv4/DNS, and router reconnect holdoff through attempt 7. MicroNUX
 does not build or flash replacement C6 firmware.
 
 The loader initializes the exact 800x1280, two-lane, 1500-Mbps/lane JD9365
-panel, converts its scanout to bounded circular GDMA, and publishes a
-versioned CRC-protected contract. Linux validates and claims it as `/dev/fb0`,
-attaches a 100x80 framebuffer console, and owns patterns and backlight control.
-Userspace framebuffer `mmap()` is denied. DMA permissions grant only SDMMC and
-the exact display channel their bounded buffers/descriptors; all other channel
-access to those regions is denied.
+panel, leaves DPI/framebuffer mode selected, quiesces its one-shot transfer,
+and publishes a bounded, CRC-protected descriptor-ring contract. Linux
+validates and claims it as `/dev/fb0`, programs DW-GDMA hardware auto-reload,
+counts frames through the routed block-done IRQ, attaches a 100x80 framebuffer
+console, and owns backlight control. A monitored 50-microsecond timer only
+checks the bridge underrun latch. Framebuffer writes are paced in 512-byte
+bursts to protect PSRAM scanout bandwidth, while userspace `mmap()` and the
+unsafe revision-1.3 hardware-pattern transition are denied. DMA permissions
+grant only SDMMC and the exact display channel their bounded
+buffers/descriptors plus the DSI FIFO page; all other channel access to those
+regions is denied.
 
 M7 routes userspace through a zero-on-allocation 8 MiB pool with one contiguous
 arena per `mm_struct`. Every U-mode return installs and verifies a per-process
@@ -44,9 +49,9 @@ descriptor, memory, time, and output budgets. Physical fault tests cover
 privilege, read/write/execute, cross-process access, arena reuse, failed exec,
 malformed pointers, and W^X.
 
-The accepted M7 image is 6,024,944 bytes, leaving 266,512 bytes in the fixed
+The accepted M7 image is 6,025,008 bytes, leaving 266,448 bytes in the fixed
 6 MiB partition. Its three-boot gate returned identical arena accounting and
-`MemFree` (8,176->8,176 KiB) on every boot while repeating SD, networking,
+`MemFree` on every boot while repeating SD, networking,
 display, fault, W^X, and supervisor workloads. SMP was compile-evaluated and
 is deliberately deferred because the two-hart image exceeds the partition and
 the current per-hart PMP contract is not safe for process migration. The Linux

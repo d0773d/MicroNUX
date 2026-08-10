@@ -331,14 +331,16 @@ executables for the required 128-byte boundary.
 WP6 also audits every DMA master enabled by the accepted image. The loader's
 P4 DMA permission controller grants SDMMC read/write access only to its
 internal bounce/descriptor window. The exact display GDMA channel can read
-only the rounded framebuffer range and read/write only its descriptor page;
-other DMA channels are denied. Linux verifies the versioned circular-display
-contract before claiming `/dev/fb0`, and userspace framebuffer `mmap()` is
-disabled. See the [Linux-owned display report](m7-linux-display.md).
+only the rounded framebuffer range, read/write only its descriptor page, and
+write only the DSI FIFO page; other DMA channels are denied. Linux verifies the
+versioned circular-display contract before claiming `/dev/fb0`, then programs
+hardware-reload scanout, counts frames through a routed block-done
+interrupt, paces CPU writes to avoid bridge underruns, and disables userspace
+framebuffer `mmap()`. See the [Linux-owned display report](m7-linux-display.md).
 
 The final WP6/display candidate passed three independent ROM resets with the
 same payload hash, complete SD/C6/display workloads, exact arena accounting,
-and `MemFree` stable at 8,176 KiB before and after every measured workload.
+and stable `MemFree` before and after every measured workload.
 
 ## Exact guarantee and remaining limits
 

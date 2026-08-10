@@ -96,6 +96,10 @@
 #define ESP32P4_INTERRUPT_MAP_MASK UINT32_C(0x3F)
 #define MICRONUX_USB_SERIAL_JTAG_CLIC_ID UINT32_C(16)
 
+/* DW-GDMA is peripheral interrupt source 24 on ESP32-P4. */
+#define ESP32P4_CORE0_GDMA_INT_MAP UINT32_C(0x500D6060)
+#define MICRONUX_GDMA_CLIC_ID UINT32_C(18)
+
 /*
  * Waveshare ESP32-P4-Module-DEV-KIT onboard microSD wiring.  Slot 0 uses
  * the P4's dedicated IOMUX pins and SD1_VDD is supplied by LDO_VO4.
@@ -350,6 +354,18 @@ static void prepare_usb_serial_jtag_for_linux(void)
          ESP32P4_INTERRUPT_MAP_MASK) !=
         MICRONUX_USB_SERIAL_JTAG_CLIC_ID) {
         fail("usb-serial-jtag-route");
+    }
+}
+
+static void prepare_gdma_for_linux(void)
+{
+    const uint32_t map = read_reg32(ESP32P4_CORE0_GDMA_INT_MAP);
+
+    write_reg32(ESP32P4_CORE0_GDMA_INT_MAP,
+        (map & ~ESP32P4_INTERRUPT_MAP_MASK) | MICRONUX_GDMA_CLIC_ID);
+    if ((read_reg32(ESP32P4_CORE0_GDMA_INT_MAP) &
+         ESP32P4_INTERRUPT_MAP_MASK) != MICRONUX_GDMA_CLIC_ID) {
+        fail("gdma-route");
     }
 }
 
@@ -887,6 +903,11 @@ void app_main(void)
     if (micronux_mipi_dsi_handoff() != ESP_OK) {
         fail("mipi-dsi-handoff");
     }
+    prepare_gdma_for_linux();
+    ESP_LOGI(TAG,
+             "MICRONUX:M7:IRQ source=24 matrix=%08" PRIx32
+             " clic=%" PRIu32 " handoff=armed",
+             ESP32P4_CORE0_GDMA_INT_MAP, MICRONUX_GDMA_CLIC_ID);
     prepare_sdmmc_for_linux();
     if (micronux_dma_pms_prepare() != ESP_OK) {
         fail("dma-pms");

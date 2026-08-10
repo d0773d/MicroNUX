@@ -105,6 +105,7 @@ static esp_err_t probe_display_adapter(void)
 #define MICRONUX_DSI_INTERNAL_SRAM_END UINT32_C(0x50000000)
 #define MICRONUX_DSI_NONCACHE_OFFSET UINT32_C(0x40000000)
 #define MICRONUX_DSI_DMA_DESCRIPTOR_ALIGNMENT UINT32_C(64)
+#define MICRONUX_DSI_DMA_DESCRIPTOR_COUNT UINT32_C(4)
 
 typedef struct {
     const char *name;
@@ -374,10 +375,6 @@ esp_err_t micronux_mipi_dsi_prepare(void)
                         "create selected MIPI panel");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_panel, true), TAG,
                         "turn MIPI panel on");
-    ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_set_pattern(
-                            s_panel, MIPI_DSI_PATTERN_BAR_VERTICAL),
-                        TAG, "enable MIPI hardware color bars");
-
     void *framebuffer = NULL;
     ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_get_frame_buffer(
                             s_panel, 1, &framebuffer),
@@ -416,7 +413,7 @@ esp_err_t micronux_mipi_dsi_prepare(void)
 
     ESP_LOGI(TAG,
              "MICRONUX:M6:DSI state=ready profile=%s resolution=%ux%u"
-             " lanes=%u lane_mbps=%u format=rgb565 pattern=vertical-bars"
+             " lanes=%u lane_mbps=%u format=rgb565 pattern=framebuffer"
              " fb=%p bytes=%zu ownership=loader backlight=%u"
              " i2c=retained-for-linux",
              s_profile.name, s_profile.width, s_profile.height,
@@ -449,7 +446,7 @@ esp_err_t micronux_mipi_dsi_handoff(void)
     esp_lcd_dpi_panel_handoff_t dsi_handoff = {0};
     ESP_RETURN_ON_ERROR(
         esp_lcd_dpi_panel_prepare_handoff(s_panel, &dsi_handoff), TAG,
-        "prepare circular MIPI DPI handoff");
+        "prepare descriptor-ring MIPI DPI handoff");
 
     const uintptr_t framebuffer_start =
         dma_bus_address((uintptr_t)dsi_handoff.frame_buffer);
@@ -468,7 +465,8 @@ esp_err_t micronux_mipi_dsi_handoff(void)
         (descriptor_start &
          (MICRONUX_DSI_DMA_DESCRIPTOR_ALIGNMENT - 1U)) != 0 ||
         dsi_handoff.dma_descriptor_size !=
-            MICRONUX_DSI_DMA_DESCRIPTOR_ALIGNMENT ||
+            MICRONUX_DSI_DMA_DESCRIPTOR_ALIGNMENT *
+                MICRONUX_DSI_DMA_DESCRIPTOR_COUNT ||
         dsi_handoff.dma_channel < 0 || dsi_handoff.dma_channel > 3) {
         ESP_LOGE(TAG,
                  "MICRONUX:M7:DSI-HANDOFF state=fail"
@@ -492,7 +490,7 @@ esp_err_t micronux_mipi_dsi_handoff(void)
         .struct_size = sizeof(*handoff),
         .flags = MICRONUX_DISPLAY_FLAG_ACTIVE |
                  MICRONUX_DISPLAY_FLAG_RGB565 |
-                 MICRONUX_DISPLAY_FLAG_DMA_CIRCULAR |
+                 MICRONUX_DISPLAY_FLAG_DMA_RING |
                  MICRONUX_DISPLAY_FLAG_I2C_TRANSFERRED,
         .width = s_profile.width,
         .height = s_profile.height,
@@ -531,17 +529,20 @@ esp_err_t micronux_mipi_dsi_handoff(void)
         .framebuffer_end = align_up_4k((uint32_t)framebuffer_end),
         .descriptor_start = align_down_4k((uint32_t)descriptor_start),
         .descriptor_end = align_up_4k((uint32_t)descriptor_end),
+        .fifo_start = MICRONUX_DSI_FIFO_WINDOW_START,
+        .fifo_end = MICRONUX_DSI_FIFO_WINDOW_END,
         .dma_channel = (uint32_t)dsi_handoff.dma_channel,
     };
     s_dma_policy_ready = true;
 
     ESP_LOGI(TAG,
              "MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending"
-             " pattern=vertical-bars dma=circular channel=%d"
+             " pattern=framebuffer dma=descriptor-ring channel=%d rearm=linux"
              " fb=[%08" PRIxPTR ",%08" PRIxPTR ")"
              " desc=[%08" PRIxPTR ",%08" PRIxPTR ") i2c=transferred"
              " contract=%08" PRIx32 " crc32=%08" PRIx32,
-             dsi_handoff.dma_channel, framebuffer_start, framebuffer_end,
+             dsi_handoff.dma_channel,
+             framebuffer_start, framebuffer_end,
              descriptor_start, descriptor_end,
              MICRONUX_DISPLAY_HANDOFF_ADDRESS, handoff->crc32);
     return ESP_OK;
