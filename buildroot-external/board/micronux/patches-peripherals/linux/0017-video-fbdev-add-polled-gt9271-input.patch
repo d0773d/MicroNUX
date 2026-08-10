@@ -70,20 +70,7 @@ index 22fbf4c..fea02e1 100644
  	int irq;
  	struct mutex lock;
  	struct micronux_display_handoff_v1 handoff;
-@@ -166,31 +181,28 @@ struct micronux_dsi {
- 	u32 scanout_frames;
- 	u32 last_dma_error;
- 	u32 bridge_underruns;
-+	u32 touch_reads;
-+	u32 touch_errors;
-+	u32 touch_poll_ms;
-+	u8 touch_address;
-+	char touch_product[5];
-+	bool touch_down;
- 	struct hrtimer scanout_timer;
- 	struct delayed_work scanout_enable_work;
- };
- 
+@@ -181,24 +196,15 @@ struct micronux_dsi {
 -static int micronux_i2c_write(struct micronux_dsi *dsi, u8 reg, u8 value)
 +static int micronux_i2c_prepare_locked(struct micronux_dsi *dsi)
  {
@@ -497,4 +484,3 @@ index 22fbf4c..fea02e1 100644
  	unregister_framebuffer(dsi->info);
  	dsi->backlight->props.power = FB_BLANK_POWERDOWN;
  	backlight_update_status(dsi->backlight);
-

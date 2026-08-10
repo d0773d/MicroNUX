@@ -48,7 +48,7 @@ diff --git a/drivers/video/fbdev/Makefile b/drivers/video/fbdev/Makefile
 diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
 --- /dev/null
 +++ b/drivers/video/fbdev/esp32p4-dsi.c
-@@ -0,0 +1,848 @@
+@@ -0,0 +1,935 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * ESP32-P4 MIPI-DSI ownership-transfer framebuffer for MicroNUX.
@@ -217,6 +217,14 @@ diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi
 +	u32 scanout_frames;
 +	u32 last_dma_error;
 +	u32 bridge_underruns;
++	bool scanout_ready;
++	bool scanout_active;
++	u32 touch_reads;
++	u32 touch_errors;
++	u32 touch_poll_ms;
++	u8 touch_address;
++	char touch_product[5];
++	bool touch_down;
 +	struct hrtimer scanout_timer;
 +	struct delayed_work scanout_enable_work;
 +};
@@ -377,15 +385,7 @@ diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi
 +	return written ? written : error;
 +}
 +
-+static int micronux_fb_blank(int blank, struct fb_info *info)
-+{
-+	struct micronux_dsi *dsi = info->par;
-+
-+	if (!dsi->backlight)
-+		return 0;
-+	dsi->backlight->props.power = blank;
-+	return backlight_update_status(dsi->backlight);
-+}
++static int micronux_fb_blank(int blank, struct fb_info *info);
 +
 +static const struct fb_ops micronux_fb_ops = {
 +	.owner = THIS_MODULE,
@@ -488,6 +488,90 @@ diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi
 +	mutex_unlock(&dsi->lock);
 +}
 +
++static int micronux_dma_stop_reload(struct micronux_dsi *dsi)
++{
++	u32 channel = BIT(dsi->handoff.dma_channel);
++	u32 abort_mask = channel | (channel << 8);
++	u32 bridge, state;
++
++	hrtimer_cancel(&dsi->scanout_timer);
++	mutex_lock(&dsi->lock);
++	bridge = readl(dsi->bridge + DSI_BRG_DPI_MISC_CONFIG);
++	writel(bridge & ~DSI_BRG_DPI_EN,
++	       dsi->bridge + DSI_BRG_DPI_MISC_CONFIG);
++	writel(1, dsi->bridge + DSI_BRG_DPI_CONFIG_UPDATE);
++	mutex_unlock(&dsi->lock);
++	writel(channel << 8, dsi->gdma + DW_GDMA_CHEN);
++	writel(abort_mask, dsi->gdma + DW_GDMA_CHABORT);
++	if (readl_poll_timeout_atomic(dsi->gdma + DW_GDMA_CHABORT, state,
++				      !(state & abort_mask), 1, 100))
++		return -ETIMEDOUT;
++	writel(DSI_BRG_INT_UNDERRUN, dsi->bridge + DSI_BRG_INT_CLR);
++	return 0;
++}
++
++static int micronux_fb_blank(int blank, struct fb_info *info)
++{
++	struct micronux_dsi *dsi = info->par;
++	u32 bridge_status, frame, initial_frame;
++	int ret;
++
++	if (!dsi->backlight)
++		return 0;
++	if (!dsi->scanout_ready) {
++		dsi->backlight->props.power = blank;
++		return backlight_update_status(dsi->backlight);
++	}
++	if (blank != FB_BLANK_UNBLANK) {
++		dsi->backlight->props.power = blank;
++		ret = backlight_update_status(dsi->backlight);
++		if (ret || !dsi->scanout_active)
++			return ret;
++		ret = micronux_dma_stop_reload(dsi);
++		if (!ret)
++			dsi->scanout_active = false;
++		return ret;
++	}
++	if (dsi->scanout_active) {
++		dsi->backlight->props.power = FB_BLANK_UNBLANK;
++		return backlight_update_status(dsi->backlight);
++	}
++
++	WRITE_ONCE(dsi->last_dma_error, 0);
++	writel(DSI_BRG_INT_UNDERRUN, dsi->bridge + DSI_BRG_INT_CLR);
++	writel(readl(dsi->bridge + DSI_BRG_DMA_BLOCK_INTERVAL) |
++	       DSI_BRG_RAW_NUM_AUTO_RELOAD,
++	       dsi->bridge + DSI_BRG_DMA_BLOCK_INTERVAL);
++	writel(readl(dsi->bridge + DSI_BRG_RAW_NUM_CONFIG) |
++	       DSI_BRG_RAW_NUM_TOTAL_SET,
++	       dsi->bridge + DSI_BRG_RAW_NUM_CONFIG);
++	initial_frame = READ_ONCE(dsi->scanout_frames);
++	micronux_dma_start_reload(dsi);
++	micronux_select_framebuffer(dsi);
++	ret = read_poll_timeout(READ_ONCE, frame, frame != initial_frame,
++				1000, MICRONUX_SCANOUT_START_TIMEOUT_MS * 1000,
++				false, dsi->scanout_frames);
++	bridge_status = readl(dsi->bridge + DSI_BRG_INT_RAW);
++	if (ret || READ_ONCE(dsi->last_dma_error) ||
++	    (bridge_status & DSI_BRG_INT_UNDERRUN)) {
++		if (bridge_status & DSI_BRG_INT_UNDERRUN)
++			writel(DSI_BRG_INT_UNDERRUN,
++			       dsi->bridge + DSI_BRG_INT_CLR);
++		(void)micronux_dma_stop_reload(dsi);
++		return ret ? ret : -EIO;
++	}
++	hrtimer_start(&dsi->scanout_timer, ns_to_ktime(MICRONUX_DMA_POLL_NS),
++		      HRTIMER_MODE_REL_PINNED);
++	dsi->scanout_active = true;
++	dsi->backlight->props.power = FB_BLANK_UNBLANK;
++	ret = backlight_update_status(dsi->backlight);
++	if (ret) {
++		(void)micronux_dma_stop_reload(dsi);
++		dsi->scanout_active = false;
++	}
++	return ret;
++}
++
 +static void micronux_enable_scanout_work(struct work_struct *work)
 +{
 +	struct micronux_dsi *dsi = container_of(to_delayed_work(work),
@@ -526,6 +610,7 @@ diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi
 +	}
 +	hrtimer_start(&dsi->scanout_timer, ns_to_ktime(MICRONUX_DMA_POLL_NS),
 +		      HRTIMER_MODE_REL_PINNED);
++	dsi->scanout_active = true;
 +	dsi->backlight->props.power = FB_BLANK_UNBLANK;
 +	ret = backlight_update_status(dsi->backlight);
 +	if (ret) {
@@ -846,6 +931,7 @@ diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi
 +	hrtimer_init(&dsi->scanout_timer, CLOCK_MONOTONIC,
 +		     HRTIMER_MODE_REL_PINNED);
 +	dsi->scanout_timer.function = micronux_dma_poll;
++	dsi->scanout_ready = true;
 +	schedule_delayed_work(&dsi->scanout_enable_work, 0);
 +	dev_info(&pdev->dev,
 +		 "MICRONUX:M7:DSI-LINUX state=ready owner=linux fb=fb%d resolution=%ux%u format=rgb565 dma=ch%u:auto-reload event=block-done-irq irq=%d health_poll_us=50 enable_delay_ms=0 underrun=monitored write_chunk=512 write_gap_us=2 backlight=linux mmap=denied\n",
@@ -870,6 +956,7 @@ diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi
 +	struct micronux_dsi *dsi = platform_get_drvdata(pdev);
 +
 +	cancel_delayed_work_sync(&dsi->scanout_enable_work);
++	dsi->scanout_ready = false;
 +	hrtimer_cancel(&dsi->scanout_timer);
 +	writel(0, dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA);
 +	sysfs_remove_groups(&pdev->dev.kobj, micronux_display_groups);

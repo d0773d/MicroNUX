@@ -27,6 +27,8 @@
 #define TARGET_TOLERANCE 96U
 #define DEFAULT_DRAW_SECONDS 5U
 #define DEFAULT_TOUCH_TIMEOUT_MS 30000U
+#define WRITE_CHUNK 64U
+#define WRITE_GAP_NS 100000L
 #define BITS_PER_LONG (sizeof(unsigned long) * 8U)
 #define BITS_TO_LONGS(bits) (((bits) + BITS_PER_LONG - 1U) / BITS_PER_LONG)
 
@@ -83,8 +85,20 @@ static int bit_is_set(const unsigned long *bits, unsigned int bit)
 
 static void restore_console(void)
 {
-	if (graphics_active && console_fd >= 0)
+	int framebuffer_fd = -1;
+
+	if (graphics_active && console_fd >= 0) {
+		framebuffer_fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+		if (framebuffer_fd >= 0)
+			(void)ioctl(framebuffer_fd, FBIOBLANK,
+				    FB_BLANK_POWERDOWN);
 		(void)ioctl(console_fd, KDSETMODE, KD_TEXT);
+		if (framebuffer_fd >= 0) {
+			(void)ioctl(framebuffer_fd, FBIOBLANK,
+				    FB_BLANK_UNBLANK);
+			(void)close(framebuffer_fd);
+		}
+	}
 	graphics_active = 0;
 	if (console_fd >= 0) {
 		(void)close(console_fd);
@@ -206,6 +220,39 @@ static int read_touch_status(char *status, size_t status_size)
 	return 0;
 }
 
+static int write_paced(int fd, const void *buffer, size_t length, off_t offset)
+{
+	const uint8_t *bytes = buffer;
+	size_t written = 0;
+
+	while (written < length) {
+		size_t chunk = length - written;
+		ssize_t result;
+
+		if (chunk > WRITE_CHUNK)
+			chunk = WRITE_CHUNK;
+		result = pwrite(fd, bytes + written, chunk, offset + written);
+		if (result <= 0)
+			return -1;
+		written += (size_t)result;
+		if (written < length) {
+			struct timespec start;
+			struct timespec now;
+			int64_t elapsed;
+
+			if (clock_gettime(CLOCK_MONOTONIC, &start) != 0)
+				return -1;
+			do {
+				if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+					return -1;
+				elapsed = (int64_t)(now.tv_sec - start.tv_sec) *
+					INT64_C(1000000000) + now.tv_nsec - start.tv_nsec;
+			} while (elapsed < WRITE_GAP_NS);
+		}
+	}
+	return 0;
+}
+
 static uint16_t color_for(unsigned int x, unsigned int y)
 {
 	if (x < 8U || x >= DISPLAY_WIDTH - 8U ||
@@ -229,8 +276,8 @@ static int draw_test_pattern(int fd)
 	for (y = 0; y < DISPLAY_HEIGHT; ++y) {
 		for (x = 0; x < DISPLAY_WIDTH; ++x)
 			row[x] = color_for(x, y);
-		if (pwrite(fd, row, sizeof(row), (off_t)y * DISPLAY_STRIDE) !=
-		    (ssize_t)sizeof(row))
+		if (write_paced(fd, row, sizeof(row),
+				 (off_t)y * DISPLAY_STRIDE) != 0)
 			return -1;
 	}
 	return 0;
@@ -247,9 +294,8 @@ static int draw_target(int fd, unsigned int center_x,
 	for (y = 0; y < sizeof(row) / sizeof(row[0]); ++y)
 		row[y] = color;
 	for (y = 0; y < sizeof(row) / sizeof(row[0]); ++y) {
-		if (pwrite(fd, row, sizeof(row),
-			   (off_t)(y0 + y) * DISPLAY_STRIDE + x0 * 2U) !=
-		    (ssize_t)sizeof(row))
+		if (write_paced(fd, row, sizeof(row),
+				 (off_t)(y0 + y) * DISPLAY_STRIDE + x0 * 2U) != 0)
 			return -1;
 	}
 	return 0;
@@ -353,8 +399,8 @@ static int run_draw(unsigned int seconds)
 		(void)close(fb);
 		return fail("framebuffer-draw-write");
 	}
-	printf("MICRONUX:M9:DISPLAY-TEST state=visible mode=draw seconds=%u\n",
-	       seconds);
+	printf("MICRONUX:M9:DISPLAY-TEST state=visible mode=draw seconds=%u pace_bytes=%u gap_ns=%ld\n",
+	       seconds, WRITE_CHUNK, WRITE_GAP_NS);
 	(void)sleep(seconds);
 	(void)close(fb);
 	restore_console();

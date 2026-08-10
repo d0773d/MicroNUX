@@ -17,7 +17,7 @@ only after every required feature and its exit criterion are completed.
 | Work package | Section status | Current evidence |
 | --- | --- | --- |
 | M9.0 Contract freeze | **COMPLETED** | Plan approved for implementation on 2026-08-10; architecture commit `b3d011f` |
-| M9.1 Linux input and presentation | **TESTING** | Clean M9 build passed; physical Kit C display, touch, underrun, responsiveness, and terminal-return gate pending |
+| M9.1 Linux input and presentation | **TESTING** | Physical preflight, five-point touch, normal console return, and SIGTERM recovery passed with zero DSI underruns; final visual confirmation remains |
 | M9.2 Optional LVGL service | **PLANNED** | Starts only after the M9.1 Linux gate passes |
 | M9.3 UI-v1 and native C SDK | **PLANNED** | Starts only after the M9.2 service gate passes |
 | M9.4 Window and session manager | **PLANNED** | Starts only after the M9.3 ABI gate passes |
@@ -463,10 +463,10 @@ Section status: **TESTING**
 
 Deliverables:
 
-- [ ] **TESTING** - GT9271 Linux probe and input events;
-- [ ] **TESTING** - accepted reset, interrupt, and coordinate-transform
+- [x] **COMPLETED** - GT9271 Linux probe and input events;
+- [x] **COMPLETED** - accepted reset, interrupt, and coordinate-transform
   device-tree contract;
-- [ ] **TESTING** - a safe foreground GUI ownership transition for fbcon and
+- [x] **COMPLETED** - a safe foreground GUI ownership transition for fbcon and
   `/dev/fb0`;
 - [ ] **TESTING** - positioned, paced partial-rectangle presentation; and
 - [ ] **TESTING** - a no-LVGL C diagnostic that proves display and primary
@@ -498,6 +498,94 @@ Physical testing still required before any item or this section may be marked
 - zero DSI underruns during the test;
 - responsive USB shell and unrelated background task during presentation; and
 - clean restoration of the framebuffer console after normal exit and signal.
+
+Physical test evidence recorded 2026-08-10, iteration 1:
+
+- GT9271 probe, `/dev/input/event0`, product ID, 800x1280 ranges, and zero touch
+  transport errors passed;
+- the USB shell remained responsive during a three-second full-frame draw and
+  the diagnostic restored the framebuffer console;
+- DSI diagnostics changed from `underruns=0` to `underruns=4`, so the physical
+  presentation gate failed and the affected features returned to
+  `IMPLEMENTING`; and
+- no completion box was checked. The next iteration adds bounded userspace
+  write chunks and an explicit inter-chunk gap before rebuilding and repeating
+  the same measurement.
+
+Physical test evidence recorded 2026-08-10, iteration 2:
+
+- the rebuilt 6,090,608-byte image passed the 33-patch manifest, bFLT W^X,
+  partition-size, and no-LVGL gates, then flash read-back verification passed;
+- GT9271 readiness, `/dev/input/event0`, zero touch errors, the framebuffer
+  interface contract, foreground draw, concurrent USB-shell responsiveness,
+  and framebuffer-console restoration all passed again;
+- the 256-byte/100-microsecond paced writer completed without the NOMMU timer
+  stall seen in the first pacing attempt, but DSI diagnostics changed from
+  `underruns=0` to `underruns=5`; and
+- the presentation features remain `IMPLEMENTING`. Iteration 3 reduces the
+  instantaneous framebuffer write burst to 64 bytes while retaining the
+  100-microsecond inter-burst gap, then repeats the same zero-underrun gate.
+
+Physical test evidence recorded 2026-08-10, iteration 3:
+
+- the 64-byte/100-microsecond writer passed cross-compilation, the complete M9
+  build gates, flash read-back verification, and the physical interface checks;
+- an added mid-presentation diagnostic proved `underruns=0` before and after
+  the full-frame paced write while the foreground pattern remained visible;
+- the counter changed from `underruns=0` to `underruns=6` only after
+  `KDSETMODE(KD_TEXT)` caused fbcon to redraw through its kernel drawing path;
+  and
+- the root cause is therefore the ownership transition rather than the paced
+  presentation path. Iteration 4 brackets fbcon restoration with the standard
+  fbdev blank API, and the Linux driver stops scanout while blanked, accepts the
+  console redraw, then cleanly restarts scanout before restoring the backlight.
+
+Physical test evidence recorded 2026-08-10, iteration 4:
+
+- the complete clean Linux 6.12.27 build passed with all 33 patches, manifest
+  SHA-256
+  `77a4abb56b34519e5cb8e1e7329363fe4e2a4a6660202aa06242db94ca286002`,
+  bFLT W^X enforcement, no LVGL artifact, and a 6,090,608-byte image;
+- image, DTB, and metadata flash read-back verification passed on ESP32-P4
+  revision 1.3;
+- GT9271 readiness, `/dev/input/event0`, product 9271, 800x1280 coordinates,
+  zero transport errors, and the framebuffer interface contract passed;
+- the foreground diagnostic completed its 64-byte/100-microsecond paced draw,
+  the USB shell remained responsive, and fbcon restoration completed through
+  the kernel-owned blank/redraw/restart transition; and
+- DSI diagnostics remained `underruns=0` before presentation, during the
+  visible pattern, and after console restoration. The automated preflight
+  emitted `MICRONUX:M9:PREFLIGHT:PASS`; the section advances to `TESTING` for
+  its remaining five-point touch and visual-confirmation gates.
+
+Physical test evidence recorded 2026-08-10, iteration 5:
+
+- the interactive diagnostic accepted all five targets in the required order:
+  top-left `79,81`, top-right `720,95`, bottom-right `718,1207`, bottom-left
+  `91,1198`, and center `393,641`;
+- every press was within the 96-pixel acceptance radius, each release was
+  observed before advancing, the diagnostic emitted
+  `MICRONUX:M9:DISPLAY-TEST:PASS mode=touch points=5`, and fbcon returned;
+- post-touch DSI diagnostics reported `underruns=0`, no DMA error, and active
+  scanout, producing `MICRONUX:M9:TOUCH-GATE:PASS`; and
+- the GT9271 input/event feature and the polling-only unrotated 800x1280
+  device-tree contract are now `COMPLETED`. The ownership, presentation, and
+  diagnostic features remain `TESTING` until signal-recovery and final visual
+  confirmation pass.
+
+Physical test evidence recorded 2026-08-10, iteration 6:
+
+- the recovery test launched a 30-second foreground diagnostic, delivered
+  SIGTERM after the pattern became visible, and observed the expected exit code
+  143 from the installed signal handler;
+- the framebuffer console and USB shell returned, scanout remained active with
+  no DMA error, and DSI diagnostics stayed `underruns=0` before and after the
+  forced exit;
+- the complete preflight emitted `MICRONUX:M9:PREFLIGHT:PASS` with
+  `console=restored`, `signal=restored`, and `underruns=0`; and
+- safe foreground ownership and recovery are now `COMPLETED`. Positioned
+  presentation and the no-LVGL diagnostic remain `TESTING` only for the final
+  human visual-confirmation gate.
 
 Exit criterion: the diagnostic draws a target, receives correctly transformed
 touch, returns to the terminal cleanly, and produces zero DSI underruns while
