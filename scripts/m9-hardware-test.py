@@ -154,12 +154,9 @@ def capture_passive_output(device: serial.Serial, duration: float) -> str:
     return captured.decode("utf-8", errors="replace")
 
 
-def reconnect_probe_complete(output: str, token: str) -> bool:
-    marker = re.search(
-        rf"(?:^|\r?\n){re.escape(token)}\r?\n", output
-    )
-    return marker is not None and re.search(
-        r"(?:^|\r?\n)/ # $", output[marker.end() :]
+def reconnect_prompt_complete(output: str, response_start: int) -> bool:
+    return re.search(
+        r"(?:^|\r?\n)/ # $", output[response_start:]
     ) is not None
 
 
@@ -189,9 +186,9 @@ def recover_reconnect_prompt(
     port: str, device: serial.Serial, timeout: float
 ) -> tuple[serial.Serial, str]:
     deadline = time.monotonic() + timeout
-    token = f"MICRONUX_M9_RECONNECT_{time.monotonic_ns()}"
     captured = ""
-    cancel_partial_line = False
+    quote_closers = (b'"\n', b"'\n")
+    closer_index = 0
 
     while time.monotonic() < deadline:
         try:
@@ -200,21 +197,25 @@ def recover_reconnect_prompt(
             )
         except (serial.SerialException, OSError):
             device = reopen_reconnect_serial(port, device, deadline)
-            cancel_partial_line = True
             continue
-        if reconnect_probe_complete(captured, token):
-            return device, captured
 
-        payload = b"\x03\n" if cancel_partial_line else f"echo {token}\n".encode(
-            "ascii"
-        )
+        if re.search(r"(?:^|\r?\n)> $", captured[-2048:]):
+            payload = quote_closers[closer_index % len(quote_closers)]
+            closer_index += 1
+        else:
+            payload = b"\n"
+        response_start = len(captured)
         try:
             written = device.write(payload)
             if written != len(payload):
                 raise serial.SerialTimeoutException(
                     "short write while recovering USB shell"
                 )
-            cancel_partial_line = False
+            captured += capture_passive_output(
+                device, min(0.75, max(0.0, deadline - time.monotonic()))
+            )
+            if reconnect_prompt_complete(captured, response_start):
+                return device, captured
         except (serial.SerialException, OSError):
             try:
                 captured += capture_passive_output(
@@ -222,10 +223,9 @@ def recover_reconnect_prompt(
                 )
             except (serial.SerialException, OSError):
                 pass
-            if reconnect_probe_complete(captured, token):
+            if reconnect_prompt_complete(captured, response_start):
                 return device, captured
             device = reopen_reconnect_serial(port, device, deadline)
-            cancel_partial_line = True
 
     raise TimeoutError("Linux USB shell did not become writable after reconnect")
 
