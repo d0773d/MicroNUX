@@ -747,8 +747,8 @@ iteration 12:
 - the disconnected-test harness now creates a detached on-device boundary
   snapshot after the complete closed-USB interval but before the host reopens
   COM. It passively preserves queued serial evidence, recovers the shell with
-  short writes, captures relevant `/proc/kmsg` records, and distinguishes an
-  idle `disconnect-failure` from a later `reconnect-driver-fault`;
+  short writes, and distinguishes an idle `disconnect-failure` from a later
+  `reconnect-driver-fault` without depending on a blocking kernel-log reader;
 - the corrected 39-patch series passed with manifest SHA-256
   `e3d9c796bbbb0ca845e5eea95aed881da93f225fcfce40b7757f788300b55edf`.
   Patch 0022 passed strict checkpatch with 0 errors, 0 warnings, and 0 checks;

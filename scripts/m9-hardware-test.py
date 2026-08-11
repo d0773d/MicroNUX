@@ -761,7 +761,6 @@ def run_disconnect(
     port: str, device: serial.Serial, disconnect_seconds: int
 ) -> tuple[int, serial.Serial]:
     boundary_path = "/tmp/m9-disconnect-boundary"
-    kmsg_path = "/tmp/m9-disconnect-kmsg"
     boundary_delay = disconnect_seconds + 1
     reopen_delay = disconnect_seconds + 3
     status_re = (
@@ -886,25 +885,6 @@ def run_disconnect(
         f"host_closed_seconds={opened_at - closed_at:.3f} shell=writable"
     )
 
-    kmsg_capture = run_command(
-        device,
-        f"rm -f {kmsg_path}; "
-        "/bin/busybox timeout 2 /bin/busybox cat /proc/kmsg "
-        f">{kmsg_path}; "
-        'm9_kmsg_rc=$?; echo "MICRONUX:M9:USB-RECONNECT:KMSG '
-        'rc=$m9_kmsg_rc"; '
-        'case "$m9_kmsg_rc" in 0|124|143) true;; *) false;; esac',
-        "DISCONNECT_KMSG_CAPTURE",
-        10.0,
-    )
-    kmsg = run_command(
-        device,
-        'while IFS= read -r m9_line; do case "$m9_line" in '
-        '*MICRONUX:M9:*|*esp32p4-dsi*) printf "%s\\n" "$m9_line";; '
-        f"esac; done <{kmsg_path}",
-        "DISCONNECT_KMSG_READ",
-        20.0,
-    )
     boundary = run_command(
         device,
         f"cat {boundary_path}",
@@ -956,8 +936,6 @@ def run_disconnect(
         return fail("disconnect-after", "unexpected-reboot"), device
 
     evidence_results = (
-        kmsg_capture,
-        kmsg,
         boundary,
         after_diagnostics,
         after_scanout,
@@ -1030,7 +1008,7 @@ def run_disconnect(
         or not after_frames
         or after_frames[-1] <= boundary_frames[-1]
     ):
-        evidence = reconnect_log + kmsg.output + after_output
+        evidence = reconnect_log + after_output
         detail = after_problem or (
             "source-or-backlight"
             if after_status_ok is None
