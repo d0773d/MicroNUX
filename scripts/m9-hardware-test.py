@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -50,7 +51,10 @@ def rom_reset(port: str) -> None:
 
 
 def open_serial(
-    port: str, timeout: float, clear_input: bool = True
+    port: str,
+    timeout: float,
+    clear_input: bool = True,
+    write_timeout: float = 10.0,
 ) -> serial.Serial:
     deadline = time.monotonic() + timeout
     while True:
@@ -59,7 +63,7 @@ def open_serial(
             device.port = port
             device.baudrate = 115200
             device.timeout = 0.05
-            device.write_timeout = 10.0
+            device.write_timeout = write_timeout
             device.dsrdtr = False
             device.rtscts = False
             device.dtr = False
@@ -111,7 +115,6 @@ def wait_for_prompt(device: serial.Serial, timeout: float) -> str:
 
     while time.monotonic() < deadline:
         device.write(b"\n")
-        device.flush()
         sample_deadline = min(deadline, time.monotonic() + 0.5)
         while time.monotonic() < sample_deadline:
             chunk = device.read(4096)
@@ -151,6 +154,82 @@ def capture_passive_output(device: serial.Serial, duration: float) -> str:
     return captured.decode("utf-8", errors="replace")
 
 
+def reconnect_probe_complete(output: str, token: str) -> bool:
+    marker = re.search(
+        rf"(?:^|\r?\n){re.escape(token)}\r?\n", output
+    )
+    return marker is not None and re.search(
+        r"(?:^|\r?\n)/ # $", output[marker.end() :]
+    ) is not None
+
+
+def reopen_reconnect_serial(
+    port: str, device: serial.Serial, deadline: float
+) -> serial.Serial:
+    try:
+        device.close()
+    except (serial.SerialException, OSError):
+        pass
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Linux USB endpoint did not reactivate")
+    time.sleep(min(0.25, remaining))
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Linux USB endpoint did not reactivate")
+    return open_serial(
+        port,
+        remaining,
+        clear_input=False,
+        write_timeout=1.0,
+    )
+
+
+def recover_reconnect_prompt(
+    port: str, device: serial.Serial, timeout: float
+) -> tuple[serial.Serial, str]:
+    deadline = time.monotonic() + timeout
+    token = f"MICRONUX_M9_RECONNECT_{time.monotonic_ns()}"
+    captured = ""
+    cancel_partial_line = False
+
+    while time.monotonic() < deadline:
+        try:
+            captured += capture_passive_output(
+                device, min(0.75, max(0.0, deadline - time.monotonic()))
+            )
+        except (serial.SerialException, OSError):
+            device = reopen_reconnect_serial(port, device, deadline)
+            cancel_partial_line = True
+            continue
+        if reconnect_probe_complete(captured, token):
+            return device, captured
+
+        payload = b"\x03\n" if cancel_partial_line else f"echo {token}\n".encode(
+            "ascii"
+        )
+        try:
+            written = device.write(payload)
+            if written != len(payload):
+                raise serial.SerialTimeoutException(
+                    "short write while recovering USB shell"
+                )
+            cancel_partial_line = False
+        except (serial.SerialException, OSError):
+            try:
+                captured += capture_passive_output(
+                    device, min(0.5, max(0.0, deadline - time.monotonic()))
+                )
+            except (serial.SerialException, OSError):
+                pass
+            if reconnect_probe_complete(captured, token):
+                return device, captured
+            device = reopen_reconnect_serial(port, device, deadline)
+            cancel_partial_line = True
+
+    raise TimeoutError("Linux USB shell did not become writable after reconnect")
+
+
 def run_command(
     device: serial.Serial, command: str, label: str, timeout: float
 ) -> CommandResult:
@@ -159,8 +238,9 @@ def run_command(
         f"echo {token}:BEGIN; {command}; "
         f"m9_rc=$?; echo {token}:END:$m9_rc\n"
     )
-    device.write(payload.encode("ascii"))
-    device.flush()
+    written = device.write(payload.encode("ascii"))
+    if written != len(payload):
+        raise serial.SerialTimeoutException(f"short serial write: {label}")
     deadline = time.monotonic() + timeout
     captured = bytearray()
     end_pattern = re.compile(re.escape(token) + r":END:(\d+)")
@@ -183,6 +263,41 @@ def run_command(
 def fail(stage: str, detail: str) -> int:
     print(f"MICRONUX:M9:HARDWARE-TEST:FAIL stage={stage} detail={detail}")
     return 1
+
+
+def display_health_problem(output: str) -> str | None:
+    faults = re.findall(r"\bfaults=([0-9a-fA-F]+)\b", output)
+    underruns = [
+        int(value) for value in re.findall(r"\bunderruns=(\d+)\b", output)
+    ]
+    errors = re.findall(r"\berrors=([0-9a-fA-F]{8})\b", output)
+    host_ints = re.findall(
+        r"\bhost-int=([0-9a-fA-F]{8}):([0-9a-fA-F]{8})\b", output
+    )
+    frame_acks = re.findall(r"\bframe-ack=(\d+)\b", output)
+    continuous_hs = re.findall(r"\bcontinuous-hs=(\d+)\b", output)
+    lp_disabled = re.findall(r"\blp-disabled=(\d+)\b", output)
+
+    if not faults or any(int(value, 16) for value in faults):
+        return "fault-latched-or-missing"
+    if not underruns or any(value != 0 for value in underruns):
+        return "underrun-nonzero-or-missing"
+    if not errors or any(value != "00000000" for value in errors):
+        return "dma-error-nonzero-or-missing"
+    if not host_ints or any(
+        int(status0, 16) or int(status1, 16)
+        for status0, status1 in host_ints
+    ):
+        return "dsi-host-int-nonzero-or-missing"
+    if not frame_acks or any(value != "0" for value in frame_acks):
+        return "frame-ack-enabled-or-missing"
+    if not continuous_hs or any(value != "1" for value in continuous_hs):
+        return "continuous-hs-disabled-or-missing"
+    if not lp_disabled or any(value != "1" for value in lp_disabled):
+        return "video-lp-enabled-or-missing"
+    if not re.search(r"^running frames=.*$", output, re.MULTILINE):
+        return "scanout-not-running"
+    return None
 
 
 def run_preflight(device: serial.Serial, boot_log: str) -> int:
@@ -645,6 +760,18 @@ def run_soak(device: serial.Serial, soak_seconds: int, sample_seconds: int) -> i
 def run_disconnect(
     port: str, device: serial.Serial, disconnect_seconds: int
 ) -> tuple[int, serial.Serial]:
+    boundary_path = "/tmp/m9-disconnect-boundary"
+    kmsg_path = "/tmp/m9-disconnect-kmsg"
+    boundary_delay = disconnect_seconds + 1
+    reopen_delay = disconnect_seconds + 3
+    status_re = (
+        r"pattern=framebuffer boot_ready=1 bl_power=0 "
+        r"actual_brightness=([1-9]\d*)"
+    )
+    boot_id_re = (
+        r"([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})"
+    )
+
     print(
         "MICRONUX:M9:USB-DISCONNECT:VISUAL-REQUIRED "
         f"expect=status-remains-visible-no-cyan seconds={disconnect_seconds}"
@@ -677,127 +804,255 @@ def run_disconnect(
     )
     if before.return_code != 0:
         return fail("disconnect-before", f"rc-{before.return_code}"), device
+    if not re.search(
+        r"MICRONUX:M9:USB-DISCONNECT:STATUS-BEFORE " + status_re,
+        before.output,
+    ):
+        return fail("disconnect-before", "source-or-backlight"), device
+    before_problem = display_health_problem(before.output)
+    if before_problem is not None:
+        return fail("disconnect-before", before_problem), device
+    before_boot_ids = re.findall(
+        r"MICRONUX:M9:USB-DISCONNECT:BEFORE boot_id=" + boot_id_re,
+        before.output,
+    )
+    if not before_boot_ids:
+        return fail("disconnect-before", "boot-id-missing"), device
+
+    boundary_script = (
+        "trap '' HUP; "
+        f"sleep {boundary_delay}; "
+        f"D={DISPLAY_SYSFS}; B=/sys/class/backlight/micronux-backlight; "
+        'm9_boot="$(cat /proc/sys/kernel/random/boot_id)"; '
+        'echo "MICRONUX:M9:USB-DISCONNECT:BOUNDARY:BEGIN '
+        'boot_id=$m9_boot"; '
+        'echo -n "MICRONUX:M9:USB-DISCONNECT:BOUNDARY:UPTIME "; '
+        'cat /proc/uptime; '
+        'cat "$D/diagnostics"; cat "$D/scanout"; '
+        'echo "MICRONUX:M9:USB-DISCONNECT:STATUS-BOUNDARY '
+        'pattern=$(cat $D/pattern) boot_ready=$(cat $D/boot_ready) '
+        'bl_power=$(cat $B/bl_power) '
+        'actual_brightness=$(cat $B/actual_brightness)"; '
+        'echo "MICRONUX:M9:USB-DISCONNECT:BOUNDARY:COMPLETE"'
+    )
+    boundary_arm = run_command(
+        device,
+        f"rm -f {boundary_path}; "
+        "/bin/busybox setsid /bin/busybox sh -c "
+        f"{shlex.quote(boundary_script)} </dev/null "
+        f">{boundary_path} 2>&1 & "
+        'echo "MICRONUX:M9:USB-DISCONNECT:BOUNDARY:ARMED '
+        f'delay_seconds={boundary_delay} pid=$!"',
+        "DISCONNECT_BOUNDARY_ARM",
+        20.0,
+    )
+    if boundary_arm.return_code != 0 or not re.search(
+        r"^MICRONUX:M9:USB-DISCONNECT:BOUNDARY:ARMED "
+        rf"delay_seconds={boundary_delay} pid=\d+\r?$",
+        boundary_arm.output,
+        re.MULTILINE,
+    ):
+        return fail("disconnect-boundary", "arm-failed"), device
 
     device.dtr = False
     device.rts = False
     device.close()
     print(
         "MICRONUX:M9:USB-DISCONNECT "
-        f"state=closed duration_seconds={disconnect_seconds}"
+        f"state=closed duration_seconds={disconnect_seconds} "
+        f"boundary_delay_seconds={boundary_delay} "
+        f"reopen_delay_seconds={reopen_delay}"
     )
-    time.sleep(disconnect_seconds)
+    closed_at = time.monotonic()
+    time.sleep(reopen_delay)
 
-    device = open_serial(port, 30.0, clear_input=False)
-    reconnect_log = wait_for_prompt(device, 30.0)
-    after = run_command(
+    opened_at = time.monotonic()
+    device = open_serial(
+        port, 30.0, clear_input=False, write_timeout=1.0
+    )
+    passive_deadline = time.monotonic() + 30.0
+    while True:
+        try:
+            passive_log = capture_passive_output(device, 2.0)
+            break
+        except (serial.SerialException, OSError):
+            device = reopen_reconnect_serial(port, device, passive_deadline)
+    device, prompt_log = recover_reconnect_prompt(port, device, 30.0)
+    reconnect_log = passive_log + prompt_log
+    print(
+        "MICRONUX:M9:USB-RECONNECT:TRANSPORT "
+        f"passive_bytes={len(passive_log.encode('utf-8'))} "
+        f"captured_bytes={len(reconnect_log.encode('utf-8'))} "
+        f"host_closed_seconds={opened_at - closed_at:.3f} shell=writable"
+    )
+
+    kmsg_capture = run_command(
+        device,
+        f"rm -f {kmsg_path}; "
+        "/bin/busybox timeout 2 /bin/busybox cat /proc/kmsg "
+        f">{kmsg_path}; "
+        'm9_kmsg_rc=$?; echo "MICRONUX:M9:USB-RECONNECT:KMSG '
+        'rc=$m9_kmsg_rc"; '
+        'case "$m9_kmsg_rc" in 0|124|143) true;; *) false;; esac',
+        "DISCONNECT_KMSG_CAPTURE",
+        10.0,
+    )
+    kmsg = run_command(
+        device,
+        'while IFS= read -r m9_line; do case "$m9_line" in '
+        '*MICRONUX:M9:*|*esp32p4-dsi*) printf "%s\\n" "$m9_line";; '
+        f"esac; done <{kmsg_path}",
+        "DISCONNECT_KMSG_READ",
+        20.0,
+    )
+    boundary = run_command(
+        device,
+        f"cat {boundary_path}",
+        "DISCONNECT_BOUNDARY_READ",
+        20.0,
+    )
+    after_id = run_command(
+        device,
+        'echo -n "MICRONUX:M9:USB-DISCONNECT:AFTER boot_id="; '
+        "cat /proc/sys/kernel/random/boot_id",
+        "DISCONNECT_AFTER_ID",
+        20.0,
+    )
+    after_diagnostics = run_command(
+        device,
+        f"cat {DISPLAY_SYSFS}/diagnostics",
+        "DISCONNECT_AFTER_DIAGNOSTICS",
+        20.0,
+    )
+    after_scanout = run_command(
+        device,
+        f"cat {DISPLAY_SYSFS}/scanout",
+        "DISCONNECT_AFTER_SCANOUT",
+        20.0,
+    )
+    after_status = run_command(
         device,
         f'D={DISPLAY_SYSFS}; B=/sys/class/backlight/micronux-backlight; '
-        'm9_boot="$(cat /proc/sys/kernel/random/boot_id)"; '
-        'echo "MICRONUX:M9:USB-DISCONNECT:AFTER boot_id=$m9_boot"; '
-        'cat "$D/diagnostics"; cat "$D/scanout"; '
         'echo "MICRONUX:M9:USB-DISCONNECT:STATUS-AFTER '
         'pattern=$(cat $D/pattern) boot_ready=$(cat $D/boot_ready) '
         'bl_power=$(cat $B/bl_power) '
-        'actual_brightness=$(cat $B/actual_brightness)"; '
-        'test "$(cat $D/pattern)" = framebuffer && '
-        'test "$(cat $D/boot_ready)" = 1 && '
-        'test "$(cat $B/bl_power)" = 0 && '
-        'test "$(cat $B/actual_brightness)" -gt 0 && '
-        "echo MICRONUX:M9:USB-RECONNECT shell=responsive",
-        "DISCONNECT_AFTER",
+        'actual_brightness=$(cat $B/actual_brightness)"',
+        "DISCONNECT_AFTER_STATUS",
         20.0,
     )
-    if after.return_code != 0:
-        return fail("disconnect-after", f"rc-{after.return_code}"), device
-    if "MICRONUX:M9:USB-RECONNECT shell=responsive" not in after.output:
-        return fail("disconnect-after", "shell-marker-missing"), device
-    status_re = (
-        r"pattern=framebuffer boot_ready=1 bl_power=0 "
-        r"actual_brightness=([1-9]\d*)"
+    if after_id.return_code != 0:
+        return fail("disconnect-evidence", "after-boot-id-command-failed"), device
+    after_boot_ids = re.findall(
+        r"MICRONUX:M9:USB-DISCONNECT:AFTER boot_id=" + boot_id_re,
+        after_id.output,
     )
-    if not re.search(
-        r"MICRONUX:M9:USB-DISCONNECT:STATUS-BEFORE " + status_re,
-        before.output,
-    ):
-        return fail("disconnect-before", "source-or-backlight"), device
-    if not re.search(
-        r"MICRONUX:M9:USB-DISCONNECT:STATUS-AFTER " + status_re,
-        after.output,
-    ):
-        return fail("disconnect-after", "source-or-backlight"), device
-    if len(
-        re.findall(
-            r"^running frames=.*$",
-            before.output + after.output,
-            re.MULTILINE,
+    if not after_boot_ids:
+        return fail("disconnect-evidence", "after-boot-id-missing"), device
+    if before_boot_ids[-1] != after_boot_ids[-1]:
+        print(
+            "MICRONUX:M9:USB-DISCONNECT:CLASSIFICATION "
+            "phase=disconnect result=fail reason=unexpected-reboot"
         )
-    ) < 2:
-        return fail("disconnect-after", "scanout-not-running"), device
-    if "Linux version" in reconnect_log or "MICRONUX:M3:BOOT" in reconnect_log:
         return fail("disconnect-after", "unexpected-reboot"), device
 
-    boot_id_re = (
-        r"boot_id="
-        r"([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})"
+    evidence_results = (
+        kmsg_capture,
+        kmsg,
+        boundary,
+        after_diagnostics,
+        after_scanout,
+        after_status,
     )
-    before_boot_ids = re.findall(
-        r"MICRONUX:M9:USB-DISCONNECT:BEFORE " + boot_id_re,
-        before.output,
+    if any(result.return_code != 0 for result in evidence_results):
+        return fail("disconnect-evidence", "post-command-failed"), device
+    if "MICRONUX:M9:USB-DISCONNECT:BOUNDARY:COMPLETE" not in boundary.output:
+        return fail("disconnect-boundary", "evidence-incomplete"), device
+
+    boundary_boot_ids = re.findall(
+        r"MICRONUX:M9:USB-DISCONNECT:BOUNDARY:BEGIN boot_id=" + boot_id_re,
+        boundary.output,
     )
-    after_boot_ids = re.findall(
-        r"MICRONUX:M9:USB-DISCONNECT:AFTER " + boot_id_re,
-        after.output,
-    )
-    if not before_boot_ids or not after_boot_ids:
-        return fail("disconnect-after", "boot-id-missing"), device
-    if before_boot_ids[-1] != after_boot_ids[-1]:
+    if not boundary_boot_ids:
+        return fail("disconnect-boundary", "boot-id-missing"), device
+    if before_boot_ids[-1] != boundary_boot_ids[-1]:
+        print(
+            "MICRONUX:M9:USB-DISCONNECT:CLASSIFICATION "
+            "phase=disconnect result=fail reason=unexpected-reboot"
+        )
         return fail("disconnect-after", "unexpected-reboot"), device
 
     before_frames = [
         int(value) for value in re.findall(r"\bframes=(\d+)\b", before.output)
     ]
-    after_frames = [
-        int(value) for value in re.findall(r"\bframes=(\d+)\b", after.output)
+    boundary_frames = [
+        int(value) for value in re.findall(r"\bframes=(\d+)\b", boundary.output)
     ]
-    if (
-        not before_frames
-        or not after_frames
-        or after_frames[-1] <= before_frames[-1]
-    ):
-        return fail("disconnect-after", "scanout-did-not-continue"), device
-
-    diagnostics = before.output + after.output
-    underruns = [
-        int(value) for value in re.findall(r"\bunderruns=(\d+)\b", diagnostics)
-    ]
-    errors = re.findall(r"\berrors=([0-9a-fA-F]{8})\b", diagnostics)
-    frame_acks = re.findall(r"\bframe-ack=(\d+)\b", diagnostics)
-    continuous_hs = re.findall(r"\bcontinuous-hs=(\d+)\b", diagnostics)
-    lp_disabled = re.findall(r"\blp-disabled=(\d+)\b", diagnostics)
-    if len(underruns) < 2 or any(value != 0 for value in underruns[-2:]):
-        return fail("disconnect-underrun", "nonzero-or-missing"), device
-    if len(errors) < 2 or any(value != "00000000" for value in errors[-2:]):
-        return fail("disconnect-dma", "nonzero-or-missing"), device
-    host_ints = re.findall(
-        r"\bhost-int=([0-9a-fA-F]{8}):([0-9a-fA-F]{8})\b",
-        diagnostics,
+    boundary_problem = display_health_problem(boundary.output)
+    boundary_status_ok = re.search(
+        r"MICRONUX:M9:USB-DISCONNECT:STATUS-BOUNDARY " + status_re,
+        boundary.output,
     )
-    if len(host_ints) < 2 or any(
-        int(status0, 16) or int(status1, 16)
-        for status0, status1 in host_ints[-2:]
+    if (
+        boundary_problem is not None
+        or boundary_status_ok is None
+        or not before_frames
+        or not boundary_frames
+        or boundary_frames[-1] <= before_frames[-1]
     ):
-        return fail("disconnect-dsi-host-int", "nonzero-or-missing"), device
-    if len(frame_acks) < 2 or any(value != "0" for value in frame_acks[-2:]):
-        return fail("disconnect-frame-ack", "enabled-or-missing"), device
-    if len(continuous_hs) < 2 or any(value != "1" for value in continuous_hs[-2:]):
-        return fail("disconnect-continuous-hs", "disabled-or-missing"), device
-    if len(lp_disabled) < 2 or any(value != "1" for value in lp_disabled[-2:]):
-        return fail("disconnect-video-lp", "enabled-or-missing"), device
+        detail = boundary_problem or (
+            "source-or-backlight"
+            if boundary_status_ok is None
+            else "scanout-did-not-continue"
+        )
+        print(
+            "MICRONUX:M9:USB-DISCONNECT:CLASSIFICATION "
+            f"phase=disconnect result=fail reason={detail}"
+        )
+        return fail("disconnect-failure", detail), device
 
+    after_output = (
+        after_id.output
+        + after_diagnostics.output
+        + after_scanout.output
+        + after_status.output
+    )
+    after_frames = [
+        int(value) for value in re.findall(r"\bframes=(\d+)\b", after_output)
+    ]
+    after_problem = display_health_problem(after_output)
+    after_status_ok = re.search(
+        r"MICRONUX:M9:USB-DISCONNECT:STATUS-AFTER " + status_re,
+        after_status.output,
+    )
+    if (
+        after_problem is not None
+        or after_status_ok is None
+        or not after_frames
+        or after_frames[-1] <= boundary_frames[-1]
+    ):
+        evidence = reconnect_log + kmsg.output + after_output
+        detail = after_problem or (
+            "source-or-backlight"
+            if after_status_ok is None
+            else "scanout-did-not-continue"
+        )
+        if "MICRONUX:M9:DISPLAY-FAULT" in evidence:
+            detail = "display-fault-after-usb-reopen"
+        print(
+            "MICRONUX:M9:USB-DISCONNECT:CLASSIFICATION "
+            f"phase=reconnect result=fail reason={detail}"
+        )
+        return fail("reconnect-driver-fault", detail), device
+
+    print(
+        "MICRONUX:M9:USB-DISCONNECT:CLASSIFICATION "
+        "phase=disconnect-and-reconnect result=pass "
+        "boundary=healthy reconnect=healthy"
+    )
     print(
         "MICRONUX:M9:USB-RECONNECT:PASS "
         f"disconnected_seconds={disconnect_seconds} linux=retained "
-        "shell=respawned scanout=running underruns=0 errors=0 "
+        "shell=responsive scanout=running underruns=0 errors=0 "
         "host-errors=0 frame-ack=disabled clock=forced-hs lp=disabled "
         "machine=pass visual=required"
     )

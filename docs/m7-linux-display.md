@@ -56,7 +56,7 @@ The accepted hardware handoff was:
 MICRONUX:M7:DSI-BLANK state=ready backlight=off settle_ms=100 restore=linux-after-status-ready
 MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending pattern=framebuffer dma=descriptor-ring channel=0 rearm=linux-after-status-ready fb=[48040a80,48234a80) desc=[4ff3ba80,4ff3bb80) i2c=transferred contract=49f00000 crc32=e19656a9
 MICRONUX:M7:IRQ source=24 matrix=500d6060 clic=18 handoff=armed
-MICRONUX:M7:DSI-LINUX state=ready owner=linux fb=fb0 resolution=800x1280 format=rgb565 dma=ch0:auto-reload event=block-done-irq irq=3 health_poll_us=50 enable_delay_ms=0 underrun=monitored write_chunk=512 write_gap_us=2 backlight=linux mmap=denied
+MICRONUX:M7:DSI-LINUX state=ready owner=linux fb=fb0 resolution=800x1280 format=rgb565 dma=ch0:auto-reload event=block-done-irq irq=3 health_poll_ms=50 enable_delay_ms=0 underrun=monitored write_chunk=512 write_gap_us=2 backlight=linux mmap=denied
 MICRONUX:M7:DSI-SCANOUT state=ready handoff=blanked-restart stable-frames=4 scanout=hardware-reload-running backlight=restored reveal=userspace-ready frame-ack=disabled clock=forced-hs lp=disabled
 ```
 

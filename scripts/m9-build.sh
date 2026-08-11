@@ -196,6 +196,12 @@ if ! grep -q 'micronux_visible_source_valid' \
 	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
 	! grep -q 'MICRONUX_FAULT_STALE_FRAME' \
 	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
+	! grep -q 'MICRONUX_STALE_POLL_LIMIT' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
+	! grep -q 'watchdog_sar' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
+	! grep -q 'health_poll_ms=50' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
 	! grep -q 'micronux_discard_host_status' \
 	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c"; then
 	printf 'M9 kernel is missing fail-dark display fault containment.\n' >&2

@@ -39,7 +39,7 @@ REQUIRED_MARKERS = (
     "Linux version 6.12.27",
     "MICRONUX:M7:DSI-LINUX state=ready owner=linux fb=fb0 "
     "resolution=800x1280 format=rgb565 dma=ch0:auto-reload "
-    "event=block-done-irq irq=3 health_poll_us=50 enable_delay_ms=0 "
+    "event=block-done-irq irq=3 health_poll_ms=50 enable_delay_ms=0 "
     "underrun=monitored write_chunk=512 write_gap_us=2 "
     "backlight=linux mmap=denied",
     "MICRONUX:M7:DSI-SCANOUT state=ready handoff=blanked-restart "

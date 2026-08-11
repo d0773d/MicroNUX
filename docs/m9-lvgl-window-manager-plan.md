@@ -722,6 +722,50 @@ Implementation and pre-hardware validation recorded 2026-08-10, iteration 11:
 - this revised candidate remains deliberately unflashed while the user is away.
   Host/static validation is complete; all physical visual gates remain pending.
 
+Hardware validation and corrective implementation recorded 2026-08-10,
+iteration 12:
+
+- the iteration-11 loader and Linux artifacts were flashed and read-back
+  verified on the ESP32-P4 rev1.3 Kit C. Linux reached the status console with
+  the forced-HS, LP-disabled, frame-ACK-disabled policy and initially reported
+  zero display faults, host errors, DSI underruns, and DMA errors;
+- the first 600-second USB-disconnected run retained the same Linux boot and
+  continued framebuffer production. At USB endpoint reactivation, however,
+  the driver logged `MICRONUX:M9:DISPLAY-FAULT` at 608.649813 seconds and
+  latched stale-frame fault bit 2 even though the frame count and live GDMA
+  source address immediately continued advancing with every hardware error
+  source still zero. This was a watchdog false positive, not evidence that the
+  display producer stopped during the disconnected interval;
+- the old watchdog compared one aged DMA-interrupt timestamp. This HZ=100,
+  non-high-resolution-timer kernel can service the health callback before a
+  delayed GDMA completion interrupt during USB reconnect. The corrected
+  watchdog samples every 50 milliseconds and requires six executed samples
+  with both the completed-frame count and live GDMA source address unchanged.
+  Moving either signal resets the count, and missed timer intervals never
+  replay as multiple stale observations. The interrupt timestamp remains only
+  as a process-context pre-reveal freshness guard;
+- the disconnected-test harness now creates a detached on-device boundary
+  snapshot after the complete closed-USB interval but before the host reopens
+  COM. It passively preserves queued serial evidence, recovers the shell with
+  short writes, captures relevant `/proc/kmsg` records, and distinguishes an
+  idle `disconnect-failure` from a later `reconnect-driver-fault`;
+- the corrected 39-patch series passed with manifest SHA-256
+  `e3d9c796bbbb0ca845e5eea95aed881da93f225fcfce40b7757f788300b55edf`.
+  Patch 0022 passed strict checkpatch with 0 errors, 0 warnings, and 0 checks;
+  its exact postimage hash is `88a4770e4f03069bfd3efeb15fcac63e84cdd6ca`,
+  and the RISC-V driver object compiled with SHA-256
+  `65bf6927ba1ef029385ca252cb3dd720863db9d7a101d8a16d5083ce6a6a2673`;
+- the new frozen source contract is
+  `7186cf9d209d9cde8085b1eb7324271142854b08a465beeeabf3692bcffa5fec`.
+  The complete Buildroot image again passed at 6,090,672 bytes with SHA-256
+  `a37b80f43d46e1338a964c0c56c462f3b5bec5d6aa7690dc5169661eb945880e`;
+  all seven artifact checksums, the partition limit, bFLT W^X, exact driver,
+  status-init, and no-LVGL gates passed; and
+- M9.1 remains `TESTING`. The corrected image requires a fresh flash and a
+  new pre-VPG 600-second disconnected run. Machine telemetry can validate the
+  Linux producer and fault policy while the user is away, but only later human
+  observation can close the no-cyan/no-flicker visual gate.
+
 Because the status-restoration and source-transition implementations changed,
 historical ownership and presentation passes do not validate this revised
 candidate. Both features remain `TESTING` until the exact flashed artifacts pass
