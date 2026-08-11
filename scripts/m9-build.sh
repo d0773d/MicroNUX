@@ -196,6 +196,8 @@ if ! grep -q 'micronux_visible_source_valid' \
 	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
 	! grep -q 'DSI_HOST_INT_STATUS1_DPI_PATH' \
 	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
+	! grep -q 'DSI_HOST_INT_STATUS1_FB_STARTUP_GRACE' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
 	! grep -q 'vpg_dpi_status1' \
 	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
 	! grep -q 'MICRONUX_FAULT_STALE_FRAME' \

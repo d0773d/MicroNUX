@@ -17,7 +17,7 @@ only after every required feature and its exit criterion are completed.
 | Work package | Section status | Current evidence |
 | --- | --- | --- |
 | M9.0 Contract freeze | **COMPLETED** | Plan approved for implementation on 2026-08-10; architecture commit `b3d011f` |
-| M9.1 Linux input and presentation | **TESTING** | The prior exact candidate passed automated preflight and a 600-second same-boot USB-disconnected soak. Its first real VPG run exposed a VPG-only DPI-status classification bug and contained it fail-dark. The scoped correction passed strict/static and full-image builds; its exact flash, repeated machine gates, bounded VPG restoration, touch, and all visual no-cyan gates remain pending |
+| M9.1 Linux input and presentation | **TESTING** | The exact two-window restore candidate passed build, flash/readback, fresh-reset preflight, a 600-second same-boot USB-disconnected soak, and bounded VPG restoration with zero machine faults. Exact-candidate touch interaction and human no-cyan/no-flicker observation remain pending |
 | M9.2 Optional LVGL service | **PLANNED** | Starts only after the M9.1 Linux gate passes |
 | M9.3 UI-v1 and native C SDK | **PLANNED** | Starts only after the M9.2 service gate passes |
 | M9.4 Window and session manager | **PLANNED** | Starts only after the M9.3 ABI gate passes |
@@ -491,19 +491,21 @@ Validation evidence recorded 2026-08-10:
 - the complete Linux image is 6,090,608 bytes, below the 6 MiB partition limit
   by 200,848 bytes.
 
-Physical testing still required before any open item or this section may be
-marked `COMPLETED`:
+Remaining physical testing required before any open item or this section may
+be marked `COMPLETED`:
 
-- flash and read-back verify the exact matching loader and Linux candidate;
-- observe clean loader-to-status, normal graphics-to-status, signal-driven
-  graphics-to-status, and bounded VPG-to-status transitions without cyan or
-  flicker;
-- complete a fresh, same-boot 600-second USB-disconnected status-screen soak
-  before VPG is invoked;
-- retain zero display faults, host errors, DSI underruns, and DMA errors with
-  advancing scanout; and
-- repeat the touch regression while the USB shell and unrelated tasks remain
-  responsive.
+- [x] **COMPLETED (machine)** - flash and read-back verified the exact matching
+  loader and Linux candidate;
+- [ ] **TESTING (visual)** - observe clean loader-to-status, normal
+  graphics-to-status, signal-driven graphics-to-status, and bounded
+  VPG-to-status transitions without cyan or flicker;
+- [x] **COMPLETED (machine)** - a fresh, same-boot 600-second
+  USB-disconnected status-screen soak completed on a boot where VPG had not
+  been invoked;
+- [x] **COMPLETED (machine)** - display faults, host errors, DSI underruns, and
+  DMA errors remained zero while scanout advanced; and
+- [ ] **TESTING (physical input)** - repeat the touch regression while the USB
+  shell and unrelated tasks remain responsive.
 
 Physical test evidence recorded 2026-08-10, iteration 1:
 
@@ -820,27 +822,86 @@ Hardware verification and VPG correction recorded 2026-08-11, iteration 13:
   VPG, and touch checks. Human observation is still mandatory before the
   no-cyan/no-flicker requirements can be completed.
 
+Exact two-window restore verification recorded 2026-08-11, iteration 14:
+
+- the iteration-13 candidate was first flashed and passed a fresh 600-second
+  disconnected run and fresh-reset preflight. Its VPG entry succeeded, but its
+  first strict framebuffer sample saw delayed ST1 bit 19 after four restore
+  frames. The driver correctly restored the framebuffer producer, kept the
+  backlight off, cleared `boot_ready`, and retained Linux and the USB shell;
+- hardware evidence localized that bit to the asynchronous bridge-DPI refill
+  interval: source policy, GDMA progress, bridge enable, DMA errors, and
+  underruns were all healthy. The final correction therefore keeps the panel
+  dark, waits four framebuffer refill frames, permits one read-clear grace
+  sample for bit 19 only, then requires four additional frames and a strict
+  zero-mask host-status sample before reveal. Bit 7, every other host bit, and
+  a bit-19 reassertion in the second window remain fatal and fail-dark;
+- the final 39-patch series passed with manifest SHA-256
+  `7cc298d28ea4473a2d80e864aa513b712241789a6f993a8092c1519f9cfb97b6`.
+  Patch 0022 passed strict checkpatch with 0 errors, 0 warnings, and 0 checks;
+  its postimage Git hash is
+  `95d06da579e9fcd746500bbdfeb7ea795ea3f49f`, source SHA-256 is
+  `97a035b7c11355d3d607f934be4bd22562aaf7f0a0d09be4e71d7d0e6c263850`,
+  and the full-build driver object SHA-256 is
+  `c2e25549ea701cdcce3b644fb447a99c8b5f0c513a6975c0a88b8980c4808016`;
+- the source contract is
+  `608aa4fbc3d7e09807660e8e960a29b4a1f2611ca6866f62128c62a36d680069`.
+  The 6,090,672-byte Linux image SHA-256 is
+  `8a33c53becae82fcb42be8134a8210214aff7f8dfae7598adf20f78c369baa73`;
+  all seven artifact checksums, the partition limit, bFLT W^X, exact built
+  source, status-init, and no-LVGL gates passed;
+- the loader and Linux payload were flash/read-back verified on ESP32-P4
+  revision 1.3. The unchanged loader source reported version
+  `72e131c-dirty`, was 281,360 bytes, and had SHA-256
+  `2abf3258753af07af26bd120a82bb95b40e00e6afd3abb605cc74f733f06375f`;
+  the `-dirty` suffix records the uncommitted Linux/test changes at build time;
+- the final bounded 5,000 ms VPG gate passed. Active VPG reported
+  `host=00010002`, `lpclk=00000001`, bridge `00003200`, retained GDMA, and
+  `vpg-dpi-int=00080080`. Restoration advanced frames from 70 to 87 with
+  `entry_error=0`; the final framebuffer reported
+  `host=00000002 active=00000000 lpclk=00000001`, `boot_ready=1`, restored
+  brightness, advancing scanout, and zero faults, host errors, DMA errors, and
+  bridge underruns;
+- on a separate fresh reset where VPG had not run, the 600-second disconnected
+  acceptance gate passed on boot
+  `a7932259-6b81-47a9-b0ff-74cb7af7c062`. Frames advanced from 60 before
+  disconnect to 17,864 at the completed detached boundary and 19,015 after
+  reconnect. Boundary and reconnect state both retained framebuffer,
+  `boot_ready=1`, positive brightness, zero faults/errors/underruns/global host
+  errors, and the required continuous-video policy;
+- the final fresh-reset preflight passed normal and SIGTERM-driven
+  graphics-to-status restoration, advancing scanout, shell responsiveness,
+  and every machine health gate; and
+- M9.1 remains `TESTING`. Machine validation for the exact display candidate
+  is complete. A human must still confirm the actual loader/status,
+  graphics/status, VPG/status, and 600-second status pixels contain no cyan or
+  flicker, and the exact-candidate five-point touch interaction must be
+  repeated before M9.1 can be completed.
+
 Because the status-restoration and source-transition implementations changed,
 historical ownership and presentation passes do not validate this revised
 candidate. Both features remain `TESTING` until the exact flashed artifacts pass
-the visual and machine gates below.
+the remaining visual and touch gates below.
 
 Required M9.1 physical acceptance order:
 
-1. Build, flash, and read-back verify the matching source-frozen loader and
-   Linux image; record their exact hashes.
-2. Before running VPG, start a fresh 600-second `disconnect` test. The user must
+1. **COMPLETED (machine):** build, flash, and read-back verify the matching
+   source-frozen loader and Linux image; record their exact hashes.
+2. **MACHINE COMPLETE / VISUAL PENDING:** before running VPG on the same boot,
+   start a fresh 600-second `disconnect` test. The user must
    observe a clean loader-to-status transition and confirm that the status page
    remains visible without cyan or flicker for the entire disconnected interval.
    Reconnection must prove the same Linux boot and advancing scanout.
-3. On a fresh reset, run `preflight`; visually confirm clean normal-exit and
-   signal-driven graphics-to-status restoration.
-4. On a fresh reset, run bounded VPG; visually confirm vertical bars and a clean
-   dark-settle return to status.
-5. Run touch and the remaining regressions.
+3. **MACHINE COMPLETE / VISUAL PENDING:** on a fresh reset, run `preflight`;
+   visually confirm clean normal-exit and signal-driven graphics-to-status
+   restoration.
+4. **MACHINE COMPLETE / VISUAL PENDING:** on a fresh reset, run bounded VPG;
+   visually confirm vertical bars and a clean dark-settle return to status.
+5. **TESTING:** run touch and the remaining regressions.
 
-VPG must not precede the disconnected soak because a source toggle can
-resynchronize a marginal link and mask the pre-toggle condition.
+VPG must not precede the disconnected soak on the same acceptance boot because
+a source toggle can resynchronize a marginal link and mask the pre-toggle
+condition. A fresh reset begins a new qualifying soak.
 
 Exit criterion: the exact flashed candidate cleanly transitions from loader to
 status, restores status after normal and signal-driven graphics exit without
@@ -849,7 +910,10 @@ remains visibly on status for at least 600 seconds during a fresh
 USB-disconnected same-boot test. Every gate must report framebuffer source,
 `boot_ready=1`, backlight power on with positive actual brightness, advancing
 scanout, `faults=0`, `host-errors=00000000:00000000`, `underruns=0`, and DMA
-`errors=00000000`, while the USB shell and unrelated tasks remain responsive.
+`errors=00000000`, with framebuffer policy
+`host=00000002 active=00000000 lpclk=00000001`, `frame-ack=off`,
+`clock=forced-hs`, and `lp=disabled`, while the USB shell and unrelated tasks
+remain responsive.
 During the bounded VPG phase only, `vpg-dpi-int` may contain bits 7 and 19;
 `vpg-dpi-int & ~00080080` must equal zero, and the restored framebuffer's
 global `host-errors` must remain exactly zero.

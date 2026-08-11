@@ -632,16 +632,13 @@ def run_vpg(device: serial.Serial, duration_ms: int) -> int:
         result.output,
     ):
         return fail("vpg", "vertical-bars-marker-missing")
-    during = re.search(
-        r"MICRONUX:M9:VPG:DURING pattern=vertical-bars "
-        r"actual_brightness=[1-9]\d*\r?\n"
-        r"chen=([0-9a-fA-F]{8})",
+    if not re.search(
+        r"MICRONUX:M9:VPG state=active pattern=vertical-bars .*"
+        r"producer=running .*host=00010002 lpclk=00000001 "
+        r"bridge=00003200",
         result.output,
-    )
-    if not during or int(during.group(1), 16) == 0:
+    ):
         return fail("vpg", "producer-not-retained")
-    if "host=00010002 active=00000000 lpclk=00000001" not in result.output:
-        return fail("vpg", "vpg-register-policy-mismatch")
     if not re.search(
         r"MICRONUX:M9:VPG:AFTER rc=0 pattern=framebuffer "
         r"actual_brightness=([1-9]\d*) boot_ready=1",
