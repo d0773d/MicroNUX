@@ -878,6 +878,46 @@ Exact two-window restore verification recorded 2026-08-11, iteration 14:
   flicker, and the exact-candidate five-point touch interaction must be
   repeated before M9.1 can be completed.
 
+Unattended no-reset follow-up recorded 2026-08-11, iteration 15:
+
+- the final flashed candidate remained on the same Linux boot for more than
+  2,120 seconds. No-reset snapshots reported boot ID
+  `a568c553-eb7b-4d8a-ab6a-7e1305431eed`, framebuffer source,
+  `boot_ready=1`, backlight power on at actual brightness 63, and live scanout
+  advancing first from frame 30,035 to 30,038 and later from 71,843 to 71,847;
+- its exact raw policy remained `host=00000002`, `active=00000000`, and
+  `lpclk=00000001`, with forced HS, video LP disabled, frame ACK disabled,
+  `faults=0`, zero DMA errors, zero bridge underruns, and zero accumulated DSI
+  host errors. Touch polling also remained ready with no I2C errors;
+- the first no-reset query preserved an empty passive capture but hit a host
+  USB write timeout while recovering the idle shell. Snapshot mode now uses
+  the already validated short-write/reopen recovery path, never clears queued
+  input, propagates the live replacement handle, and requires the complete
+  framebuffer, backlight, scanout, and display-health tuple. Its immediate
+  no-reset rerun passed;
+- the harness now records an anchored, phase-specific SHA-256 of the complete
+  2,048,000-byte `/dev/fb0` image at every quiescent status checkpoint. It
+  rejects a missing, duplicate, malformed, wrong-phase, or mismatched marker;
+- fresh-reset preflight retained framebuffer SHA-256
+  `d38565f64fba5402ab8b767f77648a01ba685479491b1d104b5a3eacc304601c`
+  across both normal and SIGTERM-driven graphics-to-status restoration. A
+  separate fresh-reset 5,000 ms VPG test retained that same hash across
+  framebuffer-to-bars-to-framebuffer restoration and passed every post-restore
+  health gate;
+- the full fresh 600-second disconnected acceptance rerun passed on boot
+  `dfcf2458-c15e-495e-86ad-002404c350c4`. The host remained closed for
+  603.016 seconds; the before, detached-boundary, and after-reconnect
+  framebuffer hashes all equaled
+  `d38565f64fba5402ab8b767f77648a01ba685479491b1d104b5a3eacc304601c`.
+  Frames advanced from 117 before disconnect to 17,920 at the detached boundary
+  and 18,976 after reconnect, with the same boot ID and zero display faults,
+  DMA errors, bridge underruns, or global host errors; and
+- these results prove that Linux, the framebuffer producer, the status pixels
+  in memory, and the display-health policy survived well beyond the original
+  several-minute idle-failure window. They cannot establish what photons the
+  JD9365 glass emitted. The visual and five-point touch gates below remain
+  mandatory.
+
 Because the status-restoration and source-transition implementations changed,
 historical ownership and presentation passes do not validate this revised
 candidate. Both features remain `TESTING` until the exact flashed artifacts pass
@@ -913,7 +953,9 @@ scanout, `faults=0`, `host-errors=00000000:00000000`, `underruns=0`, and DMA
 `errors=00000000`, with framebuffer policy
 `host=00000002 active=00000000 lpclk=00000001`, `frame-ack=off`,
 `clock=forced-hs`, and `lp=disabled`, while the USB shell and unrelated tasks
-remain responsive.
+remain responsive. The phase-specific `/dev/fb0` SHA-256 must also remain
+identical across normal restoration, signal-driven restoration, VPG
+restoration, and the before/boundary/after disconnected checkpoints.
 During the bounded VPG phase only, `vpg-dpi-int` may contain bits 7 and 19;
 `vpg-dpi-int & ~00080080` must equal zero, and the restored framebuffer's
 global `host-errors` must remain exactly zero.

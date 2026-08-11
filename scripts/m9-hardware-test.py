@@ -17,6 +17,10 @@ import serial
 
 DISPLAY_SYSFS = "/sys/bus/platform/devices/500a0000.display"
 USB_RESET_ARM = Path(__file__).with_name("usb-reset-arm.py")
+EMPTY_SHA256 = (
+    "e3b0c44298fc1c149afbf4c8996fb924"
+    "27ae41e4649b934ca495991b7852b855"
+)
 
 
 @dataclass(frozen=True)
@@ -76,6 +80,21 @@ def open_serial(
             if time.monotonic() >= deadline:
                 raise
             time.sleep(0.1)
+
+
+def close_serial_quietly(device: serial.Serial) -> None:
+    try:
+        device.dtr = False
+    except (serial.SerialException, OSError):
+        pass
+    try:
+        device.rts = False
+    except (serial.SerialException, OSError):
+        pass
+    try:
+        device.close()
+    except (serial.SerialException, OSError):
+        pass
 
 
 def wait_for_shell(device: serial.Serial, timeout: float) -> str:
@@ -163,10 +182,7 @@ def reconnect_prompt_complete(output: str, response_start: int) -> bool:
 def reopen_reconnect_serial(
     port: str, device: serial.Serial, deadline: float
 ) -> serial.Serial:
-    try:
-        device.close()
-    except (serial.SerialException, OSError):
-        pass
+    close_serial_quietly(device)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError("Linux USB endpoint did not reactivate")
@@ -227,6 +243,7 @@ def recover_reconnect_prompt(
                 return device, captured
             device = reopen_reconnect_serial(port, device, deadline)
 
+    close_serial_quietly(device)
     raise TimeoutError("Linux USB shell did not become writable after reconnect")
 
 
@@ -300,6 +317,39 @@ def display_health_problem(output: str) -> str | None:
     return None
 
 
+def framebuffer_hash_shell(phase: str, variable: str) -> str:
+    return (
+        f'unset {variable}; '
+        'if m9_fb_line="$(/bin/busybox sha256sum /dev/fb0)"; then '
+        f'{variable}="${{m9_fb_line%% *}}"; '
+        f'echo "MICRONUX:M9:FB-SHA256 phase={phase} '
+        f'sha256=${variable}"; fi; '
+    )
+
+
+def framebuffer_hash_problem(
+    output: str, phases: tuple[str, ...]
+) -> str | None:
+    hashes: list[tuple[str, str]] = []
+    for phase in phases:
+        matches = re.findall(
+            rf"^MICRONUX:M9:FB-SHA256 phase={re.escape(phase)} "
+            r"sha256=([0-9a-f]{64})\r?$",
+            output,
+            re.MULTILINE,
+        )
+        if len(matches) != 1:
+            return f"phase-{phase}-count-{len(matches)}"
+        if matches[0] == EMPTY_SHA256:
+            return f"phase-{phase}-empty"
+        hashes.append((phase, matches[0]))
+    reference_phase, reference = hashes[0]
+    for phase, value in hashes[1:]:
+        if value != reference:
+            return f"signature-changed-{reference_phase}-to-{phase}"
+    return None
+
+
 def run_preflight(device: serial.Serial, boot_log: str) -> int:
     if "Linux version 6.12.27" not in boot_log:
         return fail("boot-markers", "kernel-version-missing")
@@ -361,6 +411,8 @@ def run_preflight(device: serial.Serial, boot_log: str) -> int:
     presentation = run_command(
         device,
         f"D={DISPLAY_SYSFS}; B=/sys/class/backlight/micronux-backlight; "
+        + framebuffer_hash_shell("presentation-before", "m9_fb_before")
+        +
         "echo MICRONUX:M9:DIAGNOSTICS:BEFORE; "
         "cat $D/diagnostics; cat $D/scanout; "
         "micronux-display-test draw 3 & m9_pid=$!; "
@@ -369,6 +421,8 @@ def run_preflight(device: serial.Serial, boot_log: str) -> int:
         "echo MICRONUX:M9:SHELL state=responsive; "
         "wait $m9_pid; m9_draw_rc=$?; "
         "echo MICRONUX:M9:DRAW rc=$m9_draw_rc; "
+        + framebuffer_hash_shell("presentation-after", "m9_fb_after")
+        +
         "echo MICRONUX:M9:DIAGNOSTICS:AFTER; "
         "cat $D/diagnostics; cat $D/scanout; "
         'echo "MICRONUX:M9:PRESENTATION:RESTORE '
@@ -378,12 +432,19 @@ def run_preflight(device: serial.Serial, boot_log: str) -> int:
         'test "$(cat $D/pattern)" = framebuffer && '
         'test "$(cat $D/boot_ready)" = 1 && '
         'test "$(cat $B/bl_power)" = 0 && '
-        'test "$(cat $B/actual_brightness)" -gt 0',
+        'test "$(cat $B/actual_brightness)" -gt 0 && '
+        'test "$m9_fb_before" = "$m9_fb_after"',
         "PRESENTATION",
         45.0,
     )
     if presentation.return_code != 0:
         return fail("presentation", f"rc-{presentation.return_code}")
+    framebuffer_problem = framebuffer_hash_problem(
+        presentation.output,
+        ("presentation-before", "presentation-after"),
+    )
+    if framebuffer_problem is not None:
+        return fail("presentation-framebuffer", framebuffer_problem)
     for marker in (
         "MICRONUX:M9:SHELL state=responsive",
         "MICRONUX:M9:DRAW rc=0",
@@ -438,11 +499,15 @@ def run_preflight(device: serial.Serial, boot_log: str) -> int:
     signal = run_command(
         device,
         f"D={DISPLAY_SYSFS}; B=/sys/class/backlight/micronux-backlight; "
+        + framebuffer_hash_shell("signal-before", "m9_fb_before")
+        +
         "echo MICRONUX:M9:SIGNAL-DIAGNOSTICS:BEFORE; "
         "cat $D/diagnostics; cat $D/scanout; "
         "micronux-display-test draw 30 & m9_pid=$!; sleep 4; "
         "kill -TERM $m9_pid; wait $m9_pid; m9_draw_rc=$?; "
         "echo MICRONUX:M9:SIGNAL rc=$m9_draw_rc; "
+        + framebuffer_hash_shell("signal-after", "m9_fb_after")
+        +
         "echo MICRONUX:M9:SIGNAL-DIAGNOSTICS:AFTER; "
         "cat $D/diagnostics; cat $D/scanout; "
         'echo "MICRONUX:M9:SIGNAL:RESTORE '
@@ -453,12 +518,18 @@ def run_preflight(device: serial.Serial, boot_log: str) -> int:
         'test "$(cat $D/boot_ready)" = 1 && '
         'test "$(cat $B/bl_power)" = 0 && '
         'test "$(cat $B/actual_brightness)" -gt 0 && '
+        'test "$m9_fb_before" = "$m9_fb_after" && '
         "echo MICRONUX:M9:SIGNAL-SHELL state=responsive",
         "SIGNAL",
         45.0,
     )
     if signal.return_code != 0:
         return fail("signal-recovery", f"rc-{signal.return_code}")
+    framebuffer_problem = framebuffer_hash_problem(
+        signal.output, ("signal-before", "signal-after")
+    )
+    if framebuffer_problem is not None:
+        return fail("signal-framebuffer", framebuffer_problem)
     for marker in (
         "MICRONUX:M9:SIGNAL rc=143",
         "MICRONUX:M9:SIGNAL-SHELL state=responsive",
@@ -521,12 +592,24 @@ def run_preflight(device: serial.Serial, boot_log: str) -> int:
 def run_touch(device: serial.Serial, point_timeout_ms: int) -> int:
     touch = run_command(
         device,
-        f"micronux-display-test touch {point_timeout_ms}",
+        framebuffer_hash_shell("touch-before", "m9_fb_before")
+        +
+        f"micronux-display-test touch {point_timeout_ms}; "
+        "m9_touch_rc=$?; "
+        + framebuffer_hash_shell("touch-after", "m9_fb_after")
+        +
+        'test "$m9_touch_rc" -eq 0 && '
+        'test "$m9_fb_before" = "$m9_fb_after"',
         "TOUCH",
         point_timeout_ms * 5 / 1000.0 + 45.0,
     )
     if touch.return_code != 0:
         return fail("five-point-touch", f"rc-{touch.return_code}")
+    framebuffer_problem = framebuffer_hash_problem(
+        touch.output, ("touch-before", "touch-after")
+    )
+    if framebuffer_problem is not None:
+        return fail("touch-framebuffer", framebuffer_problem)
     if "MICRONUX:M9:DISPLAY-TEST:PASS mode=touch points=5" not in touch.output:
         return fail("five-point-touch", "pass-marker-missing")
     if touch.output.count("MICRONUX:M9:TOUCH-TARGET:PASS") != 5:
@@ -571,6 +654,8 @@ def run_vpg(device: serial.Serial, duration_ms: int) -> int:
     result = run_command(
         device,
         f'D={DISPLAY_SYSFS}; B=/sys/class/backlight/micronux-backlight; '
+        + framebuffer_hash_shell("vpg-before", "m9_fb_before")
+        +
         'm9_boot="$(cat /proc/sys/kernel/random/boot_id)"; '
         'm9_brightness="$(cat "$B/brightness")"; '
         'm9_power="$(cat "$B/bl_power")"; '
@@ -584,6 +669,8 @@ def run_vpg(device: serial.Serial, duration_ms: int) -> int:
         'cat "$D/diagnostics"; '
         'wait $m9_vpg_pid; m9_vpg_rc=$?; '
         'sleep 1; '
+        + framebuffer_hash_shell("vpg-after", "m9_fb_after")
+        +
         'echo "MICRONUX:M9:VPG:AFTER rc=$m9_vpg_rc '
         'pattern=$(cat "$D/pattern") '
         'actual_brightness=$(cat "$B/actual_brightness") '
@@ -596,7 +683,8 @@ def run_vpg(device: serial.Serial, duration_ms: int) -> int:
         'test "$m9_brightness" = "$(cat "$B/brightness")" && '
         'test "$m9_power" = "$(cat "$B/bl_power")" && '
         'test "$m9_actual" = "$(cat "$B/actual_brightness")" && '
-        'test "$m9_actual" -gt 0',
+        'test "$m9_actual" -gt 0 && '
+        'test "$m9_fb_before" = "$m9_fb_after"',
         "VPG",
         duration_ms / 1000.0 + 30.0,
     )
@@ -626,6 +714,11 @@ def run_vpg(device: serial.Serial, duration_ms: int) -> int:
             f"rc-{result.return_code}-driver-{after_failure.group(1)}-"
             f"after-{after_state}",
         )
+    framebuffer_problem = framebuffer_hash_problem(
+        result.output, ("vpg-before", "vpg-after")
+    )
+    if framebuffer_problem is not None:
+        return fail("vpg-framebuffer", framebuffer_problem)
     if not re.search(
         r"MICRONUX:M9:VPG:DURING pattern=vertical-bars "
         r"actual_brightness=([1-9]\d*)",
@@ -697,6 +790,7 @@ def run_vpg(device: serial.Serial, duration_ms: int) -> int:
     print(
         "MICRONUX:M9:VPG:AUTOMATED-PASS "
         f"duration_ms={duration_ms} source=restored producer=continuous "
+        "framebuffer=preserved "
         f"linux=retained host-errors=0 vpg-dpi-int={restored_dpi:08x}"
     )
     return 0
@@ -715,6 +809,9 @@ def run_soak(device: serial.Serial, soak_seconds: int, sample_seconds: int) -> i
                 "cat $D/diagnostics",
                 "cat $D/scanout",
                 "cat $D/touch",
+                framebuffer_hash_shell(
+                    f"soak-{index}", "m9_fb_hash"
+                ).removesuffix("; "),
                 f'echo "MICRONUX:M9:SOAK-STATUS index={index} '
                 'pattern=$(cat $D/pattern) boot_ready=$(cat $D/boot_ready) '
                 'bl_power=$(cat $B/bl_power) '
@@ -748,6 +845,12 @@ def run_soak(device: serial.Serial, soak_seconds: int, sample_seconds: int) -> i
         return fail("soak", "sample-count")
     if shells != expected:
         return fail("soak", "shell-count")
+    framebuffer_problem = framebuffer_hash_problem(
+        soak.output,
+        tuple(f"soak-{index}" for index in range(sample_count)),
+    )
+    if framebuffer_problem is not None:
+        return fail("soak-framebuffer", framebuffer_problem)
     statuses = re.findall(
         r"^MICRONUX:M9:SOAK-STATUS index=(\d+) pattern=framebuffer "
         r"boot_ready=1 bl_power=0 actual_brightness=[1-9]\d*\r?$",
@@ -800,7 +903,8 @@ def run_soak(device: serial.Serial, soak_seconds: int, sample_seconds: int) -> i
     print(
         "MICRONUX:M9:SOAK:PASS "
         f"seconds={soak_seconds} samples={sample_count} "
-        "shell=responsive scanout=running underruns=0 errors=0 host-errors=0 "
+        "shell=responsive framebuffer=stable scanout=running "
+        "underruns=0 errors=0 host-errors=0 "
         "frame-ack=disabled clock=forced-hs lp=disabled"
     )
     return 0
@@ -838,6 +942,8 @@ def run_disconnect(
         f'D={DISPLAY_SYSFS}; B=/sys/class/backlight/micronux-backlight; '
         'm9_boot="$(cat /proc/sys/kernel/random/boot_id)"; '
         'echo "MICRONUX:M9:USB-DISCONNECT:BEFORE boot_id=$m9_boot"; '
+        + framebuffer_hash_shell("disconnect-before", "m9_fb_hash")
+        +
         'cat "$D/diagnostics"; cat "$D/scanout"; '
         'echo "MICRONUX:M9:USB-DISCONNECT:STATUS-BEFORE '
         'pattern=$(cat $D/pattern) boot_ready=$(cat $D/boot_ready) '
@@ -852,6 +958,11 @@ def run_disconnect(
     )
     if before.return_code != 0:
         return fail("disconnect-before", f"rc-{before.return_code}"), device
+    framebuffer_problem = framebuffer_hash_problem(
+        before.output, ("disconnect-before",)
+    )
+    if framebuffer_problem is not None:
+        return fail("disconnect-before-framebuffer", framebuffer_problem), device
     if not re.search(
         r"MICRONUX:M9:USB-DISCONNECT:STATUS-BEFORE " + status_re,
         before.output,
@@ -876,6 +987,8 @@ def run_disconnect(
         'boot_id=$m9_boot"; '
         'echo -n "MICRONUX:M9:USB-DISCONNECT:BOUNDARY:UPTIME "; '
         'cat /proc/uptime; '
+        + framebuffer_hash_shell("disconnect-boundary", "m9_fb_hash")
+        +
         'cat "$D/diagnostics"; cat "$D/scanout"; '
         'echo "MICRONUX:M9:USB-DISCONNECT:STATUS-BOUNDARY '
         'pattern=$(cat $D/pattern) boot_ready=$(cat $D/boot_ready) '
@@ -962,6 +1075,8 @@ def run_disconnect(
     after_status = run_command(
         device,
         f'D={DISPLAY_SYSFS}; B=/sys/class/backlight/micronux-backlight; '
+        + framebuffer_hash_shell("disconnect-after", "m9_fb_hash")
+        +
         'echo "MICRONUX:M9:USB-DISCONNECT:STATUS-AFTER '
         'pattern=$(cat $D/pattern) boot_ready=$(cat $D/boot_ready) '
         'bl_power=$(cat $B/bl_power) '
@@ -1015,18 +1130,23 @@ def run_disconnect(
         int(value) for value in re.findall(r"\bframes=(\d+)\b", boundary.output)
     ]
     boundary_problem = display_health_problem(boundary.output)
+    boundary_framebuffer_problem = framebuffer_hash_problem(
+        before.output + boundary.output,
+        ("disconnect-before", "disconnect-boundary"),
+    )
     boundary_status_ok = re.search(
         r"MICRONUX:M9:USB-DISCONNECT:STATUS-BOUNDARY " + status_re,
         boundary.output,
     )
     if (
         boundary_problem is not None
+        or boundary_framebuffer_problem is not None
         or boundary_status_ok is None
         or not before_frames
         or not boundary_frames
         or boundary_frames[-1] <= before_frames[-1]
     ):
-        detail = boundary_problem or (
+        detail = boundary_problem or boundary_framebuffer_problem or (
             "source-or-backlight"
             if boundary_status_ok is None
             else "scanout-did-not-continue"
@@ -1047,18 +1167,23 @@ def run_disconnect(
         int(value) for value in re.findall(r"\bframes=(\d+)\b", after_output)
     ]
     after_problem = display_health_problem(after_output)
+    after_framebuffer_problem = framebuffer_hash_problem(
+        before.output + boundary.output + after_status.output,
+        ("disconnect-before", "disconnect-boundary", "disconnect-after"),
+    )
     after_status_ok = re.search(
         r"MICRONUX:M9:USB-DISCONNECT:STATUS-AFTER " + status_re,
         after_status.output,
     )
     if (
         after_problem is not None
+        or after_framebuffer_problem is not None
         or after_status_ok is None
         or not after_frames
         or after_frames[-1] <= boundary_frames[-1]
     ):
         evidence = reconnect_log + after_output
-        detail = after_problem or (
+        detail = after_problem or after_framebuffer_problem or (
             "source-or-backlight"
             if after_status_ok is None
             else "scanout-did-not-continue"
@@ -1079,14 +1204,17 @@ def run_disconnect(
     print(
         "MICRONUX:M9:USB-RECONNECT:PASS "
         f"disconnected_seconds={disconnect_seconds} linux=retained "
-        "shell=responsive scanout=running underruns=0 errors=0 "
+        "shell=responsive framebuffer=stable scanout=running "
+        "underruns=0 errors=0 "
         "host-errors=0 frame-ack=disabled clock=forced-hs lp=disabled "
         "machine=pass visual=required"
     )
     return 0, device
 
 
-def run_snapshot(device: serial.Serial, snapshot_seconds: int) -> int:
+def run_snapshot(
+    port: str, device: serial.Serial, snapshot_seconds: int
+) -> tuple[int, serial.Serial]:
     captured = capture_passive_output(device, snapshot_seconds)
     print(
         "MICRONUX:M9:SNAPSHOT "
@@ -1101,30 +1229,96 @@ def run_snapshot(device: serial.Serial, snapshot_seconds: int) -> int:
             "MICRONUX:M9:DISPLAY-FAULT",
         )
     ):
-        return fail("snapshot-passive", "kernel-failure-observed")
+        return fail("snapshot-passive", "kernel-failure-observed"), device
 
-    wait_for_prompt(device, 30.0)
-    snapshot = run_command(
-        device,
-        'echo -n "MICRONUX:M9:SNAPSHOT boot_id="; '
-        "cat /proc/sys/kernel/random/boot_id; "
-        'echo -n "MICRONUX:M9:SNAPSHOT uptime="; cat /proc/uptime; '
-        f"cat {DISPLAY_SYSFS}/diagnostics; "
-        f"cat {DISPLAY_SYSFS}/scanout; "
-        f"cat {DISPLAY_SYSFS}/touch",
-        "SNAPSHOT",
-        30.0,
+    device, recovered = recover_reconnect_prompt(port, device, 45.0)
+    captured += recovered
+    print(
+        "MICRONUX:M9:SNAPSHOT "
+        f"state=prompt-recovered bytes={len(recovered.encode('utf-8'))}"
     )
+    if any(
+        marker in recovered
+        for marker in (
+            "Kernel panic",
+            "Oops:",
+            "BUG:",
+            "MICRONUX:M9:DISPLAY-FAULT",
+        )
+    ):
+        return fail("snapshot-reconnect", "kernel-failure-observed"), device
+
+    try:
+        snapshot = run_command(
+            device,
+            'echo -n "MICRONUX:M9:SNAPSHOT boot_id="; '
+            "cat /proc/sys/kernel/random/boot_id; "
+            'echo -n "MICRONUX:M9:SNAPSHOT uptime="; cat /proc/uptime; '
+            f'D={DISPLAY_SYSFS}; B=/sys/class/backlight/micronux-backlight; '
+            'echo -n "MICRONUX:M9:SNAPSHOT pattern="; cat "$D/pattern"; '
+            'echo -n "MICRONUX:M9:SNAPSHOT boot_ready="; '
+            'cat "$D/boot_ready"; '
+            'echo -n "MICRONUX:M9:SNAPSHOT bl_power="; '
+            'cat "$B/bl_power"; '
+            'echo -n "MICRONUX:M9:SNAPSHOT actual_brightness="; '
+            'cat "$B/actual_brightness"; '
+            + framebuffer_hash_shell("snapshot-a", "m9_fb_before")
+            +
+            f"cat {DISPLAY_SYSFS}/diagnostics; "
+            f"cat {DISPLAY_SYSFS}/scanout; "
+            f"cat {DISPLAY_SYSFS}/touch; "
+            + framebuffer_hash_shell("snapshot-b", "m9_fb_after")
+            +
+            'test "$m9_fb_before" = "$m9_fb_after"',
+            "SNAPSHOT",
+            30.0,
+        )
+    except (serial.SerialException, OSError, TimeoutError) as error:
+        return fail("serial", str(error).replace(" ", "-")), device
     if snapshot.return_code != 0:
-        return fail("snapshot", f"rc-{snapshot.return_code}")
-    faults = re.findall(r"\bfaults=([0-9a-fA-F]+)\b", snapshot.output)
-    if not faults or int(faults[-1], 16) != 0:
-        return fail("snapshot", "display-fault-latched")
+        return fail("snapshot", f"rc-{snapshot.return_code}"), device
+    framebuffer_problem = framebuffer_hash_problem(
+        snapshot.output, ("snapshot-a", "snapshot-b")
+    )
+    if framebuffer_problem is not None:
+        return fail("snapshot-framebuffer", framebuffer_problem), device
+    health_problem = display_health_problem(snapshot.output)
+    if health_problem is not None:
+        return fail("snapshot-health", health_problem), device
+    if "host=00000002 active=00000000 lpclk=00000001" not in snapshot.output:
+        return fail("snapshot", "continuous-hs-policy-mismatch"), device
+    if not re.search(
+        r"^MICRONUX:M9:SNAPSHOT pattern=framebuffer\r?$",
+        snapshot.output,
+        re.MULTILINE,
+    ):
+        return fail("snapshot", "framebuffer-source-missing"), device
+    if not re.search(
+        r"^MICRONUX:M9:SNAPSHOT boot_ready=1\r?$",
+        snapshot.output,
+        re.MULTILINE,
+    ):
+        return fail("snapshot", "boot-ready-missing"), device
+    if not re.search(
+        r"^MICRONUX:M9:SNAPSHOT bl_power=0\r?$",
+        snapshot.output,
+        re.MULTILINE,
+    ):
+        return fail("snapshot", "backlight-unblank-missing"), device
+    if not re.search(
+        r"^MICRONUX:M9:SNAPSHOT actual_brightness=[1-9]\d*\r?$",
+        snapshot.output,
+        re.MULTILINE,
+    ):
+        return fail("snapshot", "applied-brightness-missing"), device
     print(
         "MICRONUX:M9:SNAPSHOT:CAPTURED "
-        "reset=not-requested evidence=machine-state visual=unverified"
+        "reset=not-requested source=framebuffer scanout=running "
+        "framebuffer=stable "
+        "faults=0 underruns=0 errors=0 host-errors=0 "
+        "evidence=machine-state visual=unverified"
     )
-    return 0
+    return 0, device
 
 
 def main() -> int:
@@ -1161,8 +1355,13 @@ def main() -> int:
     device: serial.Serial | None = None
     try:
         if args.mode == "snapshot":
-            device = open_serial(args.port, 30.0, clear_input=False)
-            return run_snapshot(device, args.snapshot_seconds)
+            device = open_serial(
+                args.port, 30.0, clear_input=False, write_timeout=1.0
+            )
+            result, device = run_snapshot(
+                args.port, device, args.snapshot_seconds
+            )
+            return result
 
         if args.mode == "preflight":
             print(
@@ -1198,9 +1397,7 @@ def main() -> int:
         return fail("serial", str(error).replace(" ", "-"))
     finally:
         if device is not None:
-            device.dtr = False
-            device.rts = False
-            device.close()
+            close_serial_quietly(device)
 
 
 if __name__ == "__main__":
