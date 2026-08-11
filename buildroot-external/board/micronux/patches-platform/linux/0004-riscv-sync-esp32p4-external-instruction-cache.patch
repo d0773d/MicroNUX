@@ -1,7 +1,7 @@
 From 8f4f1ed3404000d59c54f0f4b625da2b8de34b5c Mon Sep 17 00:00:00 2001
 From: MicroNUX Project <micronux@example.invalid>
 Date: Fri, 7 Aug 2026 18:00:00 -0700
-Subject: [PATCH 4/6] riscv: sync ESP32-P4 external instruction cache
+Subject: [PATCH 4/7] riscv: sync ESP32-P4 external instruction cache
 
 The architectural fence.i instruction synchronizes the CPU pipeline, but it
 does not operate the ESP32-P4's external-memory L1 cache controller.  NOMMU

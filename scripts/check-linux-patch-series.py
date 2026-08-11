@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BOARD = ROOT / "buildroot-external" / "board" / "micronux"
 CONFIGS = ROOT / "buildroot-external" / "configs"
 SERIES = (
-    ("patches-platform", 6),
+    ("patches-platform", 7),
     ("patches-peripherals", 17),
     ("patches-isolation", 10),
 )
@@ -86,7 +86,7 @@ def main() -> int:
     manifest_hash = hashlib.sha256(("\n".join(manifest) + "\n").encode()).hexdigest()
     print(
         "MICRONUX:PATCH-SERIES state=pass "
-        "platform=6 peripherals=17 isolation=10 total=33 "
+        "platform=7 peripherals=17 isolation=10 total=34 "
         f"manifest_sha256={manifest_hash}"
     )
     return 0

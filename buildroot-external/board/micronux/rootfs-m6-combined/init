@@ -71,11 +71,12 @@ if [ -c /dev/fb0 ] && [ -c /dev/tty1 ]; then
 fi
 
 echo 'MICRONUX:M6:COMBINED:SHELL ready console=ttyGS0 network=nonblocking device_api=1.0'
-/bin/busybox setsid /bin/busybox cttyhack /bin/busybox sh -i \
-	</dev/ttyGS0 >/dev/ttyGS0 2>&1 &
-console_shell_pid=$!
-wait "$console_shell_pid"
-console_status=$?
-/bin/busybox kill "$device_supervisor_pid" 2>/dev/null
-wait "$device_supervisor_pid" 2>/dev/null
-exit "$console_status"
+while :; do
+	/bin/busybox setsid /bin/busybox cttyhack /bin/busybox sh -i \
+		</dev/ttyGS0 >/dev/ttyGS0 2>&1 &
+	console_shell_pid=$!
+	wait "$console_shell_pid"
+	console_status=$?
+	echo "MICRONUX:M6:COMBINED:SHELL state=disconnected rc=$console_status action=respawn"
+	/bin/busybox sleep 1
+done

@@ -1,7 +1,7 @@
 From b8bc9344d630dfa5cd786223ddf0d06c97deed99 Mon Sep 17 00:00:00 2001
 From: MicroNUX Project <micronux@example.invalid>
 Date: Sun, 9 Aug 2026 04:45:00 -0700
-Subject: [PATCH 6/6] riscv: fix ESP32-P4 CLIC level across user task switches
+Subject: [PATCH 6/7] riscv: fix ESP32-P4 CLIC level across user task switches
 
 ESP32-P4 revision 1 only restores mintstatus.MIL from mcause.MPIL for
 an interrupt-form mret.  The existing workaround used such an mret

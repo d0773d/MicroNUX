@@ -1,0 +1,151 @@
+From 9a14c7efc7611244a69823ba3848287d7014796d Mon Sep 17 00:00:00 2001
+From: MicroNUX Project <micronux@example.invalid>
+Date: Mon, 10 Aug 2026 18:02:00 -0700
+Subject: [PATCH 7/7] power: protect ESP32-P4 from USB console disconnect
+
+The ESP32-P4 USB Serial/JTAG controller normally converts a host CDC
+control-line transition into a chip reset.  Windows closes the native COM
+port with such a transition, so exiting an otherwise ordinary serial
+terminal resets Linux and leaves the panel showing the loader framebuffer.
+
+Make reset-on-disconnect a machine reset policy rather than tty policy.
+Disable it when the ESP32-P4 restart support initializes, and expose a
+root-writable sysfs control so the flash workflow can deliberately re-enable
+the hardware reset path immediately before invoking esptool.
+
+Signed-off-by: MicroNUX Project <micronux@example.invalid>
+---
+ drivers/power/reset/esp32p4-restart.c | 94 ++++++++++++++++++++++++++-
+ 1 file changed, 89 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/power/reset/esp32p4-restart.c b/drivers/power/reset/esp32p4-restart.c
+index 0cc583b8d87e..e6b7a7d4d0ad 100644
+--- a/drivers/power/reset/esp32p4-restart.c
++++ b/drivers/power/reset/esp32p4-restart.c
+@@ -6,17 +6,68 @@
+  * shipped with ESP-IDF v6.0.1.
+  */
+ 
++#include <linux/bits.h>
+ #include <linux/init.h>
+ #include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/kobject.h>
+ #include <linux/notifier.h>
+ #include <linux/of.h>
+ #include <linux/reboot.h>
++#include <linux/sysfs.h>
+ #include <linux/types.h>
+ 
+ #define ESP32P4_ROM_SOFTWARE_RESET	0x4fc00094UL
++#define ESP32P4_USB_SERIAL_JTAG_BASE	0x500d2000UL
++#define ESP32P4_USB_CHIP_RST_REG		0x4c
++#define ESP32P4_USB_UART_CHIP_RST_DIS	BIT(2)
+ 
+ typedef void (*esp32p4_rom_reset_fn)(void);
+ 
++static void __iomem *esp32p4_usb_chip_rst;
++static struct kobject *esp32p4_micronux_kobj;
++
++static bool esp32p4_usb_reset_enabled(void)
++{
++	return !(readl(esp32p4_usb_chip_rst) &
++		 ESP32P4_USB_UART_CHIP_RST_DIS);
++}
++
++static void esp32p4_set_usb_reset(bool enable)
++{
++	u32 value = readl(esp32p4_usb_chip_rst);
++
++	if (enable)
++		value &= ~ESP32P4_USB_UART_CHIP_RST_DIS;
++	else
++		value |= ESP32P4_USB_UART_CHIP_RST_DIS;
++	writel(value, esp32p4_usb_chip_rst);
++}
++
++static ssize_t usb_reset_show(struct kobject *kobj,
++			      struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%s\n",
++		esp32p4_usb_reset_enabled() ? "enabled" : "disabled");
++}
++
++static ssize_t usb_reset_store(struct kobject *kobj,
++			       struct kobj_attribute *attr,
++			       const char *buf, size_t count)
++{
++	if (sysfs_streq(buf, "enable"))
++		esp32p4_set_usb_reset(true);
++	else if (sysfs_streq(buf, "disable"))
++		esp32p4_set_usb_reset(false);
++	else
++		return -EINVAL;
++
++	return count;
++}
++
++static struct kobj_attribute usb_reset_attr =
++	__ATTR(usb_reset, 0644, usb_reset_show, usb_reset_store);
++
+ static int esp32p4_restart(struct notifier_block *this, unsigned long mode,
+ 			   void *cmd)
+ {
+@@ -41,17 +92,50 @@ static struct notifier_block esp32p4_restart_nb = {
+ 
+ static int __init esp32p4_restart_init(void)
+ {
+-	int ret;
++	int ret = -ENOMEM;
+ 
+ 	if (!of_machine_is_compatible("espressif,esp32p4"))
+ 		return -ENODEV;
+ 
++	esp32p4_usb_chip_rst = ioremap(ESP32P4_USB_SERIAL_JTAG_BASE +
++					       ESP32P4_USB_CHIP_RST_REG,
++					       sizeof(u32));
++	if (!esp32p4_usb_chip_rst) {
++		pr_err("ESP32-P4 USB reset register mapping failed\n");
++		return -ENOMEM;
++	}
++
++	esp32p4_set_usb_reset(false);
+ 	ret = register_restart_handler(&esp32p4_restart_nb);
+-	if (ret)
++	if (ret) {
+ 		pr_err("ESP32-P4 restart handler registration failed: %d\n", ret);
+-	else
+-		pr_info("ESP32-P4 ROM restart handler registered\n");
++		goto err_enable_reset;
++	}
+ 
+-	return ret;
++	esp32p4_micronux_kobj = kobject_create_and_add("micronux", kernel_kobj);
++	if (!esp32p4_micronux_kobj) {
++		pr_err("ESP32-P4 MicroNUX sysfs creation failed\n");
++		goto err_unregister_restart;
++	}
++
++	ret = sysfs_create_file(esp32p4_micronux_kobj,
++				&usb_reset_attr.attr);
++	if (ret) {
++		pr_err("ESP32-P4 USB reset control creation failed: %d\n", ret);
++		goto err_put_kobject;
++	}
++
++	pr_info("ESP32-P4 ROM restart handler registered, "
++		"USB serial reset-on-disconnect disabled\n");
++	return 0;
++
++err_put_kobject:
++	kobject_put(esp32p4_micronux_kobj);
++err_unregister_restart:
++	unregister_restart_handler(&esp32p4_restart_nb);
++err_enable_reset:
++	esp32p4_set_usb_reset(true);
++	iounmap(esp32p4_usb_chip_rst);
++	return ret;
+ }
+ device_initcall(esp32p4_restart_init);
+-- 
+2.43.0

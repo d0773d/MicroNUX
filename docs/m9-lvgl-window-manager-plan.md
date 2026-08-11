@@ -1,6 +1,6 @@
 # M9 Optional LVGL Window and Session Manager Plan
 
-Status: **IMPLEMENTING**
+Status: **TESTING**
 
 Current section: **M9.1 - Linux input and presentation foundation (TESTING)**
 
@@ -17,7 +17,7 @@ only after every required feature and its exit criterion are completed.
 | Work package | Section status | Current evidence |
 | --- | --- | --- |
 | M9.0 Contract freeze | **COMPLETED** | Plan approved for implementation on 2026-08-10; architecture commit `b3d011f` |
-| M9.1 Linux input and presentation | **TESTING** | Physical preflight, five-point touch, normal console return, and SIGTERM recovery passed with zero DSI underruns; final visual confirmation remains |
+| M9.1 Linux input and presentation | **TESTING** | Touch and transition gates pass. A 240-second soak proved stable DSI/DMA, touch, and shell operation. Linux now protects against USB host-close resets and the 15-second disconnect/reconnect hardware gate passes; final human visual confirmation is pending |
 | M9.2 Optional LVGL service | **PLANNED** | Starts only after the M9.1 Linux gate passes |
 | M9.3 UI-v1 and native C SDK | **PLANNED** | Starts only after the M9.2 service gate passes |
 | M9.4 Window and session manager | **PLANNED** | Starts only after the M9.3 ABI gate passes |
@@ -468,7 +468,7 @@ Deliverables:
   device-tree contract;
 - [x] **COMPLETED** - a safe foreground GUI ownership transition for fbcon and
   `/dev/fb0`;
-- [ ] **TESTING** - positioned, paced partial-rectangle presentation; and
+- [x] **COMPLETED** - positioned, paced partial-rectangle presentation; and
 - [ ] **TESTING** - a no-LVGL C diagnostic that proves display and primary
   touch input.
 
@@ -586,6 +586,65 @@ Physical test evidence recorded 2026-08-10, iteration 6:
 - safe foreground ownership and recovery are now `COMPLETED`. Positioned
   presentation and the no-LVGL diagnostic remain `TESTING` only for the final
   human visual-confirmation gate.
+
+Physical test evidence recorded 2026-08-10, iteration 7:
+
+- the user confirmed that touch worked as expected and that all five visual
+  targets could be followed successfully;
+- the full-screen color pattern visibly painted from top to bottom. This is
+  expected for the current deliberately paced single-buffer row writer and is
+  not itself a failure;
+- after loader progress reached 100%, the panel flickered rapidly between light
+  blue and black before the framebuffer terminal appeared; after remaining at
+  the terminal for approximately two minutes, the panel changed to solid light
+  blue; and
+- the delayed visual state is not accepted as stable presentation. M9.1 and
+  positioned presentation return to `IMPLEMENTING`; the completed touch,
+  device-tree, and ownership-transition results remain completed. A timed
+  serial-attached soak now samples DSI underruns, DMA errors, scanout progress,
+  touch health, and shell responsiveness while the visual failure is reproduced.
+- the first soak invocation captured one healthy sample, then stopped because
+  this minimal BusyBox `hush` does not support the runner's arithmetic loop.
+  The test harness is being changed to emit pre-expanded sample commands; this
+  harness failure is not counted as a MicroNUX runtime result.
+
+Physical test evidence recorded 2026-08-10, iteration 8:
+
+- the corrected 240-second soak completed all 17 samples from 0 through 240
+  seconds while scanout advanced from frame 533 to frame 17,204;
+- every sample reported active GDMA scanout, `underruns=0`, DMA
+  `errors=00000000`, ready GT9271 touch with zero transport errors, and a
+  responsive USB shell;
+- the panel changed to the loader's solid light-blue framebuffer exactly when
+  the host test completed and closed COM14, ruling out a spontaneous display
+  or DMA timeout during the observed interval; and
+- inspection found that PID 1 exited after the USB interactive shell received
+  a terminal hangup. That caused Linux to reboot whenever the host terminal
+  disconnected. The init shell is now being supervised and respawned, and a
+  disconnect/reconnect hardware gate is being added before visual stability is
+  accepted.
+
+Physical test evidence recorded 2026-08-10, iteration 9:
+
+- a deliberate host-close test captured reset reason `CHIP_USB_UART_RESET`,
+  proving that native USB Serial/JTAG CDC close reset the entire ESP32-P4 and
+  exposed the loader's light-blue framebuffer; the DSI controller did not fail;
+- Linux now sets the ESP32-P4 USB-UART chip-reset-disable bit during machine
+  restart initialization and exposes the root-writable policy at
+  `/sys/kernel/micronux/usb_reset`; normal runtime state is `disabled`, while
+  the flash workflow explicitly writes `enable` immediately before esptool;
+- the complete 34-patch Linux series passed with manifest SHA-256
+  `2b1d82b01553d9ae65beebcf8b3a5c41300774d3c1b4abb18afa743e0858aee9`, and a
+  clean M9 build passed with Linux 6.12.27, the bFLT W^X audit, LVGL absent,
+  and a 6,090,608-byte image;
+- that exact image was written and hash-verified on the connected ESP32-P4;
+  boot reported `USB serial reset-on-disconnect disabled`, and sysfs confirmed
+  `disabled`; and
+- the automated gate closed COM14 for 15 seconds, then reconnected without a
+  Linux or loader boot marker. The same boot's scanout advanced from frame 487
+  to frame 1,537, the shell returned, and both DSI underruns and DMA errors
+  remained zero. Machine validation passed; human confirmation that the panel
+  stayed on the MicroNUX terminal/status screen is the remaining visual gate.
 
 Exit criterion: the diagnostic draws a target, receives correctly transformed
 touch, returns to the terminal cleanly, and produces zero DSI underruns while

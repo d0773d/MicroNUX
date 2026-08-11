@@ -78,6 +78,11 @@ if ($idfVersion -ne "ESP-IDF v6.0.1-dirty") {
     throw "Expected the verified patched ESP-IDF v6.0.1 worktree, got '$idfVersion'."
 }
 
+& $idfPython (Join-Path $PSScriptRoot "usb-reset-arm.py") --port $Port
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not prepare the MicroNUX USB reset path for flashing."
+}
+
 & $idfPython -m esptool --chip esp32p4 -p $Port -b 921600 `
     --before default-reset --after hard-reset write-flash `
     0x200000 $linuxImagePath `

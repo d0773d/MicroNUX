@@ -1,7 +1,7 @@
 From 208b631640b917d0b60ec67e19af2e807a2dc780 Mon Sep 17 00:00:00 2001
 From: MicroNUX Project <micronux@example.invalid>
 Date: Fri, 7 Aug 2026 17:00:00 -0700
-Subject: [PATCH 3/6] riscv: report raw ESP32-P4 CLIC cause
+Subject: [PATCH 3/7] riscv: report raw ESP32-P4 CLIC cause
 
 The P4 CLIC extends mcause with saved interrupt state that generic RISC-V
 diagnostics intentionally do not expose.  Include the preserved raw value in
