@@ -575,7 +575,8 @@ def run_vpg(device: serial.Serial, duration_ms: int) -> int:
         'm9_brightness="$(cat "$B/brightness")"; '
         'm9_power="$(cat "$B/bl_power")"; '
         'm9_actual="$(cat "$B/actual_brightness")"; '
-        f'/bin/busybox echo {duration_ms} >"$D/vpg_test_ms" & '
+        f"/bin/busybox sh -c 'echo {duration_ms} "
+        f">{DISPLAY_SYSFS}/vpg_test_ms' & "
         'm9_vpg_pid=$!; '
         'sleep 1; '
         'echo "MICRONUX:M9:VPG:DURING pattern=$(cat "$D/pattern") '
