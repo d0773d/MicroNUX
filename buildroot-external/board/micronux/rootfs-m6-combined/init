@@ -57,8 +57,9 @@ else
 fi
 
 if [ -c /dev/fb0 ] && [ -c /dev/tty1 ]; then
-	{
-		printf '\033[H\033[1;36m'
+	display_sysfs=/sys/bus/platform/devices/500a0000.display
+	if ! {
+		printf '\033[2J\033[H\033[1;36m'
 		printf '  MICRONUX\n'
 		printf '\033[0;37m  Linux device controller\n\n'
 		printf '  Display   800x1280 RGB565\n'
@@ -66,8 +67,21 @@ if [ -c /dev/fb0 ] && [ -c /dev/tty1 ]; then
 		printf '  Network   %s\n\n' "$network_state"
 		printf '\033[1;32m  SYSTEM READY\033[0;37m\n'
 		printf '  USB shell: ttyGS0\n'
-	} >/dev/tty1
-	echo 'MICRONUX:M7:FB-CONSOLE state=ready tty=tty1 role=status usb=ttyGS0'
+	} >/dev/tty1; then
+		echo 'MICRONUX:M7:FB-CONSOLE state=fail reason=status-render'
+		exit 1
+	fi
+	cursor_state=unavailable
+	if [ -w /sys/class/graphics/fbcon/cursor_blink ] &&
+		echo 0 >/sys/class/graphics/fbcon/cursor_blink; then
+		cursor_state=steady
+	fi
+	if [ ! -w "$display_sysfs/boot_ready" ] ||
+		! echo 1 >"$display_sysfs/boot_ready"; then
+		echo 'MICRONUX:M7:FB-CONSOLE state=fail reason=display-reveal'
+		exit 1
+	fi
+	echo "MICRONUX:M7:FB-CONSOLE state=ready tty=tty1 role=status usb=ttyGS0 reveal=userspace-ready cursor=$cursor_state"
 fi
 
 echo 'MICRONUX:M6:COMBINED:SHELL ready console=ttyGS0 network=nonblocking device_api=1.0'

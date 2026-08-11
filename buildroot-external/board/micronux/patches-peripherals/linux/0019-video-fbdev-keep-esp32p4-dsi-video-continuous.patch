@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MicroNUX <micronux@example.invalid>
+Date: Mon, 10 Aug 2026 20:15:00 -0700
+Subject: [PATCH 19/22] video: fbdev: keep ESP32-P4 DSI video continuous
+
+The JD9365 is a direct-video panel. Preserve a continuous high-speed clock,
+disable low-power video intervals, and remove the unserviced per-frame BTA ACK
+request when Linux selects framebuffer scanout. Expose the host, PHY, packet,
+and timeout registers needed to verify the policy without resetting the board.
+
+Signed-off-by: MicroNUX <micronux@example.invalid>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 86 ++++++++++++++++++++++++++-----
+ 1 file changed, 74 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -47,7 +47,25 @@
+ #define ESP32P4_DSI_FIFO_ADDRESS		0x50105000
+ 
+ #define DSI_HOST_VID_MODE_CFG		0x38
++#define DSI_HOST_TO_CNT_CFG		0x78
++#define DSI_HOST_HS_RD_TO_CNT		0x7c
++#define DSI_HOST_LP_RD_TO_CNT		0x80
++#define DSI_HOST_HS_WR_TO_CNT		0x84
++#define DSI_HOST_LP_WR_TO_CNT		0x88
++#define DSI_HOST_BTA_TO_CNT		0x8c
++#define DSI_HOST_LPCLK_CTRL		0x94
++#define DSI_HOST_PHY_STATUS		0xb0
++#define DSI_HOST_INT_STATUS0		0xbc
++#define DSI_HOST_INT_STATUS1		0xc0
++#define DSI_HOST_VID_MODE_CFG_ACT	0x138
++#define DSI_HOST_VID_PKT_STATUS		0x168
+ #define DSI_HOST_VPG_EN			BIT(16)
++#define DSI_HOST_FRAME_BTA_ACK_EN	BIT(14)
++#define DSI_HOST_LP_VIDEO_EN_MASK	(GENMASK(13, 8) | BIT(15))
++#define DSI_HOST_PHY_TXREQUESTCLKHS	BIT(0)
++#define DSI_HOST_AUTO_CLKLANE_CTRL	BIT(1)
++#define DSI_HOST_FRAME_BTA_ACK_EN_ACT	BIT(8)
++#define DSI_HOST_LP_VIDEO_EN_ACT_MASK	(GENMASK(7, 2) | BIT(9))
+ 
+ #define DSI_BRG_DPI_MISC_CONFIG		0x40
+ #define DSI_BRG_DPI_EN			BIT(0)
+@@ -681,13 +699,18 @@ static enum hrtimer_restart micronux_dma_poll(struct hrtimer *timer)
+ 
+ static void micronux_select_framebuffer(struct micronux_dsi *dsi)
+ {
+-	u32 bridge, host;
++	u32 bridge, host, lpclk;
+ 
+ 	mutex_lock(&dsi->lock);
+ 	bridge = readl(dsi->bridge + DSI_BRG_DPI_MISC_CONFIG);
+ 	host = readl(dsi->host + DSI_HOST_VID_MODE_CFG);
++	lpclk = readl(dsi->host + DSI_HOST_LPCLK_CTRL);
+ 
+-	host &= ~DSI_HOST_VPG_EN;
++	lpclk |= DSI_HOST_PHY_TXREQUESTCLKHS;
++	lpclk &= ~DSI_HOST_AUTO_CLKLANE_CTRL;
++	host &= ~(DSI_HOST_VPG_EN | DSI_HOST_FRAME_BTA_ACK_EN |
++		  DSI_HOST_LP_VIDEO_EN_MASK);
++	writel(lpclk, dsi->host + DSI_HOST_LPCLK_CTRL);
+ 	writel(host, dsi->host + DSI_HOST_VID_MODE_CFG);
+ 	writel(bridge | DSI_BRG_DPI_EN,
+ 	       dsi->bridge + DSI_BRG_DPI_MISC_CONFIG);
+@@ -827,7 +850,7 @@ static ssize_t boot_ready_store(struct device *dev,
+ 		return ret;
+ 	}
+ 	dev_info(dsi->dev,
+-		 "MICRONUX:M7:DSI-SCANOUT state=ready handoff=blanked-restart stable-frames=%u scanout=hardware-reload-running backlight=restored reveal=userspace-ready\n",
++		 "MICRONUX:M7:DSI-SCANOUT state=ready handoff=blanked-restart stable-frames=%u scanout=hardware-reload-running backlight=restored reveal=userspace-ready frame-ack=disabled clock=forced-hs lp=disabled\n",
+ 		 MICRONUX_SCANOUT_STABLE_FRAMES);
+ 	return count;
+ }
+@@ -855,7 +878,8 @@ static ssize_t scanout_show(struct device *dev,
+ 			    struct device_attribute *attribute, char *buf)
+ {
+ 	struct micronux_dsi *dsi = dev_get_drvdata(dev);
+-	u32 before, after, error, channel_enable, underruns;
++	bool clock_forced_hs, frame_ack_disabled, lp_disabled;
++	u32 active, before, after, error, channel_enable, host, lpclk, underruns;
+ 
+ 	before = READ_ONCE(dsi->scanout_frames);
+ 	msleep(50);
+@@ -864,12 +888,26 @@ static ssize_t scanout_show(struct device *dev,
+ 	underruns = READ_ONCE(dsi->bridge_underruns);
+ 	channel_enable = readl(dsi->gdma + DW_GDMA_CHEN) &
+ 			 BIT(dsi->handoff.dma_channel);
++	host = readl(dsi->host + DSI_HOST_VID_MODE_CFG);
++	active = readl(dsi->host + DSI_HOST_VID_MODE_CFG_ACT);
++	lpclk = readl(dsi->host + DSI_HOST_LPCLK_CTRL);
++	frame_ack_disabled = !(host & DSI_HOST_FRAME_BTA_ACK_EN) &&
++			     !(active & DSI_HOST_FRAME_BTA_ACK_EN_ACT);
++	clock_forced_hs = (lpclk & (DSI_HOST_PHY_TXREQUESTCLKHS |
++				       DSI_HOST_AUTO_CLKLANE_CTRL)) ==
++			  DSI_HOST_PHY_TXREQUESTCLKHS;
++	lp_disabled = !(host & DSI_HOST_LP_VIDEO_EN_MASK) &&
++		      !(active & DSI_HOST_LP_VIDEO_EN_ACT_MASK);
+ 
+ 	return sysfs_emit(buf,
+-			  "%s frames=%u->%u error=%08x underruns=%u chen=%u\n",
+-			  after != before && !error && !underruns ?
++			  "%s frames=%u->%u error=%08x underruns=%u chen=%u frame-ack=%s clock=%s lp=%s\n",
++			  after != before && !error && !underruns &&
++			  frame_ack_disabled && clock_forced_hs && lp_disabled ?
+ 			  "running" : "stalled",
+-			  before, after, error, underruns, !!channel_enable);
++			  before, after, error, underruns, !!channel_enable,
++			  frame_ack_disabled ? "off" : "on",
++			  clock_forced_hs ? "forced-hs" : "auto",
++			  lp_disabled ? "disabled" : "enabled");
+ }
+ static DEVICE_ATTR_RO(scanout);
+ 
+@@ -881,6 +919,7 @@ static ssize_t diagnostics_show(struct device *dev,
+ 		dsi->handoff.framebuffer_address;
+ 	u32 sar_before, sar_after, llp_before, llp_after;
+ 	u32 status_before, status_after;
++	u32 active, host, lpclk;
+ 
+ 	sar_before = readl(dsi->channel + DW_GDMA_CH_SAR);
+ 	llp_before = readl(dsi->channel + DW_GDMA_CH_LLP);
+@@ -889,12 +928,20 @@ static ssize_t diagnostics_show(struct device *dev,
+ 	sar_after = readl(dsi->channel + DW_GDMA_CH_SAR);
+ 	llp_after = readl(dsi->channel + DW_GDMA_CH_LLP);
+ 	status_after = readl(dsi->channel + DW_GDMA_CH_STATUS);
++	host = readl(dsi->host + DSI_HOST_VID_MODE_CFG);
++	active = readl(dsi->host + DSI_HOST_VID_MODE_CFG_ACT);
++	lpclk = readl(dsi->host + DSI_HOST_LPCLK_CTRL);
+ 
+ 	return sysfs_emit(buf,
+ 		"chen=%08x sar=%08x->%08x dar=%08x block=%08x "
+ 		"ctl=%08x:%08x cfg=%08x:%08x llp=%08x->%08x "
+-		"status=%08x->%08x int=%08x int-ena=%08x host=%08x bridge=%08x "
+-		"bridge-raw=%08x underruns=%u "
++		"status=%08x->%08x int=%08x int-ena=%08x "
++		"host=%08x active=%08x lpclk=%08x "
++		"frame-ack=%u continuous-hs=%u lp-disabled=%u "
++		"host-int=%08x:%08x "
++		"phy=%08x packet=%08x "
++		"timeouts=%08x:%08x:%08x:%08x:%08x:%08x "
++		"bridge=%08x bridge-raw=%08x underruns=%u "
+ 		"desc=%08x sar=%08x dar=%08x llp=%08x ctl=%08x "
+ 		"fb-cached=%08x fb-uncached=%08x frames=%u errors=%08x\n",
+ 		readl(dsi->gdma + DW_GDMA_CHEN),
+@@ -908,7 +955,24 @@ static ssize_t diagnostics_show(struct device *dev,
+ 		llp_before, llp_after, status_before, status_after,
+ 		readl(dsi->channel + DW_GDMA_CH_INT_STATUS),
+ 		readl(dsi->channel + DW_GDMA_CH_INT_STATUS_ENA),
+-		readl(dsi->host + DSI_HOST_VID_MODE_CFG),
++		host, active, lpclk,
++		!!((host & DSI_HOST_FRAME_BTA_ACK_EN) |
++		   (active & DSI_HOST_FRAME_BTA_ACK_EN_ACT)),
++		(lpclk & (DSI_HOST_PHY_TXREQUESTCLKHS |
++			  DSI_HOST_AUTO_CLKLANE_CTRL)) ==
++		 DSI_HOST_PHY_TXREQUESTCLKHS,
++		!(host & DSI_HOST_LP_VIDEO_EN_MASK) &&
++		!(active & DSI_HOST_LP_VIDEO_EN_ACT_MASK),
++		readl(dsi->host + DSI_HOST_INT_STATUS0),
++		readl(dsi->host + DSI_HOST_INT_STATUS1),
++		readl(dsi->host + DSI_HOST_PHY_STATUS),
++		readl(dsi->host + DSI_HOST_VID_PKT_STATUS),
++		readl(dsi->host + DSI_HOST_TO_CNT_CFG),
++		readl(dsi->host + DSI_HOST_HS_RD_TO_CNT),
++		readl(dsi->host + DSI_HOST_LP_RD_TO_CNT),
++		readl(dsi->host + DSI_HOST_HS_WR_TO_CNT),
++		readl(dsi->host + DSI_HOST_LP_WR_TO_CNT),
++		readl(dsi->host + DSI_HOST_BTA_TO_CNT),
+ 		readl(dsi->bridge + DSI_BRG_DPI_MISC_CONFIG),
+ 		readl(dsi->bridge + DSI_BRG_INT_RAW),
+ 		READ_ONCE(dsi->bridge_underruns),
+-- 
+2.47.3

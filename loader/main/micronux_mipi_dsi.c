@@ -106,6 +106,14 @@ static esp_err_t probe_display_adapter(void)
 #define MICRONUX_DSI_NONCACHE_OFFSET UINT32_C(0x40000000)
 #define MICRONUX_DSI_DMA_DESCRIPTOR_ALIGNMENT UINT32_C(64)
 #define MICRONUX_DSI_DMA_DESCRIPTOR_COUNT UINT32_C(4)
+#define MICRONUX_DSI_BACKLIGHT_OFF_SETTLE_MS UINT32_C(100)
+#if CONFIG_MICRONUX_MIPI_PANEL_JD9365_800_1280
+#define MICRONUX_DSI_CLOCK_LANE_FORCE_HS 1
+#define MICRONUX_DSI_LINK_LOG " lane_clock=forced-hs video_lp=disabled"
+#else
+#define MICRONUX_DSI_CLOCK_LANE_FORCE_HS 0
+#define MICRONUX_DSI_LINK_LOG " lane_clock=auto video_lp=panel-default"
+#endif
 #define MICRONUX_SPLASH_BACKGROUND UINT16_C(0x0842)
 #define MICRONUX_SPLASH_FOREGROUND UINT16_C(0xffff)
 #define MICRONUX_SPLASH_ACCENT UINT16_C(0x05ff)
@@ -165,6 +173,7 @@ static bool s_dma_policy_ready;
 static void *s_framebuffer;
 static size_t s_framebuffer_size;
 static uint8_t s_progress_percent;
+static uint16_t s_dpi_clock_mhz;
 
 static esp_err_t write_backlight_register(uint8_t reg, uint8_t value)
 {
@@ -460,7 +469,10 @@ static esp_err_t create_selected_panel(void)
 #if CONFIG_MICRONUX_MIPI_PANEL_JD9365_800_1280
     esp_lcd_dpi_panel_config_t dpi_config =
         JD9365_800_1280_PANEL_60HZ_DPI_CONFIG(LCD_COLOR_FMT_RGB565);
+    /* Exact Waveshare Kit C profile; do not inherit an older component value. */
+    dpi_config.dpi_clock_freq_mhz = 80;
     dpi_config.num_fbs = 1;
+    dpi_config.flags.disable_lp = 1;
     jd9365_vendor_config_t vendor_config = {
         .mipi_config = {
             .dsi_bus = s_dsi_bus,
@@ -504,6 +516,8 @@ static esp_err_t create_selected_panel(void)
 #else
     return ESP_ERR_INVALID_STATE;
 #endif
+
+    s_dpi_clock_mhz = (uint16_t)dpi_config.dpi_clock_freq_mhz;
 
 #if !CONFIG_MICRONUX_MIPI_PANEL_UNSELECTED
     const esp_lcd_panel_dev_config_t panel_config = {
@@ -564,6 +578,7 @@ esp_err_t micronux_mipi_dsi_prepare(void)
         .num_data_lanes = MICRONUX_DSI_LANES,
         .phy_clk_src = MIPI_DSI_PHY_CLK_SRC_DEFAULT,
         .lane_bit_rate_mbps = s_profile.lane_mbps,
+        .flags.clock_lane_force_hs = MICRONUX_DSI_CLOCK_LANE_FORCE_HS,
     };
     ESP_RETURN_ON_ERROR(esp_lcd_new_dsi_bus(&bus_config, &s_dsi_bus), TAG,
                         "create MIPI DSI bus");
@@ -624,11 +639,13 @@ esp_err_t micronux_mipi_dsi_prepare(void)
     }
     ESP_LOGI(TAG,
              "MICRONUX:M6:DSI state=ready profile=%s resolution=%ux%u"
-             " lanes=%u lane_mbps=%u format=rgb565 pattern=framebuffer"
+             " lanes=%u lane_mbps=%u dpi_mhz=%u"
+             " format=rgb565 pattern=framebuffer"
+             MICRONUX_DSI_LINK_LOG
              " fb=%p bytes=%zu ownership=loader backlight=%u"
              " i2c=retained-for-linux",
              s_profile.name, s_profile.width, s_profile.height,
-             MICRONUX_DSI_LANES, s_profile.lane_mbps,
+             MICRONUX_DSI_LANES, s_profile.lane_mbps, s_dpi_clock_mhz,
              framebuffer, framebuffer_size,
              CONFIG_MICRONUX_MIPI_BACKLIGHT_PERCENT);
     return ESP_OK;
@@ -704,11 +721,18 @@ esp_err_t micronux_mipi_dsi_handoff(void)
     ESP_RETURN_ON_ERROR(
         write_backlight_register(MICRONUX_DSI_BACKLIGHT_REGISTER, 0),
         TAG, "blank backlight for MIPI handoff");
-    ESP_RETURN_ON_ERROR(release_backlight_device(), TAG,
-                        "release loader backlight device");
+    /*
+     * I2C completion only proves that the adapter accepted brightness=0.
+     * Keep the splash scanout valid until its LED current has settled, so the
+     * panel's cyan no-video state cannot become visible during ownership
+     * transfer.
+     */
+    /* One extra tick makes 100 ms a minimum despite tick-phase truncation. */
+    vTaskDelay(pdMS_TO_TICKS(MICRONUX_DSI_BACKLIGHT_OFF_SETTLE_MS) + 1U);
     ESP_LOGI(TAG,
-             "MICRONUX:M7:DSI-BLANK state=ready backlight=off"
-             " restore=linux-after-first-frame");
+             "MICRONUX:M7:DSI-BLANK state=ready backlight=off settle_ms=%" PRIu32
+             " restore=linux-after-status-ready",
+             MICRONUX_DSI_BACKLIGHT_OFF_SETTLE_MS);
 
     esp_lcd_dpi_panel_handoff_t dsi_handoff = {0};
     ESP_RETURN_ON_ERROR(
@@ -752,6 +776,10 @@ esp_err_t micronux_mipi_dsi_handoff(void)
                  " reason=framebuffer-changed");
         return ESP_ERR_INVALID_STATE;
     }
+
+    /* Keep fail-dark control until every fallible handoff check has passed. */
+    ESP_RETURN_ON_ERROR(release_backlight_device(), TAG,
+                        "release loader backlight device");
 
     REG_WRITE(I2C_INT_ENA_REG(MICRONUX_DSI_I2C_PORT), 0);
     REG_WRITE(I2C_INT_CLR_REG(MICRONUX_DSI_I2C_PORT), UINT32_MAX);
@@ -808,7 +836,7 @@ esp_err_t micronux_mipi_dsi_handoff(void)
     ESP_LOGI(TAG,
              "MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending"
              " pattern=framebuffer dma=descriptor-ring channel=%d"
-             " rearm=linux-after-blank"
+             " rearm=linux-after-status-ready"
              " fb=[%08" PRIxPTR ",%08" PRIxPTR ")"
              " desc=[%08" PRIxPTR ",%08" PRIxPTR ") i2c=transferred"
              " contract=%08" PRIx32 " crc32=%08" PRIx32,

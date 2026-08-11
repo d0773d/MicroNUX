@@ -21,6 +21,7 @@
 #define DISPLAY_STRIDE (DISPLAY_WIDTH * 2U)
 #define TOUCH_NAME "MicroNUX GT9271 Touchscreen"
 #define TOUCH_SYSFS "/sys/bus/platform/devices/500a0000.display/touch"
+#define BOOT_READY_SYSFS "/sys/bus/platform/devices/500a0000.display/boot_ready"
 #define LOCK_PATH "/run/micronux-display.lock"
 #define MAX_INPUT_DEVICES 8
 #define TARGET_HALF 32U
@@ -83,44 +84,84 @@ static int bit_is_set(const unsigned long *bits, unsigned int bit)
 		  (1UL << (bit % BITS_PER_LONG)));
 }
 
-static void restore_console(void)
+static int set_boot_ready(int ready)
 {
-	int framebuffer_fd = -1;
+	const char value[2] = { ready ? '1' : '0', '\n' };
+	int fd;
+	int saved_errno;
+
+	fd = open(BOOT_READY_SYSFS, O_WRONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	if (write(fd, value, sizeof(value)) != (ssize_t)sizeof(value)) {
+		saved_errno = errno ? errno : EIO;
+		(void)close(fd);
+		errno = saved_errno;
+		return -1;
+	}
+	if (close(fd) < 0)
+		return -1;
+	return 0;
+}
+
+static int restore_console_state(void)
+{
+	int first_error = 0;
 
 	if (graphics_active && console_fd >= 0) {
-		framebuffer_fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
-		if (framebuffer_fd >= 0)
-			(void)ioctl(framebuffer_fd, FBIOBLANK,
-				    FB_BLANK_POWERDOWN);
-		(void)ioctl(console_fd, KDSETMODE, KD_TEXT);
-		if (framebuffer_fd >= 0) {
-			(void)ioctl(framebuffer_fd, FBIOBLANK,
-				    FB_BLANK_UNBLANK);
-			(void)close(framebuffer_fd);
-		}
+		/* Keep fbcon's KD_TEXT redraw dark until the status frame is complete. */
+		if (set_boot_ready(0) < 0)
+			first_error = errno;
+		if (!first_error && ioctl(console_fd, KDSETMODE, KD_TEXT) < 0)
+			first_error = errno;
+		if (!first_error && set_boot_ready(1) < 0)
+			first_error = errno;
 	}
 	graphics_active = 0;
 	if (console_fd >= 0) {
 		(void)close(console_fd);
 		console_fd = -1;
 	}
+	if (first_error) {
+		errno = first_error;
+		return -1;
+	}
+	return 0;
+}
+
+static void restore_console(void)
+{
+	(void)restore_console_state();
 }
 
 static void handle_signal(int signal_number)
 {
-	(void)signal_number;
-	restore_console();
-	_exit(128 + SIGTERM);
+	if (restore_console_state() != 0)
+		_exit(125);
+	_exit(128 + signal_number);
 }
 
 static int acquire_graphics(void)
 {
+	int framebuffer_fd;
+	int saved_errno;
+
 	console_fd = open("/dev/tty1", O_RDWR | O_CLOEXEC);
 	if (console_fd < 0)
 		return fail("tty1-open");
 	if (ioctl(console_fd, KDSETMODE, KD_GRAPHICS) < 0)
 		return fail("kd-graphics");
 	graphics_active = 1;
+	framebuffer_fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+	if (framebuffer_fd < 0)
+		return fail("framebuffer-unblank-open");
+	if (ioctl(framebuffer_fd, FBIOBLANK, FB_BLANK_UNBLANK) < 0) {
+		saved_errno = errno;
+		(void)close(framebuffer_fd);
+		errno = saved_errno;
+		return fail("framebuffer-unblank");
+	}
+	(void)close(framebuffer_fd);
 	return 0;
 }
 
@@ -403,7 +444,8 @@ static int run_draw(unsigned int seconds)
 	       seconds, WRITE_CHUNK, WRITE_GAP_NS);
 	(void)sleep(seconds);
 	(void)close(fb);
-	restore_console();
+	if (restore_console_state() != 0)
+		return fail("console-restore");
 	printf("MICRONUX:M9:DISPLAY-TEST:PASS mode=draw console=restored\n");
 	return 0;
 }
@@ -461,7 +503,8 @@ static int run_touch(unsigned int timeout_ms)
 
 	(void)close(touch);
 	(void)close(fb);
-	restore_console();
+	if (restore_console_state() != 0)
+		return fail("console-restore");
 	printf("MICRONUX:M9:DISPLAY-TEST:PASS mode=touch points=5 input=%s console=restored\n",
 	       touch_path);
 	return 0;
@@ -517,7 +560,8 @@ int main(int argc, char **argv)
 		result = 2;
 	}
 
-	restore_console();
+	if (restore_console_state() != 0 && result == 0)
+		result = fail("console-restore");
 	(void)close(lock_fd);
 	return result;
 }

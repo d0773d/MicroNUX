@@ -133,8 +133,28 @@ if ! grep -q 'console=ttyGS0,115200' "${KERNEL_DIR}/.config"; then
 	printf 'M7 kernel did not retain the USB recovery console.\n' >&2
 	exit 1
 fi
-if ! grep -q 'MICRONUX:M7:FB-CONSOLE state=ready' "${OUTPUT_DIR}/target/init"; then
+if ! grep -q 'MICRONUX:M7:FB-CONSOLE state=ready' "${OUTPUT_DIR}/target/init" ||
+	! grep -q 'boot_ready' "${OUTPUT_DIR}/target/init"; then
 	printf 'M7 rootfs is missing the framebuffer status console.\n' >&2
+	exit 1
+fi
+if ! grep -q 'DSI_HOST_FRAME_BTA_ACK_EN' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c"; then
+	printf 'M7 kernel is missing the continuous-video frame-ACK policy.\n' >&2
+	exit 1
+fi
+if ! grep -q 'DSI_HOST_LPCLK_CTRL' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
+	! grep -q 'DSI_HOST_VID_MODE_CFG_ACT' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c"; then
+	printf 'M7 kernel is missing the continuous-high-speed DSI policy.\n' >&2
+	exit 1
+fi
+if ! grep -q 'MICRONUX_BACKLIGHT_OFF_SETTLE_MS' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
+	! grep -q 'DEVICE_ATTR_WO(vpg_test_ms)' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c"; then
+	printf 'M7 kernel is missing the dark-settle or bounded VPG contract.\n' >&2
 	exit 1
 fi
 if ! grep -aq 'micronux,esp32p4-user-pool' "${DTB}"; then

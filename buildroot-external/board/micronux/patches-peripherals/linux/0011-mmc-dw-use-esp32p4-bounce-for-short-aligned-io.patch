@@ -1,7 +1,7 @@
 From b5640b5344540b88028b6526add481a7ca1d4231 Mon Sep 17 00:00:00 2001
 From: MicroNUX contributors <micronux@users.noreply.github.com>
 Date: Sat, 8 Aug 2026 16:55:00 -0700
-Subject: [PATCH 11/17] mmc: dw: use ESP32-P4 bounce for short aligned I/O
+Subject: [PATCH 11/22] mmc: dw: use ESP32-P4 bounce for short aligned I/O
 
 Generic DesignWare MMC sends transfers shorter than 16 bytes through PIO to
 avoid DMA setup overhead.  ESP-Hosted's interrupt handler reads three 32-bit

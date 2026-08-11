@@ -1,0 +1,744 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MicroNUX <micronux@example.invalid>
+Date: Mon, 10 Aug 2026 23:00:00 -0700
+Subject: [PATCH 22/22] video: fbdev: contain ESP32-P4 display faults safely
+
+Never illuminate the panel unless a verified framebuffer or VPG source is
+active and healthy. Track the last confirmed hardware brightness, preserve
+a valid video producer when backlight I2C completion is ambiguous, and mark
+scanout inactive after every destructive stop attempt.
+
+Latch DMA errors, bridge underruns, stale frames, and fatal DSI payload
+faults in IRQ-safe paths, then turn the backlight off from process context
+without disturbing the last source. Serialize and retain the DSI host's
+read-to-clear status registers for post-fault evidence.
+
+Darken and settle before every bounded VPG source transition, discard only
+the intentional dark transition residue, prime the selected source before
+reveal, and keep the health timer stopped until framebuffer restoration is
+validated. Require reboot after destructive faults because Linux does not
+yet own a proven panel reinitialization sequence. Close IRQ, workqueue, and
+backlight lifetimes before releasing framebuffer-private state.
+
+Signed-off-by: MicroNUX <micronux@example.invalid>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 399 +++++++++++++++++++++++++++++++++-----
+ 1 file changed, 349 insertions(+), 50 deletions(-)
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 4e145de..c99710f 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -19,12 +19,15 @@
+ #include <linux/hrtimer.h>
+ #include <linux/input.h>
+ #include <linux/interrupt.h>
++#include <linux/jiffies.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
++#include <linux/spinlock.h>
+ #include <linux/uaccess.h>
++#include <linux/workqueue.h>
+ 
+ #define MICRONUX_DISPLAY_MAGIC		0x4d4e5844
+ #define MICRONUX_DISPLAY_ABI_VERSION	1
+@@ -57,6 +60,9 @@
+ #define DSI_HOST_PHY_STATUS		0xb0
+ #define DSI_HOST_INT_STATUS0		0xbc
+ #define DSI_HOST_INT_STATUS1		0xc0
++#define DSI_HOST_INT_STATUS0_VALID	GENMASK(20, 0)
++#define DSI_HOST_INT_STATUS1_VALID	(BIT(19) | GENMASK(12, 0))
++#define DSI_HOST_INT_STATUS1_FATAL	(BIT(7) | BIT(19))
+ #define DSI_HOST_VID_MODE_CFG_ACT	0x138
+ #define DSI_HOST_VID_PKT_STATUS		0x168
+ #define DSI_HOST_VPG_EN			BIT(16)
+@@ -118,9 +124,16 @@
+ #define MICRONUX_SCANOUT_START_TIMEOUT_MS 500
+ #define MICRONUX_SCANOUT_STABLE_FRAMES	4
+ #define MICRONUX_BACKLIGHT_OFF_SETTLE_MS 100
++#define MICRONUX_VPG_SOURCE_SETTLE_MS	100
+ #define MICRONUX_VPG_TEST_MIN_MS	250
+ #define MICRONUX_VPG_TEST_MAX_MS	10000
+ 
++#define MICRONUX_FAULT_DMA		0
++#define MICRONUX_FAULT_UNDERRUN		1
++#define MICRONUX_FAULT_STALE_FRAME	2
++#define MICRONUX_FAULT_DSI_HOST		3
++#define MICRONUX_FRAME_RECENT_MS	250
++
+ #define MICRONUX_TOUCH_ADDRESS_PRIMARY	0x5d
+ #define MICRONUX_TOUCH_ADDRESS_BACKUP	0x14
+ #define MICRONUX_TOUCH_PRODUCT_ID	0x8140
+@@ -205,12 +218,19 @@ struct micronux_dsi {
+ 	struct mutex lock;
+ 	/* Serializes scanout source and backlight transitions. */
+ 	struct mutex mode_lock;
++	/* Serializes the read-to-clear DSI host status registers. */
++	spinlock_t host_status_lock;
+ 	struct micronux_display_handoff_v1 handoff;
+ 	u32 uncached_offset;
+ 	u32 palette[16];
+ 	u32 scanout_frames;
+ 	u32 last_dma_error;
+ 	u32 bridge_underruns;
++	u32 host_error0;
++	u32 host_error1;
++	unsigned long fault_bits;
++	unsigned long last_frame_jiffies;
++	u8 applied_brightness;
+ 	bool scanout_ready;
+ 	bool scanout_active;
+ 	bool boot_display_ready;
+@@ -222,6 +242,7 @@ struct micronux_dsi {
+ 	char touch_product[5];
+ 	bool touch_down;
+ 	struct hrtimer scanout_timer;
++	struct work_struct fault_work;
+ };
+ 
+ static int micronux_i2c_prepare_locked(struct micronux_dsi *dsi)
+@@ -364,20 +385,157 @@ static int micronux_i2c_write_reg16(struct micronux_dsi *dsi, u8 address,
+ 	return micronux_i2c_write_bytes(dsi, address, bytes, sizeof(bytes));
+ }
+ 
++static void micronux_latch_fault(struct micronux_dsi *dsi, int fault)
++{
++	if (!test_and_set_bit(fault, &dsi->fault_bits))
++		schedule_work(&dsi->fault_work);
++}
++
++/* INT_ST0/1 are read-to-clear; serialize every runtime read. */
++static void micronux_discard_host_status(struct micronux_dsi *dsi)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&dsi->host_status_lock, flags);
++	readl(dsi->host + DSI_HOST_INT_STATUS0);
++	readl(dsi->host + DSI_HOST_INT_STATUS1);
++	spin_unlock_irqrestore(&dsi->host_status_lock, flags);
++}
++
++static bool micronux_sample_host_status(struct micronux_dsi *dsi)
++{
++	unsigned long flags;
++	u32 status0, status1;
++
++	spin_lock_irqsave(&dsi->host_status_lock, flags);
++	status0 = readl(dsi->host + DSI_HOST_INT_STATUS0) &
++		  DSI_HOST_INT_STATUS0_VALID;
++	status1 = readl(dsi->host + DSI_HOST_INT_STATUS1) &
++		  DSI_HOST_INT_STATUS1_VALID;
++
++	if (status0)
++		WRITE_ONCE(dsi->host_error0,
++			   READ_ONCE(dsi->host_error0) | status0);
++	if (status1)
++		WRITE_ONCE(dsi->host_error1,
++			   READ_ONCE(dsi->host_error1) | status1);
++	spin_unlock_irqrestore(&dsi->host_status_lock, flags);
++	if (status1 & DSI_HOST_INT_STATUS1_FATAL)
++		micronux_latch_fault(dsi, MICRONUX_FAULT_DSI_HOST);
++	return status0 || status1;
++}
++
++static bool micronux_host_status_clean(struct micronux_dsi *dsi)
++{
++	return !READ_ONCE(dsi->host_error0) &&
++	       !READ_ONCE(dsi->host_error1);
++}
++
++static bool micronux_source_policy_valid(struct micronux_dsi *dsi,
++					 bool vpg);
++
++static bool micronux_visible_source_valid(struct micronux_dsi *dsi)
++{
++	unsigned long last_frame;
++	bool vpg;
++
++	if (!READ_ONCE(dsi->scanout_ready))
++		return false;
++	vpg = READ_ONCE(dsi->vpg_test_active);
++	if (!vpg)
++		(void)micronux_sample_host_status(dsi);
++	if (!READ_ONCE(dsi->boot_display_ready) ||
++	    !READ_ONCE(dsi->scanout_active) ||
++	    READ_ONCE(dsi->fault_bits) ||
++	    READ_ONCE(dsi->last_dma_error) ||
++	    (readl(dsi->bridge + DSI_BRG_INT_RAW) & DSI_BRG_INT_UNDERRUN))
++		return false;
++
++	if (!micronux_source_policy_valid(dsi, vpg))
++		return false;
++	if (vpg)
++		return true;
++
++	last_frame = READ_ONCE(dsi->last_frame_jiffies);
++	return last_frame &&
++	       !time_after(jiffies,
++			   last_frame + msecs_to_jiffies(MICRONUX_FRAME_RECENT_MS));
++}
++
+ static int micronux_backlight_update(struct backlight_device *backlight)
+ {
+ 	struct micronux_dsi *dsi = bl_get_data(backlight);
+ 	u8 brightness = backlight_get_brightness(backlight);
++	int ret;
+ 
+ 	if (backlight_is_blank(backlight))
+ 		brightness = 0;
+-	return micronux_i2c_write_reg8(dsi, dsi->handoff.i2c_address,
+-				       dsi->handoff.backlight_register, brightness);
++	if (brightness && !micronux_visible_source_valid(dsi)) {
++		ret = micronux_i2c_write_reg8(dsi, dsi->handoff.i2c_address,
++					      dsi->handoff.backlight_register, 0);
++		if (ret)
++			return ret;
++		WRITE_ONCE(dsi->applied_brightness, 0);
++		dev_warn_ratelimited(dsi->dev,
++				     "refusing backlight reveal without a healthy video source\n");
++		return -EHOSTDOWN;
++	}
++	ret = micronux_i2c_write_reg8(dsi, dsi->handoff.i2c_address,
++				      dsi->handoff.backlight_register, brightness);
++	if (!ret)
++		WRITE_ONCE(dsi->applied_brightness, brightness);
++	return ret;
+ }
+ 
+ static int micronux_backlight_get(struct backlight_device *backlight)
+ {
+-	return backlight->props.brightness;
++	struct micronux_dsi *dsi = bl_get_data(backlight);
++
++	return READ_ONCE(dsi->applied_brightness);
++}
++
++static int micronux_backlight_set_power(struct micronux_dsi *dsi, int power)
++{
++	int old_power = dsi->backlight->props.power;
++	int ret;
++
++	dsi->backlight->props.power = power;
++	ret = backlight_update_status(dsi->backlight);
++	if (ret)
++		dsi->backlight->props.power = old_power;
++	return ret;
++}
++
++static void micronux_fault_work(struct work_struct *work)
++{
++	struct micronux_dsi *dsi = container_of(work, struct micronux_dsi,
++						 fault_work);
++	unsigned long faults;
++	int ret;
++
++	mutex_lock(&dsi->mode_lock);
++	mutex_lock(&dsi->backlight->ops_lock);
++	faults = READ_ONCE(dsi->fault_bits);
++	if (!READ_ONCE(dsi->scanout_ready) || !faults)
++		goto out;
++
++	WRITE_ONCE(dsi->boot_display_ready, false);
++	ret = micronux_backlight_set_power(dsi, FB_BLANK_POWERDOWN);
++	if (ret) {
++		dev_err(dsi->dev,
++			"MICRONUX:M9:DISPLAY-FAULT state=containment-failed faults=%lx host=%08x:%08x backlight=unknown source=preserved off_error=%d reboot=required\n",
++			faults, READ_ONCE(dsi->host_error0),
++			READ_ONCE(dsi->host_error1), ret);
++		goto out;
++	}
++	msleep(MICRONUX_BACKLIGHT_OFF_SETTLE_MS);
++	dev_err(dsi->dev,
++		"MICRONUX:M9:DISPLAY-FAULT state=contained faults=%lx host=%08x:%08x backlight=off source=preserved reboot=required\n",
++		faults, READ_ONCE(dsi->host_error0),
++		READ_ONCE(dsi->host_error1));
++out:
++	mutex_unlock(&dsi->backlight->ops_lock);
++	mutex_unlock(&dsi->mode_lock);
+ }
+ 
+ static const struct backlight_ops micronux_backlight_ops = {
+@@ -680,15 +838,18 @@ static irqreturn_t micronux_dma_irq(int irq, void *data)
+ 	if (!status)
+ 		return IRQ_NONE;
+ 	writel(status, dsi->channel + DW_GDMA_CH_INT_CLEAR);
+-	if (status & DW_GDMA_INT_ERROR_MASK)
++	if (status & DW_GDMA_INT_ERROR_MASK) {
+ 		WRITE_ONCE(dsi->last_dma_error,
+ 			   status & DW_GDMA_INT_ERROR_MASK);
++		micronux_latch_fault(dsi, MICRONUX_FAULT_DMA);
++	}
+ 	if (status & DW_GDMA_INT_BLOCK_TFR_DONE) {
+ 		writel(readl(dsi->bridge + DSI_BRG_RAW_NUM_CONFIG) |
+ 		       DSI_BRG_RAW_NUM_TOTAL_SET,
+ 		       dsi->bridge + DSI_BRG_RAW_NUM_CONFIG);
+ 		WRITE_ONCE(dsi->scanout_frames,
+ 			   READ_ONCE(dsi->scanout_frames) + 1);
++		WRITE_ONCE(dsi->last_frame_jiffies, jiffies);
+ 	}
+ 	return IRQ_HANDLED;
+ }
+@@ -697,6 +858,7 @@ static enum hrtimer_restart micronux_dma_poll(struct hrtimer *timer)
+ {
+ 	struct micronux_dsi *dsi = container_of(timer, struct micronux_dsi,
+ 					       scanout_timer);
++	unsigned long last_frame;
+ 	u32 bridge_status;
+ 
+ 	bridge_status = readl(dsi->bridge + DSI_BRG_INT_RAW);
+@@ -705,7 +867,17 @@ static enum hrtimer_restart micronux_dma_poll(struct hrtimer *timer)
+ 		       dsi->bridge + DSI_BRG_INT_CLR);
+ 		WRITE_ONCE(dsi->bridge_underruns,
+ 			   READ_ONCE(dsi->bridge_underruns) + 1);
++		micronux_latch_fault(dsi, MICRONUX_FAULT_UNDERRUN);
+ 	}
++	(void)micronux_sample_host_status(dsi);
++	last_frame = READ_ONCE(dsi->last_frame_jiffies);
++	if (READ_ONCE(dsi->scanout_ready) &&
++	    READ_ONCE(dsi->boot_display_ready) &&
++	    READ_ONCE(dsi->scanout_active) &&
++	    !READ_ONCE(dsi->fault_bits) &&
++	    (!last_frame || time_after(jiffies,
++		last_frame + msecs_to_jiffies(MICRONUX_FRAME_RECENT_MS))))
++		micronux_latch_fault(dsi, MICRONUX_FAULT_STALE_FRAME);
+ 	hrtimer_forward_now(timer, ns_to_ktime(MICRONUX_DMA_POLL_NS));
+ 	return HRTIMER_RESTART;
+ }
+@@ -748,7 +920,7 @@ static bool micronux_source_policy_valid(struct micronux_dsi *dsi,
+ 			 DSI_HOST_LP_VIDEO_EN_MASK)) &&
+ 	       (lpclk & (DSI_HOST_PHY_TXREQUESTCLKHS |
+ 			 DSI_HOST_AUTO_CLKLANE_CTRL)) ==
+-		DSI_HOST_PHY_TXREQUESTCLKHS &&
++	       DSI_HOST_PHY_TXREQUESTCLKHS &&
+ 	       (!!(bridge & DSI_BRG_DPI_EN) == !vpg) &&
+ 	       !!channel;
+ }
+@@ -774,24 +946,29 @@ static int micronux_select_vertical_vpg(struct micronux_dsi *dsi)
+ static int micronux_restore_framebuffer_source(struct micronux_dsi *dsi,
+ 					       u32 initial_underruns)
+ {
++	bool host_status_seen;
+ 	u32 bridge_status, frame, initial_frame;
+ 	int ret;
+ 
+ 	initial_frame = READ_ONCE(dsi->scanout_frames);
+ 	micronux_select_framebuffer(dsi);
++	/* Ignore only the intentional dark source-switch residue. */
++	micronux_discard_host_status(dsi);
+ 	WRITE_ONCE(dsi->vpg_test_active, false);
+ 	ret = read_poll_timeout(READ_ONCE, frame,
+ 				(u32)(frame - initial_frame) >=
+ 				MICRONUX_SCANOUT_STABLE_FRAMES,
+ 				1000, MICRONUX_SCANOUT_START_TIMEOUT_MS * 1000,
+ 				false, dsi->scanout_frames);
++	host_status_seen = micronux_sample_host_status(dsi);
+ 	bridge_status = readl(dsi->bridge + DSI_BRG_INT_RAW);
+ 	if (ret || !micronux_source_policy_valid(dsi, false) ||
++	    READ_ONCE(dsi->fault_bits) ||
+ 	    READ_ONCE(dsi->last_dma_error) ||
+ 	    (bridge_status & DSI_BRG_INT_UNDERRUN) ||
+ 	    READ_ONCE(dsi->bridge_underruns) != initial_underruns)
+ 		return ret ? ret : -EIO;
+-	return 0;
++	return host_status_seen ? -EUCLEAN : 0;
+ }
+ 
+ static int micronux_dma_stop_reload(struct micronux_dsi *dsi)
+@@ -826,31 +1003,24 @@ static int __micronux_fb_blank(int blank, struct fb_info *info)
+ 		return 0;
+ 	/* fbcon unblanks during registration, before the status page exists. */
+ 	if (blank == FB_BLANK_UNBLANK &&
+-	    !READ_ONCE(dsi->boot_display_ready)) {
+-		dsi->backlight->props.power = FB_BLANK_POWERDOWN;
+-		return backlight_update_status(dsi->backlight);
+-	}
+-	if (!dsi->scanout_ready) {
+-		dsi->backlight->props.power = blank;
+-		return backlight_update_status(dsi->backlight);
+-	}
++	    !READ_ONCE(dsi->boot_display_ready))
++		return micronux_backlight_set_power(dsi, FB_BLANK_POWERDOWN);
++	if (!dsi->scanout_ready)
++		return micronux_backlight_set_power(dsi, blank);
+ 	if (blank != FB_BLANK_UNBLANK) {
+-		dsi->backlight->props.power = blank;
+-		ret = backlight_update_status(dsi->backlight);
++		ret = micronux_backlight_set_power(dsi, blank);
+ 		if (ret || !dsi->scanout_active)
+ 			return ret;
+ 		/* Keep valid video present until the LEDs are physically dark. */
+ 		msleep(MICRONUX_BACKLIGHT_OFF_SETTLE_MS);
+ 		dev_dbg(dsi->dev, "backlight-off settled before scanout stop\n");
+ 		ret = micronux_dma_stop_reload(dsi);
+-		if (!ret)
+-			dsi->scanout_active = false;
++		/* The stop path has already disabled the bridge and DMA channel. */
++		dsi->scanout_active = false;
+ 		return ret;
+ 	}
+-	if (dsi->scanout_active) {
+-		dsi->backlight->props.power = FB_BLANK_UNBLANK;
+-		return backlight_update_status(dsi->backlight);
+-	}
++	if (dsi->scanout_active)
++		return micronux_backlight_set_power(dsi, FB_BLANK_UNBLANK);
+ 
+ 	WRITE_ONCE(dsi->last_dma_error, 0);
+ 	writel(DSI_BRG_INT_UNDERRUN, dsi->bridge + DSI_BRG_INT_CLR);
+@@ -863,6 +1033,8 @@ static int __micronux_fb_blank(int blank, struct fb_info *info)
+ 	initial_frame = READ_ONCE(dsi->scanout_frames);
+ 	micronux_dma_start_reload(dsi);
+ 	micronux_select_framebuffer(dsi);
++	/* Ignore only the intentional dark stopped-to-framebuffer residue. */
++	micronux_discard_host_status(dsi);
+ 	ret = read_poll_timeout(READ_ONCE, frame,
+ 				(u32)(frame - initial_frame) >=
+ 				MICRONUX_SCANOUT_STABLE_FRAMES,
+@@ -880,12 +1052,11 @@ static int __micronux_fb_blank(int blank, struct fb_info *info)
+ 	hrtimer_start(&dsi->scanout_timer, ns_to_ktime(MICRONUX_DMA_POLL_NS),
+ 		      HRTIMER_MODE_REL_PINNED);
+ 	dsi->scanout_active = true;
+-	dsi->backlight->props.power = FB_BLANK_UNBLANK;
+-	ret = backlight_update_status(dsi->backlight);
+-	if (ret) {
+-		(void)micronux_dma_stop_reload(dsi);
+-		dsi->scanout_active = false;
+-	}
++	ret = micronux_backlight_set_power(dsi, FB_BLANK_UNBLANK);
++	if (ret)
++		dev_warn(dsi->dev,
++			 "backlight reveal failed: %d; preserving valid scanout\n",
++			 ret);
+ 	return ret;
+ }
+ 
+@@ -938,11 +1109,13 @@ static ssize_t boot_ready_store(struct device *dev,
+ 	ret = __micronux_fb_blank(FB_BLANK_UNBLANK, dsi->info);
+ 	if (ret) {
+ 		WRITE_ONCE(dsi->boot_display_ready, false);
+-		dsi->backlight->props.power = FB_BLANK_POWERDOWN;
+-		backlight_update_status(dsi->backlight);
++		if (micronux_backlight_set_power(dsi, FB_BLANK_POWERDOWN))
++			dev_warn(dsi->dev,
++				 "backlight-off retry failed; source=%s\n",
++				 dsi->scanout_active ? "preserved" : "stopped");
+ 		dev_err(dsi->dev,
+-			"MICRONUX:M7:DSI-SCANOUT state=fail reason=boot-ready error=%d backlight=off\n",
+-			ret);
++			"MICRONUX:M7:DSI-SCANOUT state=fail reason=boot-ready error=%d backlight=off-requested source=%s\n",
++			ret, dsi->scanout_active ? "preserved" : "stopped");
+ 		goto out;
+ 	}
+ 	dev_info(dsi->dev,
+@@ -976,7 +1149,9 @@ static ssize_t vpg_test_ms_store(struct device *dev,
+ 				 const char *buf, size_t count)
+ {
+ 	struct micronux_dsi *dsi = dev_get_drvdata(dev);
++	bool phase_status_seen;
+ 	u32 duration_ms, initial_frames, initial_underruns;
++	int entry_ret = 0;
+ 	int ret, restore_ret;
+ 
+ 	ret = kstrtou32(buf, 10, &duration_ms);
+@@ -998,6 +1173,7 @@ static ssize_t vpg_test_ms_store(struct device *dev,
+ 		goto out_unlock;
+ 	}
+ 	if (!micronux_source_policy_valid(dsi, false) ||
++	    READ_ONCE(dsi->fault_bits) || !micronux_host_status_clean(dsi) ||
+ 	    READ_ONCE(dsi->last_dma_error) ||
+ 	    (readl(dsi->bridge + DSI_BRG_INT_RAW) &
+ 	     DSI_BRG_INT_UNDERRUN)) {
+@@ -1007,31 +1183,131 @@ static ssize_t vpg_test_ms_store(struct device *dev,
+ 
+ 	initial_frames = READ_ONCE(dsi->scanout_frames);
+ 	initial_underruns = READ_ONCE(dsi->bridge_underruns);
++	ret = micronux_backlight_set_power(dsi, FB_BLANK_POWERDOWN);
++	if (ret) {
++		dev_err(dsi->dev,
++			"MICRONUX:M9:VPG state=fail stage=entry-blank error=%d framebuffer=preserved backlight=unknown\n",
++			ret);
++		goto out_unlock;
++	}
++	msleep(MICRONUX_BACKLIGHT_OFF_SETTLE_MS);
++	hrtimer_cancel(&dsi->scanout_timer);
++	phase_status_seen = micronux_sample_host_status(dsi);
++	phase_status_seen |= !micronux_host_status_clean(dsi);
++	if (READ_ONCE(dsi->fault_bits) ||
++	    READ_ONCE(dsi->last_dma_error) ||
++	    (readl(dsi->bridge + DSI_BRG_INT_RAW) &
++	     DSI_BRG_INT_UNDERRUN)) {
++		WRITE_ONCE(dsi->boot_display_ready, false);
++		ret = -EIO;
++		dev_err(dsi->dev,
++			"MICRONUX:M9:VPG state=fail stage=entry-health framebuffer=preserved backlight=off reboot=required\n");
++		goto out_unlock;
++	}
++	if (phase_status_seen) {
++		entry_ret = -EUCLEAN;
++		goto restore_framebuffer_dark;
++	}
++
+ 	ret = micronux_select_vertical_vpg(dsi);
+-	if (ret)
+-		goto restore_framebuffer;
++	if (ret) {
++		entry_ret = ret;
++		goto restore_framebuffer_dark;
++	}
++	/* Ignore only the intentional dark framebuffer-to-VPG residue. */
++	micronux_discard_host_status(dsi);
+ 
+ 	WRITE_ONCE(dsi->vpg_test_active, true);
++	/* Let the direct-video panel receive several complete VPG frames dark. */
++	msleep(MICRONUX_VPG_SOURCE_SETTLE_MS);
++	phase_status_seen = micronux_sample_host_status(dsi);
++	if (READ_ONCE(dsi->fault_bits) ||
++	    READ_ONCE(dsi->last_dma_error) ||
++	    (readl(dsi->bridge + DSI_BRG_INT_RAW) &
++	     DSI_BRG_INT_UNDERRUN) ||
++	    !micronux_source_policy_valid(dsi, true)) {
++		WRITE_ONCE(dsi->boot_display_ready, false);
++		ret = -EIO;
++		dev_err(dsi->dev,
++			"MICRONUX:M9:VPG state=fail stage=entry-prime pattern=vertical-bars source=preserved backlight=off reboot=required\n");
++		goto out_unlock;
++	}
++	if (phase_status_seen) {
++		entry_ret = -EUCLEAN;
++		goto restore_framebuffer_dark;
++	}
++	ret = micronux_backlight_set_power(dsi, FB_BLANK_UNBLANK);
++	if (ret) {
++		entry_ret = ret;
++		ret = micronux_backlight_set_power(dsi, FB_BLANK_POWERDOWN);
++		if (ret) {
++			WRITE_ONCE(dsi->boot_display_ready, false);
++			dev_err(dsi->dev,
++				"MICRONUX:M9:VPG state=fail stage=entry-reveal error=%d off_error=%d pattern=vertical-bars source=preserved backlight=unknown reboot=required\n",
++				entry_ret, ret);
++			goto out_unlock;
++		}
++		msleep(MICRONUX_BACKLIGHT_OFF_SETTLE_MS);
++		goto restore_framebuffer_dark;
++	}
+ 	dev_info(dsi->dev,
+-		 "MICRONUX:M9:VPG state=active pattern=vertical-bars duration_ms=%u frames=%u producer=running host=%08x lpclk=%08x bridge=%08x\n",
++		 "MICRONUX:M9:VPG state=active pattern=vertical-bars duration_ms=%u frames=%u producer=running transition=dark-switched-revealed host=%08x lpclk=%08x bridge=%08x\n",
+ 		 duration_ms, initial_frames,
+ 		 readl(dsi->host + DSI_HOST_VID_MODE_CFG),
+ 		 readl(dsi->host + DSI_HOST_LPCLK_CTRL),
+ 		 readl(dsi->bridge + DSI_BRG_DPI_MISC_CONFIG));
+ 	msleep(duration_ms);
+ 
+-restore_framebuffer:
++	ret = micronux_backlight_set_power(dsi, FB_BLANK_POWERDOWN);
++	if (ret) {
++		WRITE_ONCE(dsi->boot_display_ready, false);
++		dev_err(dsi->dev,
++			"MICRONUX:M9:VPG state=fail stage=restore-blank error=%d pattern=vertical-bars source=preserved backlight=unknown reboot=required\n",
++			ret);
++		goto out_unlock;
++	}
++	msleep(MICRONUX_BACKLIGHT_OFF_SETTLE_MS);
++	phase_status_seen = micronux_sample_host_status(dsi);
++	if (READ_ONCE(dsi->fault_bits) ||
++	    READ_ONCE(dsi->last_dma_error) ||
++	    (readl(dsi->bridge + DSI_BRG_INT_RAW) &
++	     DSI_BRG_INT_UNDERRUN) ||
++	    READ_ONCE(dsi->bridge_underruns) != initial_underruns) {
++		WRITE_ONCE(dsi->boot_display_ready, false);
++		ret = -EIO;
++		dev_err(dsi->dev,
++			"MICRONUX:M9:VPG state=fail stage=active-health pattern=vertical-bars source=preserved backlight=off reboot=required\n");
++		goto out_unlock;
++	}
++	if (phase_status_seen)
++		entry_ret = -EUCLEAN;
++
++restore_framebuffer_dark:
+ 	restore_ret = micronux_restore_framebuffer_source(dsi, initial_underruns);
+-	if (restore_ret) {
++	if (restore_ret && restore_ret != -EUCLEAN) {
++		WRITE_ONCE(dsi->boot_display_ready, false);
+ 		dev_err(dsi->dev,
+-			"MICRONUX:M9:VPG state=fail stage=restore error=%d framebuffer=requested producer=preserved\n",
++			"MICRONUX:M9:VPG state=fail stage=restore error=%d framebuffer=requested producer=preserved backlight=off reboot=required\n",
+ 			restore_ret);
+ 		ret = restore_ret;
+-	} else {
+-		dev_info(dsi->dev,
+-			 "MICRONUX:M9:VPG state=restored pattern=framebuffer producer=running frames=%u->%u entry_error=%d\n",
+-			 initial_frames, READ_ONCE(dsi->scanout_frames), ret);
++		goto out_unlock;
++	}
++	if (restore_ret == -EUCLEAN && !entry_ret)
++		entry_ret = restore_ret;
++
++	hrtimer_start(&dsi->scanout_timer, ns_to_ktime(MICRONUX_DMA_POLL_NS),
++		      HRTIMER_MODE_REL_PINNED);
++	ret = micronux_backlight_set_power(dsi, FB_BLANK_UNBLANK);
++	if (ret) {
++		dev_err(dsi->dev,
++			"MICRONUX:M9:VPG state=fail stage=restore-reveal error=%d framebuffer=running source=preserved backlight=unknown\n",
++			ret);
++		goto out_unlock;
+ 	}
++	dev_info(dsi->dev,
++		 "MICRONUX:M9:VPG state=restored pattern=framebuffer producer=running transition=dark-switched-primed-revealed frames=%u->%u entry_error=%d\n",
++		 initial_frames, READ_ONCE(dsi->scanout_frames), entry_ret);
++	ret = entry_ret;
+ 
+ out_unlock:
+ 	mutex_unlock(&dsi->backlight->ops_lock);
+@@ -1056,7 +1332,9 @@ static ssize_t scanout_show(struct device *dev,
+ {
+ 	struct micronux_dsi *dsi = dev_get_drvdata(dev);
+ 	bool clock_forced_hs, frame_ack_disabled, lp_disabled;
++	unsigned long faults;
+ 	u32 active, before, after, error, channel_enable, host, lpclk, underruns;
++	u32 host_error0, host_error1;
+ 
+ 	before = READ_ONCE(dsi->scanout_frames);
+ 	msleep(50);
+@@ -1068,6 +1346,9 @@ static ssize_t scanout_show(struct device *dev,
+ 	host = readl(dsi->host + DSI_HOST_VID_MODE_CFG);
+ 	active = readl(dsi->host + DSI_HOST_VID_MODE_CFG_ACT);
+ 	lpclk = readl(dsi->host + DSI_HOST_LPCLK_CTRL);
++	host_error0 = READ_ONCE(dsi->host_error0);
++	host_error1 = READ_ONCE(dsi->host_error1);
++	faults = READ_ONCE(dsi->fault_bits);
+ 	frame_ack_disabled = !(host & DSI_HOST_FRAME_BTA_ACK_EN) &&
+ 			     !(active & DSI_HOST_FRAME_BTA_ACK_EN_ACT);
+ 	clock_forced_hs = (lpclk & (DSI_HOST_PHY_TXREQUESTCLKHS |
+@@ -1077,11 +1358,13 @@ static ssize_t scanout_show(struct device *dev,
+ 		      !(active & DSI_HOST_LP_VIDEO_EN_ACT_MASK);
+ 
+ 	return sysfs_emit(buf,
+-			  "%s frames=%u->%u error=%08x underruns=%u chen=%u frame-ack=%s clock=%s lp=%s\n",
+-			  after != before && !error && !underruns &&
++			  "%s frames=%u->%u error=%08x underruns=%u chen=%u faults=%lx host-errors=%08x:%08x frame-ack=%s clock=%s lp=%s\n",
++			  after != before && !error && !underruns && !faults &&
++			  !host_error0 && !host_error1 &&
+ 			  frame_ack_disabled && clock_forced_hs && lp_disabled ?
+ 			  "running" : "stalled",
+ 			  before, after, error, underruns, !!channel_enable,
++			  faults, host_error0, host_error1,
+ 			  frame_ack_disabled ? "off" : "on",
+ 			  clock_forced_hs ? "forced-hs" : "auto",
+ 			  lp_disabled ? "disabled" : "enabled");
+@@ -1110,7 +1393,7 @@ static ssize_t diagnostics_show(struct device *dev,
+ 	lpclk = readl(dsi->host + DSI_HOST_LPCLK_CTRL);
+ 
+ 	return sysfs_emit(buf,
+-		"chen=%08x sar=%08x->%08x dar=%08x block=%08x "
++		"chen=%08x sar=%08x->%08x dar=%08x block=%08x faults=%lx "
+ 		"ctl=%08x:%08x cfg=%08x:%08x llp=%08x->%08x "
+ 		"status=%08x->%08x int=%08x int-ena=%08x "
+ 		"host=%08x active=%08x lpclk=%08x "
+@@ -1125,6 +1408,7 @@ static ssize_t diagnostics_show(struct device *dev,
+ 		sar_before, sar_after,
+ 		readl(dsi->channel + DW_GDMA_CH_DAR),
+ 		readl(dsi->channel + DW_GDMA_CH_BLOCK_TS),
++		READ_ONCE(dsi->fault_bits),
+ 		readl(dsi->channel + DW_GDMA_CH_CTL_LO),
+ 		readl(dsi->channel + DW_GDMA_CH_CTL_HI),
+ 		readl(dsi->channel + DW_GDMA_CH_CFG_LO),
+@@ -1140,8 +1424,8 @@ static ssize_t diagnostics_show(struct device *dev,
+ 		 DSI_HOST_PHY_TXREQUESTCLKHS,
+ 		!(host & DSI_HOST_LP_VIDEO_EN_MASK) &&
+ 		!(active & DSI_HOST_LP_VIDEO_EN_ACT_MASK),
+-		readl(dsi->host + DSI_HOST_INT_STATUS0),
+-		readl(dsi->host + DSI_HOST_INT_STATUS1),
++		READ_ONCE(dsi->host_error0),
++		READ_ONCE(dsi->host_error1),
+ 		readl(dsi->host + DSI_HOST_PHY_STATUS),
+ 		readl(dsi->host + DSI_HOST_VID_PKT_STATUS),
+ 		readl(dsi->host + DSI_HOST_TO_CNT_CFG),
+@@ -1266,13 +1550,19 @@ static int micronux_register_backlight(struct micronux_dsi *dsi)
+ 		.brightness = dsi->handoff.backlight_brightness,
+ 		.power = FB_BLANK_POWERDOWN,
+ 	};
++	int ret;
+ 
+ 	dsi->backlight = devm_backlight_device_register(
+ 		dsi->dev, "micronux-backlight", dsi->dev, dsi,
+ 		&micronux_backlight_ops, &properties);
+ 	if (IS_ERR(dsi->backlight))
+ 		return PTR_ERR(dsi->backlight);
+-	return backlight_update_status(dsi->backlight);
++	ret = backlight_update_status(dsi->backlight);
++	if (ret) {
++		devm_backlight_device_unregister(dsi->dev, dsi->backlight);
++		dsi->backlight = NULL;
++	}
++	return ret;
+ }
+ 
+ static int micronux_register_framebuffer(struct micronux_dsi *dsi)
+@@ -1324,6 +1614,8 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 	dsi->info = info;
+ 	mutex_init(&dsi->lock);
+ 	mutex_init(&dsi->mode_lock);
++	spin_lock_init(&dsi->host_status_lock);
++	INIT_WORK(&dsi->fault_work, micronux_fault_work);
+ 
+ 	dsi->host = devm_platform_ioremap_resource_byname(pdev, "dsi-host");
+ 	if (IS_ERR(dsi->host)) {
+@@ -1365,6 +1657,8 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 		dev_err(&pdev->dev, "invalid loader display handoff: %d\n", ret);
+ 		goto release;
+ 	}
++	/* Discard DBI/loader history before arming Linux runtime latches. */
++	micronux_discard_host_status(dsi);
+ 	dsi->channel = dsi->gdma +
+ 		DW_GDMA_CH_BASE(dsi->handoff.dma_channel);
+ 	dsi->descriptor = (void __iomem *)(uintptr_t)
+@@ -1405,7 +1699,7 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 	hrtimer_init(&dsi->scanout_timer, CLOCK_MONOTONIC,
+ 		     HRTIMER_MODE_REL_PINNED);
+ 	dsi->scanout_timer.function = micronux_dma_poll;
+-	dsi->scanout_ready = true;
++	WRITE_ONCE(dsi->scanout_ready, true);
+ 	dev_info(&pdev->dev,
+ 		 "MICRONUX:M7:DSI-SCANOUT state=waiting trigger=userspace-boot-ready scanout=stopped backlight=off\n");
+ 	dev_info(&pdev->dev,
+@@ -1416,6 +1710,7 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 
+ remove_sysfs:
+ 	sysfs_remove_groups(&pdev->dev.kobj, micronux_display_groups);
++	cancel_work_sync(&dsi->fault_work);
+ unregister_touch:
+ 	if (dsi->touch) {
+ 		input_unregister_device(dsi->touch);
+@@ -1425,6 +1720,7 @@ unregister_touch:
+ darken:
+ 	backlight->props.power = FB_BLANK_POWERDOWN;
+ 	backlight_update_status(backlight);
++	devm_backlight_device_unregister(&pdev->dev, backlight);
+ release:
+ 	framebuffer_release(info);
+ 	return ret;
+@@ -1437,10 +1733,12 @@ static void micronux_dsi_remove(struct platform_device *pdev)
+ 	/* Removing the group waits for the bounded one-shot store to finish. */
+ 	sysfs_remove_groups(&pdev->dev.kobj, micronux_display_groups);
+ 	mutex_lock(&dsi->mode_lock);
+-	dsi->scanout_ready = false;
++	WRITE_ONCE(dsi->scanout_ready, false);
+ 	hrtimer_cancel(&dsi->scanout_timer);
+ 	writel(0, dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA);
+ 	mutex_unlock(&dsi->mode_lock);
++	devm_free_irq(dsi->dev, dsi->irq, dsi);
++	cancel_work_sync(&dsi->fault_work);
+ 	if (dsi->touch) {
+ 		input_unregister_device(dsi->touch);
+ 		dsi->touch = NULL;
+@@ -1448,6 +1746,7 @@ static void micronux_dsi_remove(struct platform_device *pdev)
+ 	unregister_framebuffer(dsi->info);
+ 	dsi->backlight->props.power = FB_BLANK_POWERDOWN;
+ 	backlight_update_status(dsi->backlight);
++	devm_backlight_device_unregister(dsi->dev, dsi->backlight);
+ 	framebuffer_release(dsi->info);
+ }
+ 

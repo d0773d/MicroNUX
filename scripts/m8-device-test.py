@@ -228,7 +228,8 @@ def main() -> int:
     if args.expect_mipi_profile == "jd9365" and not marker_seen(
         log,
         "MICRONUX:M6:DSI state=ready profile=jd9365-800x1280 "
-        "resolution=800x1280 lanes=2 lane_mbps=1500 format=rgb565 "
+        "resolution=800x1280 lanes=2 lane_mbps=1500 dpi_mhz=80 "
+        "format=rgb565 "
         "pattern=framebuffer",
     ):
         missing.append("MICRONUX:M6:DSI exact Kit C JD9365 profile")

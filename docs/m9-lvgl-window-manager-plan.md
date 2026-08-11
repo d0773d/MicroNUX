@@ -17,7 +17,7 @@ only after every required feature and its exit criterion are completed.
 | Work package | Section status | Current evidence |
 | --- | --- | --- |
 | M9.0 Contract freeze | **COMPLETED** | Plan approved for implementation on 2026-08-10; architecture commit `b3d011f` |
-| M9.1 Linux input and presentation | **TESTING** | Touch and transition gates pass. A 240-second soak proved stable DSI/DMA, touch, and shell operation. Linux now protects against USB host-close resets and the 15-second disconnect/reconnect hardware gate passes; final human visual confirmation is pending |
+| M9.1 Linux input and presentation | **TESTING** | Touch and device-tree gates retain prior acceptance. The revised dark-settle, fail-dark, host-fault, and bounded-VPG source passed build/static validation; the exact candidate flash, clean loader-to-status and graphics-to-status transitions, bounded VPG restoration, and a fresh disconnected 600-second same-boot visual soak remain pending |
 | M9.2 Optional LVGL service | **PLANNED** | Starts only after the M9.1 Linux gate passes |
 | M9.3 UI-v1 and native C SDK | **PLANNED** | Starts only after the M9.2 service gate passes |
 | M9.4 Window and session manager | **PLANNED** | Starts only after the M9.3 ABI gate passes |
@@ -466,9 +466,10 @@ Deliverables:
 - [x] **COMPLETED** - GT9271 Linux probe and input events;
 - [x] **COMPLETED** - accepted reset, interrupt, and coordinate-transform
   device-tree contract;
-- [x] **COMPLETED** - a safe foreground GUI ownership transition for fbcon and
-  `/dev/fb0`;
-- [x] **COMPLETED** - positioned, paced partial-rectangle presentation; and
+- [ ] **TESTING** - safe foreground graphics ownership and clean fbcon/status
+  restoration through the dark-settle path;
+- [ ] **TESTING** - positioned, paced partial-rectangle presentation with clean
+  normal-exit and signal restoration; and
 - [ ] **TESTING** - a no-LVGL C diagnostic that proves display and primary
   touch input.
 
@@ -490,14 +491,19 @@ Validation evidence recorded 2026-08-10:
 - the complete Linux image is 6,090,608 bytes, below the 6 MiB partition limit
   by 200,848 bytes.
 
-Physical testing still required before any item or this section may be marked
-`COMPLETED`:
+Physical testing still required before any open item or this section may be
+marked `COMPLETED`:
 
-- probe/status and event-device check on the connected GT9271;
-- visible positioned draw and five-point primary-touch test;
-- zero DSI underruns during the test;
-- responsive USB shell and unrelated background task during presentation; and
-- clean restoration of the framebuffer console after normal exit and signal.
+- flash and read-back verify the exact matching loader and Linux candidate;
+- observe clean loader-to-status, normal graphics-to-status, signal-driven
+  graphics-to-status, and bounded VPG-to-status transitions without cyan or
+  flicker;
+- complete a fresh, same-boot 600-second USB-disconnected status-screen soak
+  before VPG is invoked;
+- retain zero display faults, host errors, DSI underruns, and DMA errors with
+  advancing scanout; and
+- repeat the touch regression while the USB shell and unrelated tasks remain
+  responsive.
 
 Physical test evidence recorded 2026-08-10, iteration 1:
 
@@ -646,9 +652,106 @@ Physical test evidence recorded 2026-08-10, iteration 9:
   remained zero. Machine validation passed; human confirmation that the panel
   stayed on the MicroNUX terminal/status screen is the remaining visual gate.
 
-Exit criterion: the diagnostic draws a target, receives correctly transformed
-touch, returns to the terminal cleanly, and produces zero DSI underruns while
-USB shell and unrelated tasks remain responsive.
+Implementation and pre-hardware validation recorded 2026-08-10, iteration 10:
+
+- the user's latest observation is that the currently flashed forced-HS,
+  LP-disabled, frame-ACK-disabled Linux control may not have reproduced the
+  delayed solid-cyan state. That evidence remains visual and provisional; the
+  brief cyan flash between loader, diagnostic, and status screens is a separate
+  reproducible transition defect;
+- source-history and vendor-code review localized that flash to an ordering
+  race: the backlight-off I2C write was immediately followed by removal of the
+  only valid scanout source. The new loader and Linux blank paths keep the old
+  valid frame scanning for the Waveshare driver's 100-millisecond backlight-off
+  settling interval before stopping GDMA or the bridge;
+- Linux now provides a root-only, blocking `vpg_test_ms` discriminator for 250
+  through 10,000 milliseconds. It follows ESP-IDF v6.0.1's source-switch order,
+  leaves the framebuffer GDMA producer running, changes only the bridge/VPG
+  source bits, and requires four new framebuffer frames after restoration. A
+  visible VPG result proves downstream capability after the toggle; the toggle
+  can itself resynchronize a marginal link, so it does not prove pre-toggle
+  downstream state;
+- the exact 38-patch series passed with manifest SHA-256
+  `9b6dffa397080b1a897b07b8bc88a0d41320fcb4d89bd3e8e8b2056014bba295`.
+  The bounded-VPG patch passed strict checkpatch with zero findings, its
+  RISC-V driver object compiled, and the complete Buildroot image passed at
+  6,090,672 bytes with SHA-256
+  `4c8313856dd6b95324f358a60c5c8e3262841590b756ec32041f76378058b095`;
+- the exact ESP-IDF v6.0.1 Kit C/JD9365 loader also passed at 281,344 bytes
+  with SHA-256
+  `5f9697a8d8c0d04780132e4690f5378e72e7b58795dd11ccecea7ad3b475e949`;
+  and
+- this candidate has deliberately not been flashed while the user is away.
+  M9.1 remains `TESTING` until a clean boot/status transition, visible
+  vertical-bars-to-status VPG cycle, and at least 600 seconds of disconnected
+  human visual observation all pass with zero DMA errors and DSI underruns.
+
+Implementation and pre-hardware validation recorded 2026-08-10, iteration 11:
+
+- failure-path review found that an ambiguous backlight I2C completion or DMA
+  stop timeout could remove the last valid video source while the panel might
+  be illuminated. Linux now preserves a valid producer on reveal errors,
+  marks every destructive stop attempt inactive, and refuses every backlight
+  reveal unless framebuffer or VPG scanout is verified healthy;
+- DMA errors and DSI bridge underruns are now latched from interrupt-safe
+  paths. A process-context worker requests backlight-off while preserving the
+  current source and logs `MICRONUX:M9:DISPLAY-FAULT`; recovery requires reboot
+  because Linux does not yet own a proven JD9365 panel reinitialization path;
+- the watchdog now also detects stale framebuffer production and the fatal DSI
+  host payload-write and payload-underflow conditions. Clear-on-read host status
+  is serialized, accumulated for diagnostics, and deliberately baselined only
+  while the backlight is confirmed dark during a source transition;
+- the M9 flash workflow now builds, validates, and flashes the matching
+  ESP-IDF v6.0.1 Kit C loader before writing Linux. The hardware runner also
+  compares Linux boot IDs across USB-disconnected tests and provides a passive
+  `snapshot` mode that does not reset or discard buffered serial evidence;
+- the exact 39-patch series passed with manifest SHA-256
+  `0b66d3e13a3ce6503e7c792b4f7d8ede77d1e478aef4f20f7860dbd86d168d55`.
+  Patch `0022-video-fbdev-contain-esp32p4-display-faults-safely.patch`
+  passed strict checkpatch with 0 errors, 0 warnings, and 0 checks, and its exact
+  postimage cross-compiled as a RISC-V driver object;
+- the frozen source contract is
+  `622404321f01b19087f99a05ac20afb3ff97dede5246bfc2bfdf077912eb83bb`.
+  The complete Buildroot image passed at 6,090,672 bytes with SHA-256
+  `67935cf443c59307d62483183a30a64054ec96ea887eb326db1d590b0c87826f`;
+  the seven-entry artifact checksum manifest, bFLT W^X audit, partition limit,
+  exact built-driver comparison, status init, and no-LVGL gates all passed;
+- the matching loader passed at 281,360 bytes with SHA-256
+  `9023cddf934db6086131d5e9118f35bfdbf0231fc01cd3fa864b232a3ced320c`;
+  and
+- this revised candidate remains deliberately unflashed while the user is away.
+  Host/static validation is complete; all physical visual gates remain pending.
+
+Because the status-restoration and source-transition implementations changed,
+historical ownership and presentation passes do not validate this revised
+candidate. Both features remain `TESTING` until the exact flashed artifacts pass
+the visual and machine gates below.
+
+Required M9.1 physical acceptance order:
+
+1. Build, flash, and read-back verify the matching source-frozen loader and
+   Linux image; record their exact hashes.
+2. Before running VPG, start a fresh 600-second `disconnect` test. The user must
+   observe a clean loader-to-status transition and confirm that the status page
+   remains visible without cyan or flicker for the entire disconnected interval.
+   Reconnection must prove the same Linux boot and advancing scanout.
+3. On a fresh reset, run `preflight`; visually confirm clean normal-exit and
+   signal-driven graphics-to-status restoration.
+4. On a fresh reset, run bounded VPG; visually confirm vertical bars and a clean
+   dark-settle return to status.
+5. Run touch and the remaining regressions.
+
+VPG must not precede the disconnected soak because a source toggle can
+resynchronize a marginal link and mask the pre-toggle condition.
+
+Exit criterion: the exact flashed candidate cleanly transitions from loader to
+status, restores status after normal and signal-driven graphics exit without
+cyan or flicker, completes the bounded vertical-bars-to-status VPG cycle, and
+remains visibly on status for at least 600 seconds during a fresh
+USB-disconnected same-boot test. Every gate must report framebuffer source,
+`boot_ready=1`, backlight power on with positive actual brightness, advancing
+scanout, `faults=0`, `host-errors=00000000:00000000`, `underruns=0`, and DMA
+`errors=00000000`, while the USB shell and unrelated tasks remain responsive.
 
 ### M9.2 - Optional LVGL service
 

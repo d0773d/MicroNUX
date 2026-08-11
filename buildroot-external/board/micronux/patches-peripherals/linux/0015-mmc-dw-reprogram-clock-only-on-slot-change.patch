@@ -1,7 +1,7 @@
 From bdd1276f3958b17dd40c036e60d476383c7e08b2 Mon Sep 17 00:00:00 2001
 From: MicroNUX contributors <micronux@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 05:20:00 -0700
-Subject: [PATCH 15/17] mmc: dw: reprogram clock only on slot change
+Subject: [PATCH 15/22] mmc: dw: reprogram clock only on slot change
 
 Dual-slot arbitration forced a full clock reinitialization before every
 request.  The ESP32-P4 sequence disables the card clock and sends three

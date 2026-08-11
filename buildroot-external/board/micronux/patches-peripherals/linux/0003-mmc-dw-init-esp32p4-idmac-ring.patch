@@ -1,7 +1,7 @@
 From 02cd28961e472ca385cc51a9eea58d0d94753056 Mon Sep 17 00:00:00 2001
 From: MicroNUX Project <micronux@example.invalid>
 Date: Sat, 8 Aug 2026 04:42:00 -0700
-Subject: [PATCH 03/17] mmc: dw: initialize the ESP32-P4 IDMAC ring
+Subject: [PATCH 03/22] mmc: dw: initialize the ESP32-P4 IDMAC ring
 
 Reserve the correct number of 64-byte descriptors and clear the internal-SRAM
 ring before the ESP32-P4 controller starts.

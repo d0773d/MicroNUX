@@ -27,10 +27,10 @@ REQUIRED_MARKERS = (
     "resolution=800x1280 format=rgb565",
     "MICRONUX:M7:SPLASH progress=100 state=visible",
     "MICRONUX:M7:DSI-BLANK state=ready backlight=off "
-    "restore=linux-after-first-frame",
+    "settle_ms=100 restore=linux-after-status-ready",
     "MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending "
     "pattern=framebuffer dma=descriptor-ring channel=0 "
-    "rearm=linux-after-blank",
+    "rearm=linux-after-status-ready",
     "MICRONUX:M7:IRQ source=24 matrix=500d6060 clic=18 handoff=armed",
     "MICRONUX:M7:PMP cached=7-10 direct=12-13 mode=per-mm+wx+tor+napot "
     "state=ready first=[",
@@ -43,9 +43,11 @@ REQUIRED_MARKERS = (
     "underrun=monitored write_chunk=512 write_gap_us=2 "
     "backlight=linux mmap=denied",
     "MICRONUX:M7:DSI-SCANOUT state=ready handoff=blanked-restart "
-    "first-frame=confirmed scanout=hardware-reload-running "
-    "backlight=restored",
-    "MICRONUX:M7:FB-CONSOLE state=ready tty=tty1 role=status usb=ttyGS0",
+    "stable-frames=4 scanout=hardware-reload-running "
+    "backlight=restored reveal=userspace-ready frame-ack=disabled "
+    "clock=forced-hs lp=disabled",
+    "MICRONUX:M7:FB-CONSOLE state=ready tty=tty1 role=status usb=ttyGS0 "
+    "reveal=userspace-ready cursor=steady",
     "MICRONUX:M6:COMBINED:SHELL ready console=ttyGS0 network=nonblocking",
     "MICRONUX:M8:SERVICE state=ready abi=1.0",
     "MICRONUX:M7:JOB-SUPERVISOR state=ready uid=1000 gid=1000 "
@@ -101,6 +103,7 @@ FORBIDDEN_MARKERS = (
     "MICRONUX:M7:DSI-LINUX state=fail",
     "MICRONUX:M7:DSI-SCANOUT state=fail",
     "MICRONUX:M7:DISPLAY:FAIL",
+    "MICRONUX:M9:DISPLAY-FAULT",
     "MICRONUX:M7:POOL state=fail",
     "MICRONUX:M7:POOL state=exhausted",
     "MICRONUX:M7:POOL-PROBE:FAIL",
@@ -219,7 +222,9 @@ def workload_command() -> str:
         "grep -q '^framebuffer$' $DISPLAY/pattern || DISPLAY_RC=1; "
         "dd if=/dev/zero of=/dev/fb0 bs=4096 count=500 "
         "2>/dev/null || DISPLAY_RC=1; "
-        "grep -q '^running frames=.* error=00000000 underruns=0 chen=' "
+        "grep -q '^running frames=.* error=00000000 underruns=0 "
+        "chen=1 faults=0 host-errors=00000000:00000000 "
+        "frame-ack=off clock=forced-hs lp=disabled$' "
         "$DISPLAY/scanout || DISPLAY_RC=1; "
         "OLD_BRIGHTNESS=$(cat $BACKLIGHT/brightness) || DISPLAY_RC=1; "
         "echo 64 >$BACKLIGHT/brightness || DISPLAY_RC=1; "
@@ -608,7 +613,8 @@ def main() -> int:
         if args.expect_mipi_profile == "jd9365" and not marker_seen(
             log,
             "MICRONUX:M6:DSI state=ready profile=jd9365-800x1280 "
-            "resolution=800x1280 lanes=2 lane_mbps=1500 format=rgb565 "
+            "resolution=800x1280 lanes=2 lane_mbps=1500 dpi_mhz=80 "
+            "format=rgb565 "
             "pattern=framebuffer",
         ):
             missing.append("MICRONUX:M6:DSI exact Kit C JD9365 profile")

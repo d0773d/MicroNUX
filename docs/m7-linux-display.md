@@ -53,11 +53,11 @@ without exposing a framebuffer.
 The accepted hardware handoff was:
 
 ```text
-MICRONUX:M7:DSI-BLANK state=ready backlight=off restore=linux-after-first-frame
-MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending pattern=framebuffer dma=descriptor-ring channel=0 rearm=linux-after-blank fb=[48040a80,48234a80) desc=[4ff3ba80,4ff3bb80) i2c=transferred contract=49f00000 crc32=e19656a9
+MICRONUX:M7:DSI-BLANK state=ready backlight=off settle_ms=100 restore=linux-after-status-ready
+MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending pattern=framebuffer dma=descriptor-ring channel=0 rearm=linux-after-status-ready fb=[48040a80,48234a80) desc=[4ff3ba80,4ff3bb80) i2c=transferred contract=49f00000 crc32=e19656a9
 MICRONUX:M7:IRQ source=24 matrix=500d6060 clic=18 handoff=armed
 MICRONUX:M7:DSI-LINUX state=ready owner=linux fb=fb0 resolution=800x1280 format=rgb565 dma=ch0:auto-reload event=block-done-irq irq=3 health_poll_us=50 enable_delay_ms=0 underrun=monitored write_chunk=512 write_gap_us=2 backlight=linux mmap=denied
-MICRONUX:M7:DSI-SCANOUT state=ready handoff=blanked-restart first-frame=confirmed scanout=hardware-reload-running backlight=restored
+MICRONUX:M7:DSI-SCANOUT state=ready handoff=blanked-restart stable-frames=4 scanout=hardware-reload-running backlight=restored reveal=userspace-ready frame-ack=disabled clock=forced-hs lp=disabled
 ```
 
 ## Linux interfaces
@@ -100,7 +100,7 @@ DSI scanout while preserving the visible tty1 status page. The accepted live
 health sample after rendering the page was:
 
 ```text
-running frames=3812->3816 error=00000000 underruns=0 chen=1
+running frames=3812->3816 error=00000000 underruns=0 chen=1 faults=0 host-errors=00000000:00000000 frame-ack=off clock=forced-hs lp=disabled
   3:       3818  RISC-V INTC  18 Edge      500a0000.display
 63
 ```
@@ -110,7 +110,7 @@ The corresponding acceptance markers are:
 ```text
 MICRONUX:M7:SPLASH state=ready title=MICRONUX resolution=800x1280 format=rgb565 progress=0 mode=staged
 MICRONUX:M7:SPLASH progress=100 state=visible
-MICRONUX:M7:FB-CONSOLE state=ready tty=tty1 role=status usb=ttyGS0
+MICRONUX:M7:FB-CONSOLE state=ready tty=tty1 role=status usb=ttyGS0 reveal=userspace-ready cursor=steady
 ```
 
 This is intentionally a fixed board driver, not a general DRM/KMS stack. It

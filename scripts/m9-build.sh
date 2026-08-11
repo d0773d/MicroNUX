@@ -17,11 +17,26 @@ readonly DEFCONFIG="micronux_esp32p4_gui_foundation_defconfig"
 readonly ARTIFACT_DIR="${REPO_DIR}/out/m9"
 readonly JOBS="${MICRONUX_JOBS:-$(nproc)}"
 readonly BUILD_CONTRACT_FILE="${OUTPUT_DIR}/.micronux-m9-linux-contract"
+readonly ARTIFACT_CONTRACT_FILE="${ARTIFACT_DIR}/SOURCE-CONTRACT"
 readonly LINUX_PARTITION_SIZE=$((0x600000))
 
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+print_contract_only=false
+if (($# > 1)); then
+	printf 'Usage: %s [--print-contract]\n' "$0" >&2
+	exit 2
+fi
+if (($# == 1)); then
+	if [[ "$1" != "--print-contract" ]]; then
+		printf 'Unknown M9 build option: %s\n' "$1" >&2
+		exit 2
+	fi
+	print_contract_only=true
+fi
 
-required_tools=(awk bash bc bison cpio file find flex g++ gcc git gzip make patch perl python3 rsync sed sha256sum tar unzip wget xz)
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export LC_ALL=C
+
+required_tools=(awk bash bc bison cpio file find flex g++ gcc git gzip make patch perl python3 rsync sed sha256sum sort tar unzip wget xargs xz)
 missing_tools=()
 for tool in "${required_tools[@]}"; do
 	if ! command -v "${tool}" >/dev/null 2>&1; then
@@ -34,6 +49,20 @@ if ((${#missing_tools[@]})); then
 fi
 
 patch_evidence="$(python3 "${REPO_DIR}/scripts/check-linux-patch-series.py")"
+build_contract="$({
+	printf '%s\n' "${patch_evidence}"
+	(
+		cd "${REPO_DIR}"
+		find buildroot-external -type f -print0 |
+			sort -z |
+			xargs -0 sha256sum
+		sha256sum scripts/m3-pack.py scripts/m9-build.sh
+	)
+} | sha256sum | awk '{print $1}')"
+if ${print_contract_only}; then
+	printf 'MICRONUX:M9:SOURCE-CONTRACT sha256=%s\n' "${build_contract}"
+	exit 0
+fi
 printf '%s\n' "${patch_evidence}"
 
 mkdir -p "${DOWNLOAD_DIR}" "${WORK_DIR}/src" "${OUTPUT_DIR}" "${ARTIFACT_DIR}"
@@ -64,13 +93,6 @@ make -C "${SOURCE_DIR}" \
 	BR2_DL_DIR="${DOWNLOAD_DIR}/buildroot-dl" \
 	"${DEFCONFIG}"
 
-build_contract="$({
-	printf '%s\n' "${patch_evidence}"
-	sha256sum \
-		"${EXTERNAL_DIR}/board/micronux/linux-m9.config" \
-		"${EXTERNAL_DIR}/board/micronux/dts-m9/espressif/esp32p4-micronux.dts" \
-		"${EXTERNAL_DIR}/board/micronux/dts-m9/espressif/Makefile"
-} | sha256sum | awk '{print $1}')"
 if [[ -f "${OUTPUT_DIR}/build/linux-${LINUX_VERSION}/.stamp_patched" ]] &&
 	[[ ! -f "${BUILD_CONTRACT_FILE}" ||
 	   "$(cat "${BUILD_CONTRACT_FILE}")" != "${build_contract}" ]]; then
@@ -142,6 +164,53 @@ if ! grep -q 'console=ttyGS0,115200' "${KERNEL_DIR}/.config"; then
 	printf 'M9 kernel did not retain the USB recovery console.\n' >&2
 	exit 1
 fi
+if ! grep -q 'reason=status-render' "${OUTPUT_DIR}/target/init" ||
+	! grep -q 'boot_ready' "${OUTPUT_DIR}/target/init"; then
+	printf 'M9 rootfs is missing the display reveal gate.\n' >&2
+	exit 1
+fi
+if ! grep -q 'DSI_HOST_FRAME_BTA_ACK_EN' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c"; then
+	printf 'M9 kernel is missing the continuous-video frame-ACK policy.\n' >&2
+	exit 1
+fi
+if ! grep -q 'DSI_HOST_LPCLK_CTRL' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
+	! grep -q 'DSI_HOST_VID_MODE_CFG_ACT' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c"; then
+	printf 'M9 kernel is missing the continuous-high-speed DSI policy.\n' >&2
+	exit 1
+fi
+if ! grep -q 'MICRONUX_BACKLIGHT_OFF_SETTLE_MS' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
+	! grep -q 'DEVICE_ATTR_WO(vpg_test_ms)' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c"; then
+	printf 'M9 kernel is missing the dark-settle or bounded VPG contract.\n' >&2
+	exit 1
+fi
+if ! grep -q 'micronux_visible_source_valid' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
+	! grep -q 'MICRONUX:M9:DISPLAY-FAULT state=contained' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
+	! grep -q 'DSI_HOST_INT_STATUS1_FATAL' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
+	! grep -q 'MICRONUX_FAULT_STALE_FRAME' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
+	! grep -q 'micronux_discard_host_status' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c"; then
+	printf 'M9 kernel is missing fail-dark display fault containment.\n' >&2
+	exit 1
+fi
+for transition_marker in \
+	'transition=dark-switched-revealed' \
+	'transition=dark-switched-primed-revealed'; do
+	if ! grep -q "${transition_marker}" \
+		"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c"; then
+		printf 'M9 kernel is missing display transition marker: %s\n' \
+			"${transition_marker}" >&2
+		exit 1
+	fi
+done
 if [[ ! -x "${OUTPUT_DIR}/target/usr/bin/micronux-display-test" ]]; then
 	printf 'M9 rootfs is missing micronux-display-test.\n' >&2
 	exit 1
@@ -187,6 +256,7 @@ python3 "${REPO_DIR}/scripts/check-bflt-wx.py" \
 		linux.config vmlinux micronux-display-test > SHA256SUMS
 )
 printf '%s\n' "${build_contract}" > "${BUILD_CONTRACT_FILE}"
+printf '%s\n' "${build_contract}" > "${ARTIFACT_CONTRACT_FILE}"
 
-printf 'MICRONUX:M9:BUILD state=pass image=%s limit=%s lvgl=absent artifacts=%s\n' \
-	"${image_size}" "${LINUX_PARTITION_SIZE}" "${ARTIFACT_DIR}"
+printf 'MICRONUX:M9:BUILD state=pass image=%s limit=%s lvgl=absent contract=%s artifacts=%s\n' \
+	"${image_size}" "${LINUX_PARTITION_SIZE}" "${build_contract}" "${ARTIFACT_DIR}"
