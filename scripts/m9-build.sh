@@ -194,6 +194,10 @@ if ! grep -q 'micronux_visible_source_valid' \
 	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
 	! grep -q 'DSI_HOST_INT_STATUS1_FATAL' \
 	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
+	! grep -q 'DSI_HOST_INT_STATUS1_DPI_PATH' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
+	! grep -q 'vpg_dpi_status1' \
+	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
 	! grep -q 'MICRONUX_FAULT_STALE_FRAME' \
 	"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c" ||
 	! grep -q 'MICRONUX_STALE_POLL_LIMIT' \
@@ -209,7 +213,8 @@ if ! grep -q 'micronux_visible_source_valid' \
 fi
 for transition_marker in \
 	'transition=dark-switched-revealed' \
-	'transition=dark-switched-primed-revealed'; do
+	'transition=dark-switched-primed-revealed' \
+	'source=restore-requested'; do
 	if ! grep -q "${transition_marker}" \
 		"${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c"; then
 		printf 'M9 kernel is missing display transition marker: %s\n' \

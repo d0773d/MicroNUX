@@ -4,7 +4,7 @@ Status: **TESTING**
 
 Current section: **M9.1 - Linux input and presentation foundation (TESTING)**
 
-Last status update: **2026-08-10**
+Last status update: **2026-08-11**
 
 ## Live implementation status
 
@@ -17,7 +17,7 @@ only after every required feature and its exit criterion are completed.
 | Work package | Section status | Current evidence |
 | --- | --- | --- |
 | M9.0 Contract freeze | **COMPLETED** | Plan approved for implementation on 2026-08-10; architecture commit `b3d011f` |
-| M9.1 Linux input and presentation | **TESTING** | Touch and device-tree gates retain prior acceptance. The revised dark-settle, fail-dark, host-fault, and bounded-VPG source passed build/static validation; the exact candidate flash, clean loader-to-status and graphics-to-status transitions, bounded VPG restoration, and a fresh disconnected 600-second same-boot visual soak remain pending |
+| M9.1 Linux input and presentation | **TESTING** | The prior exact candidate passed automated preflight and a 600-second same-boot USB-disconnected soak. Its first real VPG run exposed a VPG-only DPI-status classification bug and contained it fail-dark. The scoped correction passed strict/static and full-image builds; its exact flash, repeated machine gates, bounded VPG restoration, touch, and all visual no-cyan gates remain pending |
 | M9.2 Optional LVGL service | **PLANNED** | Starts only after the M9.1 Linux gate passes |
 | M9.3 UI-v1 and native C SDK | **PLANNED** | Starts only after the M9.2 service gate passes |
 | M9.4 Window and session manager | **PLANNED** | Starts only after the M9.3 ABI gate passes |
@@ -766,6 +766,60 @@ iteration 12:
   Linux producer and fault policy while the user is away, but only later human
   observation can close the no-cyan/no-flicker visual gate.
 
+Hardware verification and VPG correction recorded 2026-08-11, iteration 13:
+
+- the iteration-12 Linux image and clean-commit loader were flashed and
+  read-back verified on the ESP32-P4 rev1.3 Kit C. The Linux image SHA-256 was
+  `a37b80f43d46e1338a964c0c56c462f3b5bec5d6aa7690dc5169661eb945880e`;
+  the loader reported version `7c31311` and SHA-256
+  `1589b72e2bea8619b27c4a5fdca056ae8be38ba7088511103796f1004b5c645d`;
+- a full automated 600-second USB-disconnected run passed on one Linux boot,
+  `7a8eaa49-ec7a-4139-9c22-435ed7986b53`. The framebuffer completion count
+  advanced from 60 before disconnect to 17,864 at the detached boundary and
+  19,018 after reconnect. The boundary and reconnect snapshots both reported
+  framebuffer source, `boot_ready=1`, positive brightness, `faults=0`, zero
+  DMA errors, zero bridge underruns, and zero global DSI host errors;
+- the subsequent fresh-reset preflight passed both normal and signal-driven
+  graphics-to-status restoration with advancing scanout and all machine fault
+  sources zero. These are machine passes; no camera was available, so photons
+  and absence of cyan/flicker remain visually unverified;
+- the first real bounded VPG invocation selected host VPG
+  (`host=00010002`, `bridge=00003200`) while keeping GDMA enabled. Its explicit
+  post-prime sampler then read DSI host ST1 `00080080`, latched host-fault bit 3,
+  and correctly kept the backlight off. The two bits are the external DPI
+  payload-write and payload-underflow conditions produced while the supported
+  ESP-IDF VPG sequence deliberately disconnects that input path; they are not
+  evidence that the internal VPG stopped;
+- the corrected driver records only those two bits in a separate bounded-VPG
+  `vpg-dpi-int` latch. They remain fatal during normal Linux framebuffer
+  operation and are again sampled strictly after framebuffer restoration.
+  Every other ST0/ST1 bit remains actionable during VPG. Source masking is
+  permitted only after VPG and a dark backlight are verified; source-boundary
+  reads suppress no other status, bridge underruns are checked after the VPG
+  prime and active interval, and every safely-dark post-switch failure routes
+  through framebuffer restoration;
+- framebuffer restoration now establishes its completion baseline only after
+  the source-select writes and readback, then requires four new frames, zero
+  global host status, valid source policy, and zero DMA/bridge faults before
+  restarting the watchdog and revealing status. A failed reveal clears
+  `boot_ready`, while preserving the qualified producer and watchdog;
+- the corrected 39-patch series passed with manifest SHA-256
+  `6a642a4f30c80cfb7d2773be4c294698c2683a8aea018481fdcd8b4a370fedac`.
+  Patch 0022 passed strict checkpatch with 0 errors, 0 warnings, and 0 checks;
+  its exact postimage hash is `c854256a7522440c4a591a37eae4df7d09abf00d`,
+  and the full-build RISC-V driver object SHA-256 is
+  `1505833a0bbb10c5da154ce7307b984ddcc9de8227fd31dbda5161aebe8ff835`;
+- the frozen source contract is
+  `39414bc96f93c3a3376dc6419dbc6731a4a889e79218dc6ec482e14c768a1fc3`.
+  The complete image passed at 6,090,672 bytes with SHA-256
+  `f494323bd698b39730bc435c6470c36bd23dc8daa9ab308218d029207c794129`;
+  all seven artifact checksums, the partition limit, bFLT W^X, exact built
+  source, status-init, and no-LVGL gates passed; and
+- M9.1 remains `TESTING`. This exact correction is not yet flashed. It must
+  repeat the fresh pre-VPG 600-second disconnected gate, preflight, bounded
+  VPG, and touch checks. Human observation is still mandatory before the
+  no-cyan/no-flicker requirements can be completed.
+
 Because the status-restoration and source-transition implementations changed,
 historical ownership and presentation passes do not validate this revised
 candidate. Both features remain `TESTING` until the exact flashed artifacts pass
@@ -796,6 +850,9 @@ USB-disconnected same-boot test. Every gate must report framebuffer source,
 `boot_ready=1`, backlight power on with positive actual brightness, advancing
 scanout, `faults=0`, `host-errors=00000000:00000000`, `underruns=0`, and DMA
 `errors=00000000`, while the USB shell and unrelated tasks remain responsive.
+During the bounded VPG phase only, `vpg-dpi-int` may contain bits 7 and 19;
+`vpg-dpi-int & ~00080080` must equal zero, and the restored framebuffer's
+global `host-errors` must remain exactly zero.
 
 ### M9.2 - Optional LVGL service
 

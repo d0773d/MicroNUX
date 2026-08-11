@@ -583,12 +583,15 @@ def run_vpg(device: serial.Serial, duration_ms: int) -> int:
         'actual_brightness=$(cat "$B/actual_brightness")"; '
         'cat "$D/diagnostics"; '
         'wait $m9_vpg_pid; m9_vpg_rc=$?; '
+        'sleep 1; '
         'echo "MICRONUX:M9:VPG:AFTER rc=$m9_vpg_rc '
         'pattern=$(cat "$D/pattern") '
-        'actual_brightness=$(cat "$B/actual_brightness")"; '
+        'actual_brightness=$(cat "$B/actual_brightness") '
+        'boot_ready=$(cat "$D/boot_ready")"; '
         'cat "$D/diagnostics"; cat "$D/scanout"; '
         'test $m9_vpg_rc -eq 0 && '
         'test "$(cat "$D/pattern")" = framebuffer && '
+        'test "$(cat "$D/boot_ready")" = 1 && '
         'test "$m9_boot" = "$(cat /proc/sys/kernel/random/boot_id)" && '
         'test "$m9_brightness" = "$(cat "$B/brightness")" && '
         'test "$m9_power" = "$(cat "$B/bl_power")" && '
@@ -598,7 +601,31 @@ def run_vpg(device: serial.Serial, duration_ms: int) -> int:
         duration_ms / 1000.0 + 30.0,
     )
     if result.return_code != 0:
-        return fail("vpg", f"rc-{result.return_code}")
+        after_failure = re.search(
+            r"MICRONUX:M9:VPG:AFTER rc=(\d+) pattern=([a-z-]+) "
+            r"actual_brightness=(\d+) boot_ready=([01])",
+            result.output,
+        )
+        if after_failure is None:
+            return fail("vpg", f"rc-{result.return_code}-after-unknown")
+        if (
+            after_failure.group(2) == "framebuffer"
+            and int(after_failure.group(3)) > 0
+            and after_failure.group(4) == "1"
+        ):
+            after_state = "framebuffer-restored"
+        elif (
+            int(after_failure.group(3)) == 0
+            and after_failure.group(4) == "0"
+        ):
+            after_state = "fail-dark"
+        else:
+            after_state = "unsafe-or-incomplete"
+        return fail(
+            "vpg",
+            f"rc-{result.return_code}-driver-{after_failure.group(1)}-"
+            f"after-{after_state}",
+        )
     if not re.search(
         r"MICRONUX:M9:VPG:DURING pattern=vertical-bars "
         r"actual_brightness=([1-9]\d*)",
@@ -617,7 +644,7 @@ def run_vpg(device: serial.Serial, duration_ms: int) -> int:
         return fail("vpg", "vpg-register-policy-mismatch")
     if not re.search(
         r"MICRONUX:M9:VPG:AFTER rc=0 pattern=framebuffer "
-        r"actual_brightness=([1-9]\d*)",
+        r"actual_brightness=([1-9]\d*) boot_ready=1",
         result.output,
     ):
         return fail("vpg", "framebuffer-restore-marker-missing")
@@ -626,6 +653,30 @@ def run_vpg(device: serial.Serial, duration_ms: int) -> int:
         or "transition=dark-switched-primed-revealed" not in result.output
     ):
         return fail("vpg", "dark-transition-marker-missing")
+    active = re.search(
+        r"MICRONUX:M9:VPG state=active .*"
+        r"vpg-dpi-int=([0-9a-fA-F]{8})",
+        result.output,
+    )
+    restored = re.search(
+        r"MICRONUX:M9:VPG state=restored .*"
+        r"frames=(\d+)->(\d+) entry_error=0 "
+        r"vpg-dpi-int=([0-9a-fA-F]{8})",
+        result.output,
+    )
+    if active is None or restored is None:
+        return fail("vpg", "source-status-marker-missing")
+    active_dpi = int(active.group(1), 16)
+    restored_dpi = int(restored.group(3), 16)
+    if (active_dpi | restored_dpi) & ~0x00080080:
+        return fail("vpg", "unexpected-vpg-dpi-status")
+    if active_dpi & ~restored_dpi:
+        return fail("vpg", "vpg-dpi-status-not-accumulated")
+    if int(restored.group(2)) - int(restored.group(1)) < 4:
+        return fail("vpg", "restore-frame-prime-short")
+    health_problem = display_health_problem(result.output)
+    if health_problem is not None:
+        return fail("vpg-health", health_problem)
     if result.output.count(
         "host=00000002 active=00000000 lpclk=00000001"
     ) < 1:
@@ -649,7 +700,7 @@ def run_vpg(device: serial.Serial, duration_ms: int) -> int:
     print(
         "MICRONUX:M9:VPG:AUTOMATED-PASS "
         f"duration_ms={duration_ms} source=restored producer=continuous "
-        "linux=retained host-errors=0"
+        f"linux=retained host-errors=0 vpg-dpi-int={restored_dpi:08x}"
     )
     return 0
 
