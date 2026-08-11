@@ -575,7 +575,8 @@ def run_vpg(device: serial.Serial, duration_ms: int) -> int:
         'm9_brightness="$(cat "$B/brightness")"; '
         'm9_power="$(cat "$B/bl_power")"; '
         'm9_actual="$(cat "$B/actual_brightness")"; '
-        f'echo {duration_ms} >"$D/vpg_test_ms" & m9_vpg_pid=$!; '
+        f'/bin/busybox echo {duration_ms} >"$D/vpg_test_ms" & '
+        'm9_vpg_pid=$!; '
         'sleep 1; '
         'echo "MICRONUX:M9:VPG:DURING pattern=$(cat "$D/pattern") '
         'actual_brightness=$(cat "$B/actual_brightness")"; '
@@ -584,7 +585,6 @@ def run_vpg(device: serial.Serial, duration_ms: int) -> int:
         'echo "MICRONUX:M9:VPG:AFTER rc=$m9_vpg_rc '
         'pattern=$(cat "$D/pattern") '
         'actual_brightness=$(cat "$B/actual_brightness")"; '
-        "/bin/busybox dmesg | /bin/busybox grep 'MICRONUX:M9:VPG state='; "
         'cat "$D/diagnostics"; cat "$D/scanout"; '
         'test $m9_vpg_rc -eq 0 && '
         'test "$(cat "$D/pattern")" = framebuffer && '
