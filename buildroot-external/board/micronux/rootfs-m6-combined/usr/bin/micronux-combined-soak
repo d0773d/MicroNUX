@@ -1,0 +1,69 @@
+#!/bin/sh
+
+device=/dev/mmcblk0
+
+if [ "$#" -eq 0 ]; then
+	echo 'usage: micronux-combined-soak CYCLE [CYCLE ...]' >&2
+	exit 64
+fi
+
+sample_hash()
+{
+	/bin/busybox dd if="$device" bs=4096 count=256 2>/dev/null | \
+		/bin/busybox sha256sum | /bin/busybox cut -d' ' -f1
+}
+
+[ -b "$device" ] || {
+	echo 'MICRONUX:M6:COMBINED:SOAK:FAIL stage=no-card'
+	exit 1
+}
+
+hash_before=$(sample_hash) || {
+	echo 'MICRONUX:M6:COMBINED:SOAK:FAIL stage=hash-before'
+	exit 1
+}
+
+for cycle do
+	echo "MICRONUX:M6:COMBINED:SOAK cycle=$cycle state=begin"
+	(
+		rc=0
+		/bin/busybox dd if="$device" of=/dev/null bs=4096 count=64 \
+			2>/dev/null || rc=1
+		/bin/busybox dd if="$device" of=/dev/null bs=4096 count=64 \
+			2>/dev/null || rc=1
+		/bin/busybox dd if="$device" of=/dev/null bs=4096 count=64 \
+			2>/dev/null || rc=1
+		/bin/busybox dd if="$device" of=/dev/null bs=4096 count=64 \
+			2>/dev/null || rc=1
+		exit "$rc"
+	) &
+	storage_pid=$!
+	(
+		rc=0
+		/bin/busybox ping 1.1.1.1 || rc=1
+		/bin/busybox ping 1.1.1.1 || rc=1
+		/bin/busybox sleep 1
+		exit "$rc"
+	) &
+	network_pid=$!
+	storage_rc=0
+	network_rc=0
+	wait "$storage_pid" || storage_rc=1
+	wait "$network_pid" || network_rc=1
+	if [ "$storage_rc" -ne 0 ] || [ "$network_rc" -ne 0 ]; then
+		echo "MICRONUX:M6:COMBINED:SOAK:FAIL cycle=$cycle storage_rc=$storage_rc network_rc=$network_rc"
+		exit 1
+	fi
+	echo "MICRONUX:M6:COMBINED:SOAK cycle=$cycle state=pass"
+done
+
+hash_after=$(sample_hash) || {
+	echo 'MICRONUX:M6:COMBINED:SOAK:FAIL stage=hash-after'
+	exit 1
+}
+if [ "$hash_before" != "$hash_after" ]; then
+	echo "MICRONUX:M6:COMBINED:SOAK:FAIL stage=integrity before=$hash_before after=$hash_after"
+	exit 1
+fi
+
+echo "MICRONUX:M6:COMBINED:SOAK:PASS cycles=$# sha256=$hash_after"

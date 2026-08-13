@@ -1,0 +1,476 @@
+From 7d580199445835a1485e3e24d6686d44b12442fe Mon Sep 17 00:00:00 2001
+From: d0773d <dottedquad@gmail.com>
+Date: Wed, 12 Aug 2026 09:08:34 -0700
+Subject: [PATCH 41/46] video: fbdev: keep native one-shot scanout fed
+
+ESP32-P4's DSI bridge emits its reserved pixel value when its FIFO
+underflows. The reset value decodes as light cyan in RGB565, which can
+hide a transient one-shot DMA starvation event behind an apparently
+healthy framebuffer and clean masked underrun counters.
+
+Program the reserved pixel value to black before enabling native DPI
+output, and keep it as a checked runtime invariant. Match ESP-IDF's
+minimal recurring DMA rearm transaction instead of repeating cold-arm
+readbacks in every completion interrupt. Add passive transfer/rearm and
+FIFO-depth telemetry so long disconnected runs can distinguish delayed
+completion delivery from driver rearm latency without changing the
+existing underrun policy.
+
+Signed-off-by: d0773d <dottedquad@gmail.com>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 222 ++++++++++++++++++++++++++++--
+ 1 file changed, 210 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index a8bff0a..460454f 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -29,6 +29,7 @@
+ #include <linux/of_address.h>
+ #include <linux/platform_device.h>
+ #include <linux/sched.h>
++#include <linux/sched/clock.h>
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+ #include <linux/uaccess.h>
+@@ -257,8 +258,11 @@
+ #define DSI_BRG_RAW_NUM_CONFIG		0x0c
+ #define DSI_BRG_RAW_NUM_TOTAL_SET	BIT(31)
+ #define DSI_BRG_FIFO_FLOW_STATUS	0x14
++#define DSI_BRG_FIFO_FLOW_DEPTH		0x00003fffU
+ #define DSI_BRG_DMA_BLOCK_INTERVAL	0x1c
+ #define DSI_BRG_DMA_REQUEST_INTERVAL	0x20
++#define DSI_BRG_DPI_RSV_DATA		0x28
++#define DSI_BRG_DPI_RSV_DATA_MASK	GENMASK(29, 0)
+ #define DSI_BRG_PIXEL_TYPE		0x18
+ #define DSI_BRG_V_TIMING0		0x30
+ #define DSI_BRG_V_TIMING1		0x34
+@@ -292,6 +296,9 @@
+ #define DSI_BRG_NATIVE_HOST_CTRL	0x00000001
+ #define DSI_BRG_NATIVE_DMA_FLOW		0x00000010
+ #define DSI_BRG_NATIVE_FIFO_THRESHOLD	0x00000300
++#define DSI_BRG_NATIVE_DPI_RSV_DATA	0x00000000
++
++#define MICRONUX_NATIVE_ARM_TO_IRQ_SLOW_NS	20000000ULL
+ 
+ #define DW_GDMA_CFG			0x10
+ #define DW_GDMA_CHEN			0x18
+@@ -752,6 +759,18 @@ struct micronux_dsi {
+ 	u64 dark_baseline_commit_sequence;
+ 	u32 watchdog_frames;
+ 	u32 watchdog_sar;
++	u64 native_last_arm_ns;
++	u64 native_arm_to_irq_last_ns;
++	u64 native_arm_to_irq_max_ns;
++	u64 native_rearm_last_ns;
++	u64 native_rearm_max_ns;
++	u32 native_arm_to_irq_over_20ms;
++	u32 native_fifo_irq_last;
++	u32 native_fifo_irq_min;
++	u32 native_fifo_irq_zero;
++	u32 native_fifo_poll_last;
++	u32 native_fifo_poll_min;
++	u32 native_fifo_poll_zero;
+ 	unsigned long fault_bits;
+ 	unsigned long last_frame_jiffies;
+ 	u8 watchdog_stale_polls;
+@@ -828,12 +847,46 @@ struct micronux_scanout_snapshot {
+ 	u32 host_vid;
+ 	u32 host_active;
+ 	u32 host_lpclk;
++	u32 bridge_filler;
++	u32 bridge_misc;
+ 	unsigned long fault_bits;
+ 	bool host_status_seen;
+ 	bool guards_valid;
+ 	bool runtime_policy_valid;
+ };
+ 
++struct micronux_native_telemetry {
++	u64 arm_to_irq_last_ns;
++	u64 arm_to_irq_max_ns;
++	u64 rearm_last_ns;
++	u64 rearm_max_ns;
++	u32 arm_to_irq_over_20ms;
++	u32 fifo_irq_last;
++	u32 fifo_irq_min;
++	u32 fifo_irq_zero;
++	u32 fifo_poll_last;
++	u32 fifo_poll_min;
++	u32 fifo_poll_zero;
++};
++
++static void
++micronux_native_capture_telemetry_locked(struct micronux_dsi *dsi,
++					 struct micronux_native_telemetry *telemetry)
++{
++	telemetry->arm_to_irq_last_ns = dsi->native_arm_to_irq_last_ns;
++	telemetry->arm_to_irq_max_ns = dsi->native_arm_to_irq_max_ns;
++	telemetry->rearm_last_ns = dsi->native_rearm_last_ns;
++	telemetry->rearm_max_ns = dsi->native_rearm_max_ns;
++	telemetry->arm_to_irq_over_20ms =
++		dsi->native_arm_to_irq_over_20ms;
++	telemetry->fifo_irq_last = dsi->native_fifo_irq_last;
++	telemetry->fifo_irq_min = dsi->native_fifo_irq_min;
++	telemetry->fifo_irq_zero = dsi->native_fifo_irq_zero;
++	telemetry->fifo_poll_last = dsi->native_fifo_poll_last;
++	telemetry->fifo_poll_min = dsi->native_fifo_poll_min;
++	telemetry->fifo_poll_zero = dsi->native_fifo_poll_zero;
++}
++
+ static void
+ micronux_capture_scanout_snapshot(struct micronux_dsi *dsi,
+ 				  struct micronux_scanout_snapshot *snapshot, u8 index,
+@@ -2145,10 +2198,44 @@ static int micronux_dma_start_frame(struct micronux_dsi *dsi, u8 index)
+ 	return micronux_dma_arm_frame(dsi, index);
+ }
+ 
++static int
++micronux_native_dma_rearm_frame_fast(struct micronux_dsi *dsi, u8 index,
++				     u64 irq_entry_ns)
++{
++	u32 channel = BIT(dsi->handoff.dma_channel);
++	u32 descriptor_address;
++	void __iomem *descriptor;
++	u64 arm_ns, rearm_ns;
++
++	if (index >= MICRONUX_DISPLAY_BUFFER_COUNT)
++		return -EINVAL;
++	descriptor_address = dsi->handoff.dma_descriptor_address +
++			     index * MICRONUX_DMA_DESCRIPTOR_SIZE;
++	descriptor = dsi->descriptor[index];
++	WRITE_ONCE(dsi->rearm_attempts,
++		   READ_ONCE(dsi->rearm_attempts) + 1);
++	/* The caller holds state_lock; keep the source-off window minimal. */
++	writel(MICRONUX_NATIVE_DMA_DESCRIPTOR_ARMED,
++	       descriptor + DMA_LLI_CTRL_HI);
++	writel(descriptor_address | DW_GDMA_LLP_MEMORY_PORT,
++	       dsi->channel + DW_GDMA_CH_LLP);
++	writel(0, dsi->channel + DW_GDMA_CH_LLP + sizeof(u32));
++	/* Publish the descriptor and link before enabling the channel. */
++	wmb();
++	writel(channel | (channel << 8), dsi->gdma + DW_GDMA_CHEN);
++	arm_ns = local_clock();
++	rearm_ns = arm_ns - irq_entry_ns;
++	dsi->native_rearm_last_ns = rearm_ns;
++	dsi->native_rearm_max_ns = max(dsi->native_rearm_max_ns, rearm_ns);
++	dsi->native_last_arm_ns = arm_ns;
++	return 0;
++}
++
+ static int
+ micronux_native_dma_arm_frame(struct micronux_dsi *dsi, u8 index,
+ 			      struct micronux_scanout_snapshot *failure_snapshot)
+ {
++	unsigned long flags;
+ 	u32 channel = BIT(dsi->handoff.dma_channel);
+ 	u32 descriptor_address = dsi->handoff.dma_descriptor_address +
+ 				 index * MICRONUX_DMA_DESCRIPTOR_SIZE;
+@@ -2233,6 +2320,9 @@ micronux_native_dma_arm_frame(struct micronux_dsi *dsi, u8 index,
+ 							  failure_snapshot, index, 0);
+ 		return -EIO;
+ 	}
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	dsi->native_last_arm_ns = local_clock();
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
+ 	return 0;
+ }
+ 
+@@ -2263,14 +2353,42 @@ micronux_native_contain_inactive_irqs(struct micronux_dsi *dsi, u32 top)
+ 	return contained;
+ }
+ 
++static void
++micronux_native_reset_telemetry(struct micronux_dsi *dsi,
++				bool reset_last_arm)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	if (reset_last_arm)
++		dsi->native_last_arm_ns = 0;
++	dsi->native_arm_to_irq_last_ns = 0;
++	dsi->native_arm_to_irq_max_ns = 0;
++	dsi->native_rearm_last_ns = 0;
++	dsi->native_rearm_max_ns = 0;
++	dsi->native_arm_to_irq_over_20ms = 0;
++	dsi->native_fifo_irq_last = 0;
++	dsi->native_fifo_irq_min = DSI_BRG_FIFO_FLOW_DEPTH;
++	dsi->native_fifo_irq_zero = 0;
++	dsi->native_fifo_poll_last = 0;
++	dsi->native_fifo_poll_min = DSI_BRG_FIFO_FLOW_DEPTH;
++	dsi->native_fifo_poll_zero = 0;
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++}
++
+ static irqreturn_t micronux_native_dma_irq(struct micronux_dsi *dsi)
+ {
+ 	unsigned long flags;
++	u64 arm_to_irq_ns, irq_entry_ns;
+ 	u32 common, status0, status1, top;
++	u32 fifo_depth;
+ 	u8 next_index;
+ 	bool dma_error, faulted, inactive_contained = true, preserve;
+ 	bool rearm_failed = false, wake_frame = false;
+ 
++	irq_entry_ns = local_clock();
++	fifo_depth = readl(dsi->bridge + DSI_BRG_FIFO_FLOW_STATUS) &
++		     DSI_BRG_FIFO_FLOW_DEPTH;
+ 	top = readl(dsi->gdma + DW_GDMA_INT_STATUS);
+ 	status0 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS);
+ 	status1 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS1);
+@@ -2325,6 +2443,18 @@ static irqreturn_t micronux_native_dma_irq(struct micronux_dsi *dsi)
+ 		   READ_ONCE(dsi->scanout_frames) + 1);
+ 	WRITE_ONCE(dsi->last_frame_jiffies, jiffies);
+ 	spin_lock_irqsave(&dsi->state_lock, flags);
++	if (dsi->native_last_arm_ns) {
++		arm_to_irq_ns = irq_entry_ns - dsi->native_last_arm_ns;
++		dsi->native_arm_to_irq_last_ns = arm_to_irq_ns;
++		dsi->native_arm_to_irq_max_ns =
++			max(dsi->native_arm_to_irq_max_ns, arm_to_irq_ns);
++		if (arm_to_irq_ns > MICRONUX_NATIVE_ARM_TO_IRQ_SLOW_NS)
++			dsi->native_arm_to_irq_over_20ms++;
++	}
++	dsi->native_fifo_irq_last = fifo_depth;
++	dsi->native_fifo_irq_min = min(dsi->native_fifo_irq_min, fifo_depth);
++	if (!fifo_depth)
++		dsi->native_fifo_irq_zero++;
+ 	if (dsi->scanout_active) {
+ 		faulted = READ_ONCE(dsi->fault_bits);
+ 		next_index = !faulted && !dma_error &&
+@@ -2332,7 +2462,8 @@ static irqreturn_t micronux_native_dma_irq(struct micronux_dsi *dsi)
+ 			dsi->queued_index : dsi->front_index;
+ 		if ((faulted || dma_error) && !preserve) {
+ 			rearm_failed = false;
+-		} else if (micronux_native_dma_arm_frame(dsi, next_index, NULL)) {
++		} else if (micronux_native_dma_rearm_frame_fast(dsi, next_index,
++							     irq_entry_ns)) {
+ 			rearm_failed = true;
+ 		} else {
+ 			if (!dma_error) {
+@@ -2440,12 +2571,25 @@ static enum hrtimer_restart micronux_dma_poll(struct hrtimer *timer)
+ {
+ 	struct micronux_dsi *dsi = container_of(timer, struct micronux_dsi,
+ 					       scanout_timer);
++	unsigned long flags;
+ 	u32 bridge_status, frames, sar;
++	u32 fifo_depth;
+ 	bool host_status, monitor, native;
+ 
+ 	native = dsi->required_handoff_abi ==
+ 		 MICRONUX_DISPLAY_ABI_VERSION_V3;
+ 	bridge_status = readl(dsi->bridge + DSI_BRG_INT_RAW);
++	if (native) {
++		fifo_depth = readl(dsi->bridge + DSI_BRG_FIFO_FLOW_STATUS) &
++			     DSI_BRG_FIFO_FLOW_DEPTH;
++		spin_lock_irqsave(&dsi->state_lock, flags);
++		dsi->native_fifo_poll_last = fifo_depth;
++		dsi->native_fifo_poll_min =
++			min(dsi->native_fifo_poll_min, fifo_depth);
++		if (!fifo_depth)
++			dsi->native_fifo_poll_zero++;
++		spin_unlock_irqrestore(&dsi->state_lock, flags);
++	}
+ 	if (bridge_status & DSI_BRG_INT_UNDERRUN) {
+ 		writel(DSI_BRG_INT_UNDERRUN,
+ 		       dsi->bridge + DSI_BRG_INT_CLR);
+@@ -3117,10 +3261,12 @@ static ssize_t scanout_show(struct device *dev,
+ 			    struct device_attribute *attribute, char *buf)
+ {
+ 	struct micronux_dsi *dsi = dev_get_drvdata(dev);
++	struct micronux_native_telemetry telemetry = { };
+ 	bool clock_auto, frame_ack_disabled, lp_enabled;
+ 	bool guards_valid;
+ 	unsigned long faults, flags;
+-	u32 active, before, after, error, channel_enable, host, lpclk, underruns;
++	u32 active, before, after, bridge_filler, bridge_misc, error;
++	u32 channel_enable, host, lpclk, underruns;
+ 	u32 host_error0, host_error1;
+ 	u32 rearm_attempts, rearm_failures, flip_requests, flip_completions;
+ 	u64 front_commit;
+@@ -3150,11 +3296,17 @@ static ssize_t scanout_show(struct device *dev,
+ 	render = dsi->render_index;
+ 	queued = dsi->queued_index;
+ 	front_commit = dsi->front_commit_sequence;
+-	spin_unlock_irqrestore(&dsi->state_lock, flags);
+ 	if (dsi->required_handoff_abi ==
+ 	    MICRONUX_DISPLAY_ABI_VERSION_V3)
++		micronux_native_capture_telemetry_locked(dsi, &telemetry);
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++	if (dsi->required_handoff_abi ==
++	    MICRONUX_DISPLAY_ABI_VERSION_V3) {
++		bridge_filler = readl(dsi->bridge + DSI_BRG_DPI_RSV_DATA) &
++				DSI_BRG_DPI_RSV_DATA_MASK;
++		bridge_misc = readl(dsi->bridge + DSI_BRG_DPI_MISC_CONFIG);
+ 		return sysfs_emit(buf,
+-			"%s abi=3 state=%s frames=%u->%u error=%08x underruns=%u chen=%u faults=%lx host-errors=%08x:%08x frame-ack=on clock=auto lp=enabled backlight-gate=%s buffers=3 front=%u queued=%d back=%u rearm=%u/%u flips=%u/%u generation=%u commit=%llu guards=%s guard-errors=%u i2c=active-serialized\n",
++			"%s abi=3 state=%s frames=%u->%u error=%08x underruns=%u chen=%u faults=%lx host-errors=%08x:%08x frame-ack=on clock=auto lp=enabled backlight-gate=%s buffers=3 front=%u queued=%d back=%u rearm=%u/%u flips=%u/%u generation=%u commit=%llu guards=%s guard-errors=%u arm-to-irq-ns=%llu/%llu arm-to-irq-over20ms=%u rearm-ns=%llu/%llu fifo-irq=%u/%u/%u fifo-poll=%u/%u/%u bridge-filler=%08x bridge-misc=%08x i2c=active-serialized\n",
+ 			after != before && !error && !underruns && !faults &&
+ 			!host_error0 && !host_error1 && guards_valid &&
+ 			micronux_native_runtime_policy_valid(dsi) ?
+@@ -3170,7 +3322,17 @@ static ssize_t scanout_show(struct device *dev,
+ 			READ_ONCE(dsi->source_generation),
+ 			(unsigned long long)front_commit,
+ 			guards_valid ? "ok" : "bad",
+-			READ_ONCE(dsi->pool_guard_errors));
++			READ_ONCE(dsi->pool_guard_errors),
++			(unsigned long long)telemetry.arm_to_irq_last_ns,
++			(unsigned long long)telemetry.arm_to_irq_max_ns,
++			telemetry.arm_to_irq_over_20ms,
++			(unsigned long long)telemetry.rearm_last_ns,
++			(unsigned long long)telemetry.rearm_max_ns,
++			telemetry.fifo_irq_last, telemetry.fifo_irq_min,
++			telemetry.fifo_irq_zero, telemetry.fifo_poll_last,
++			telemetry.fifo_poll_min, telemetry.fifo_poll_zero,
++			bridge_filler, bridge_misc);
++	}
+ 	frame_ack_disabled = !(host & DSI_HOST_FRAME_BTA_ACK_EN) &&
+ 			     !(active & DSI_HOST_FRAME_BTA_ACK_EN_ACT);
+ 	clock_auto = (lpclk & DSI_HOST_CLOCK_LANE_AUTO) ==
+@@ -3204,12 +3366,13 @@ static ssize_t diagnostics_show(struct device *dev,
+ 				struct device_attribute *attribute, char *buf)
+ {
+ 	struct micronux_dsi *dsi = dev_get_drvdata(dev);
++	struct micronux_native_telemetry telemetry = { };
+ 	void __iomem *cached;
+ 	void __iomem *descriptor;
+ 	unsigned long flags;
+ 	u32 sar_before, sar_after, llp_before, llp_after;
+ 	u32 status_before, status_after;
+-	u32 active, host, lpclk;
++	u32 active, bridge_filler, bridge_misc, host, lpclk;
+ 	ssize_t length;
+ 	u64 front_commit;
+ 	u8 front, render;
+@@ -3220,11 +3383,17 @@ static ssize_t diagnostics_show(struct device *dev,
+ 	render = dsi->render_index;
+ 	queued = dsi->queued_index;
+ 	front_commit = dsi->front_commit_sequence;
+-	spin_unlock_irqrestore(&dsi->state_lock, flags);
+ 	if (dsi->required_handoff_abi ==
+ 	    MICRONUX_DISPLAY_ABI_VERSION_V3)
++		micronux_native_capture_telemetry_locked(dsi, &telemetry);
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++	if (dsi->required_handoff_abi ==
++	    MICRONUX_DISPLAY_ABI_VERSION_V3) {
++		bridge_filler = readl(dsi->bridge + DSI_BRG_DPI_RSV_DATA) &
++				DSI_BRG_DPI_RSV_DATA_MASK;
++		bridge_misc = readl(dsi->bridge + DSI_BRG_DPI_MISC_CONFIG);
+ 		return sysfs_emit(buf,
+-			"abi=3 state=%s frames=%u faults=%lx error=%08x host-errors=%08x:%08x underruns=%u buffers=3 front=%u queued=%d back=%u rearm=%u/%u flips=%u/%u generation=%u commit=%llu guards=%s guard-errors=%u policy=%s i2c=active-serialized physical-panel-state=unobserved\n",
++			"abi=3 state=%s frames=%u faults=%lx error=%08x host-errors=%08x:%08x underruns=%u buffers=3 front=%u queued=%d back=%u rearm=%u/%u flips=%u/%u generation=%u commit=%llu guards=%s guard-errors=%u policy=%s arm-to-irq-ns=%llu/%llu arm-to-irq-over20ms=%u rearm-ns=%llu/%llu fifo-irq=%u/%u/%u fifo-poll=%u/%u/%u bridge-filler=%08x bridge-misc=%08x i2c=active-serialized physical-panel-state=unobserved\n",
+ 			READ_ONCE(dsi->display_state) ==
+ 				MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED ?
+ 			"RUNTIME_REVEALED" : "not-revealed",
+@@ -3243,7 +3412,17 @@ static ssize_t diagnostics_show(struct device *dev,
+ 			micronux_pool_guards_valid(dsi, true) ? "ok" : "bad",
+ 			READ_ONCE(dsi->pool_guard_errors),
+ 			micronux_native_runtime_policy_valid(dsi) ?
+-			"ok" : "bad");
++			"ok" : "bad",
++			(unsigned long long)telemetry.arm_to_irq_last_ns,
++			(unsigned long long)telemetry.arm_to_irq_max_ns,
++			telemetry.arm_to_irq_over_20ms,
++			(unsigned long long)telemetry.rearm_last_ns,
++			(unsigned long long)telemetry.rearm_max_ns,
++			telemetry.fifo_irq_last, telemetry.fifo_irq_min,
++			telemetry.fifo_irq_zero, telemetry.fifo_poll_last,
++			telemetry.fifo_poll_min, telemetry.fifo_poll_zero,
++			bridge_filler, bridge_misc);
++	}
+ 	cached = (void __iomem *)(uintptr_t)
+ 		dsi->handoff.framebuffer_address[front];
+ 	descriptor = dsi->descriptor[front];
+@@ -5352,7 +5531,7 @@ static int micronux_native_initialize_memory(struct micronux_dsi *dsi)
+ 
+ static int micronux_native_configure_dpi_bridge(struct micronux_dsi *dsi)
+ {
+-	u32 clock, mask;
++	u32 clock, filler, mask;
+ 
+ 	mask = HP_CLKRST_DSI_DPHY_CFG_CLK_EN |
+ 	       HP_CLKRST_DSI_DPHY_PLL_REFCLK_EN |
+@@ -5394,6 +5573,12 @@ static int micronux_native_configure_dpi_bridge(struct micronux_dsi *dsi)
+ 
+ 	writel(0, dsi->bridge + DSI_BRG_CLK_EN);
+ 	writel(0, dsi->bridge + DSI_BRG_EN);
++	writel(DSI_BRG_NATIVE_DPI_RSV_DATA,
++	       dsi->bridge + DSI_BRG_DPI_RSV_DATA);
++	filler = readl(dsi->bridge + DSI_BRG_DPI_RSV_DATA) &
++		 DSI_BRG_DPI_RSV_DATA_MASK;
++	if (filler != DSI_BRG_NATIVE_DPI_RSV_DATA)
++		return -EIO;
+ 	writel(DSI_BRG_NATIVE_BURST_LEN,
+ 	       dsi->bridge + DSI_BRG_BURST_LEN);
+ 	writel(DSI_BRG_NATIVE_RAW_NUM | DSI_BRG_RAW_NUM_TOTAL_SET,
+@@ -5448,12 +5633,14 @@ static int micronux_native_configure_dpi_bridge(struct micronux_dsi *dsi)
+ 	    readl(dsi->host + DSI_HOST_VID_VACTIVE_LINES) != 1280 ||
+ 	    readl(dsi->host + DSI_HOST_LPCLK_CTRL) !=
+ 		DSI_HOST_CLOCK_LANE_AUTO ||
++	    (readl(dsi->bridge + DSI_BRG_DPI_RSV_DATA) &
++	     DSI_BRG_DPI_RSV_DATA_MASK) != DSI_BRG_NATIVE_DPI_RSV_DATA ||
+ 	    readl(dsi->bridge + DSI_BRG_EN) != DSI_BRG_MODULE_EN ||
+ 	    readl(dsi->bridge + DSI_BRG_DPI_MISC_CONFIG) !=
+ 		DSI_BRG_NATIVE_MISC_OFF)
+ 		return -EIO;
+ 	dev_info(dsi->dev,
+-		 "MICRONUX:M9.2:COLD-INIT stage=dpi-bridge state=CONFIGURED source=f240m divider=3 dpi-hz=80000000 host=command video-policy=0000ff02 frame-bta=enabled lp=all-periods-and-commands lpclk=00000003 burst=sync-pulses-type2 timing=800x1280:20/20/40:4/10/30 bridge=enabled output=off\n");
++		 "MICRONUX:M9.2:COLD-INIT stage=dpi-bridge state=CONFIGURED source=f240m divider=3 dpi-hz=80000000 host=command video-policy=0000ff02 frame-bta=enabled lp=all-periods-and-commands lpclk=00000003 burst=sync-pulses-type2 timing=800x1280:20/20/40:4/10/30 bridge=enabled output=off underflow-filler=00000000 discard-vcnt=800\n");
+ 	return 0;
+ }
+ 
+@@ -5683,6 +5870,8 @@ static bool micronux_native_runtime_policy_valid(struct micronux_dsi *dsi)
+ 		DSI_HOST_CLOCK_LANE_AUTO &&
+ 	       !(readl(dsi->host + DSI_HOST_VID_MODE_CFG) &
+ 		 DSI_HOST_VPG_MASK) &&
++	       !(readl(dsi->bridge + DSI_BRG_DPI_RSV_DATA) &
++		 DSI_BRG_DPI_RSV_DATA_MASK) &&
+ 	       readl(dsi->bridge + DSI_BRG_CLK_EN) == 0 &&
+ 	       readl(dsi->bridge + DSI_BRG_EN) == DSI_BRG_MODULE_EN &&
+ 	       readl(dsi->bridge + DSI_BRG_BURST_LEN) ==
+@@ -5755,6 +5944,11 @@ micronux_capture_scanout_snapshot(struct micronux_dsi *dsi,
+ 	snapshot->host_sticky0 = READ_ONCE(dsi->host_error0);
+ 	snapshot->host_sticky1 = READ_ONCE(dsi->host_error1);
+ 	snapshot->bridge_raw = readl(dsi->bridge + DSI_BRG_INT_RAW);
++	snapshot->bridge_filler =
++		readl(dsi->bridge + DSI_BRG_DPI_RSV_DATA) &
++		DSI_BRG_DPI_RSV_DATA_MASK;
++	snapshot->bridge_misc =
++		readl(dsi->bridge + DSI_BRG_DPI_MISC_CONFIG);
+ 	snapshot->bridge_underruns = READ_ONCE(dsi->bridge_underruns);
+ 	snapshot->gdma_top = readl(dsi->gdma + DW_GDMA_INT_STATUS);
+ 	snapshot->gdma_status0 =
+@@ -5801,12 +5995,13 @@ micronux_log_scanout_failure(struct micronux_dsi *dsi,
+ 		snapshot->rearm_failures, snapshot->guards_valid,
+ 		snapshot->runtime_policy_valid);
+ 	dev_err(dsi->dev,
+-		"MICRONUX:M9.2:COLD-INIT stage=scanout-qualification reason=%s snapshot=host raw=%08x:%08x sticky=%08x:%08x seen=%u mode=%08x vid=%08x active=%08x lpclk=%08x bridge-raw=%08x underruns=%u gdma=%08x:%08x:%08x:%08x cfg=%08x chen=%08x cfglo=%08x cfghi=%08x llp=%08x sar=%08x ctrlhi=%08x\n",
++		"MICRONUX:M9.2:COLD-INIT stage=scanout-qualification reason=%s snapshot=host raw=%08x:%08x sticky=%08x:%08x seen=%u mode=%08x vid=%08x active=%08x lpclk=%08x bridge-raw=%08x bridge-filler=%08x bridge-misc=%08x underruns=%u gdma=%08x:%08x:%08x:%08x cfg=%08x chen=%08x cfglo=%08x cfghi=%08x llp=%08x sar=%08x ctrlhi=%08x\n",
+ 		reason, snapshot->host_raw0, snapshot->host_raw1,
+ 		snapshot->host_sticky0, snapshot->host_sticky1,
+ 		snapshot->host_status_seen, snapshot->host_mode,
+ 		snapshot->host_vid, snapshot->host_active,
+ 		snapshot->host_lpclk, snapshot->bridge_raw,
++		snapshot->bridge_filler, snapshot->bridge_misc,
+ 		snapshot->bridge_underruns,
+ 		snapshot->gdma_top, snapshot->gdma_status0,
+ 		snapshot->gdma_status1, snapshot->gdma_common,
+@@ -5826,6 +6021,7 @@ static int micronux_native_start_scanout(struct micronux_dsi *dsi)
+ 	dsi->front_index = 0;
+ 	dsi->render_index = 1;
+ 	dsi->queued_index = -1;
++	micronux_native_reset_telemetry(dsi, true);
+ 	/* The global IRQ master stays masked across this final clean snapshot. */
+ 	micronux_capture_scanout_snapshot(dsi, &snapshot,
+ 					  dsi->front_index, 0);
+@@ -6311,6 +6507,8 @@ static int micronux_cold_initialize_scanout_stage(struct micronux_dsi *dsi)
+ 	if (ret)
+ 		goto fail_publication;
+ 	dsi->boot_ready_file_created = true;
++	/* Exclude cold qualification while retaining the current arm timestamp. */
++	micronux_native_reset_telemetry(dsi, false);
+ 	micronux_watchdog_seed_progress(dsi);
+ 	WRITE_ONCE(dsi->scanout_ready, true);
+ 	WRITE_ONCE(dsi->render_enabled, true);
+-- 
+2.54.0.windows.1

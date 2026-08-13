@@ -1,0 +1,28 @@
+From 4ae5f21e55504330952f06fd9219fd8da6335555 Mon Sep 17 00:00:00 2001
+From: MicroNUX contributors <micronux@users.noreply.github.com>
+Date: Sat, 8 Aug 2026 17:55:00 -0700
+Subject: [PATCH] host: include poll definitions explicitly
+
+Linux 6.12 no longer exposes poll_table through the headers included
+incidentally by this source file. Include the API header that defines it.
+
+Signed-off-by: MicroNUX contributors <micronux@users.noreply.github.com>
+---
+ esp_hosted_fg/host/linux/host_driver/esp32/esp_serial.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/esp_hosted_fg/host/linux/host_driver/esp32/esp_serial.c b/esp_hosted_fg/host/linux/host_driver/esp32/esp_serial.c
+index 60efbb6..b417426 100644
+--- a/esp_hosted_fg/host/linux/host_driver/esp32/esp_serial.c
++++ b/esp_hosted_fg/host/linux/host_driver/esp32/esp_serial.c
+@@ -26,6 +26,7 @@
+ #include <linux/cdev.h>
+ #include <linux/fs.h>
+ #include <linux/kthread.h>
++#include <linux/poll.h>
+ #include <linux/delay.h>
+ #include <linux/slab.h>
+ 
+-- 
+2.43.0
+

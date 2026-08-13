@@ -64,6 +64,11 @@ The user confirmed that this attached device is the linked
 `ESP32-P4-Module-DEV-KIT`. This probe supersedes the earlier observation of a
 different attached Waveshare Touch-LCD-3.5 board.
 
+The reference carrier enumerated as a CH343 UART port and a separate USB
+Serial/JTAG port. M2 flashing and acceptance testing used the CH343 UART port;
+port numbers are deliberately not part of the contract because Windows can
+reassign them.
+
 ## Frozen boot-critical pin map
 
 | Function | ESP32-P4 GPIO | Evidence |
@@ -76,10 +81,11 @@ different attached Waveshare Touch-LCD-3.5 board.
 | ESP32-C6 SDIO D0-D3 | 14, 15, 16, 17 | live ESP-Hosted initialization |
 | ESP32-C6 reset | 54 | live ESP-Hosted initialization |
 
-UART0 at 115200 8N1 is the only console required for the first Linux shell.
-Storage, Ethernet, display, camera, and USB pins will be frozen in their own
-driver milestones so their mux and DMA conflicts are reviewed at the point of
-use.
+The native USB Serial/JTAG controller is the M3/M4 Linux console; UART0 at
+115200 8N1 remains the wired recovery and alternate-debug path. Storage,
+Ethernet, display, camera, and general-purpose USB pins will be frozen in their
+own driver milestones so their mux and DMA conflicts are reviewed at the point
+of use.
 
 ## Silicon and interrupt-controller risk
 
@@ -98,18 +104,21 @@ The selected reference board reports:
 - flash encryption disabled; and
 - `SPI_BOOT_CRYPT_CNT` equal to zero.
 
-Before the first MicroNUX write, read the entire 16 MiB factory flash into a
-local backup, record its SHA-256 hash, and verify that a sample can be read
-back. Then review the MicroNUX partition offsets and rehearse ROM download-mode
-recovery. No eFuse change is part of the development plan. All M0 inspection
-was read-only apart from resetting the board to collect its boot log.
+Before the first MicroNUX write, the policy requires reading the entire 16 MiB
+factory flash into a local backup, recording its SHA-256 hash, and verifying a
+sample readback. No retained pre-M2 factory backup was found in the project
+workspace, so the original factory image must not be described as preserved.
+Recovery currently means ROM download mode plus the vendor firmware or a fresh
+MicroNUX flash. M2 did not change any eFuse, secure-boot, or flash-encryption
+setting.
 
 ## Toolchain contract
 
 - Loader and hardware diagnostics: ESP-IDF v6.0.1
 - ROM inspection: esptool v5.3.0
 - Linux root filesystem: Buildroot, uClibc-ng, and BusyBox on a Linux/WSL2 host
-- Linux ABI: RV32 NOMMU; exact ISA/ABI flags will be frozen by the QEMU milestone
+- Linux ABI: RV32 NOMMU `rv32imac_zicsr_zifencei` with soft-float `ilp32`;
+  Linux must not be exposed to `F` or `D` in the initial profile
 - Build outputs must record source revisions, configuration files, and hashes
 
 ## M0 exit criteria

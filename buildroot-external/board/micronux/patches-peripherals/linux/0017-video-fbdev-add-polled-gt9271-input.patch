@@ -1,0 +1,486 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MicroNUX <micronux@example.invalid>
+Date: Mon, 10 Aug 2026 14:30:00 -0700
+Subject: [PATCH 17/46] video: fbdev: expose polled Kit C GT9271 input
+
+The Waveshare Kit C routes its GT9271 over the same retained ESP32-P4 I2C
+controller used by the panel backlight, but the platform leaves touch reset
+and interrupt GPIOs unconnected. Extend the Linux-owned display device with
+bounded 16-bit-register I2C reads and a standard polled input device.
+
+Probe the documented 0x5d address with a 0x14 fallback, require product ID
+9271, report the primary contact through ABS_X, ABS_Y, ABS_PRESSURE, and
+BTN_TOUCH, clear each consumed Goodix status record, and expose read/error
+diagnostics. Touch failure remains nonfatal so display and console recovery
+continue to work on an absent or incompatible panel.
+
+Require the standard touchscreen dimensions to match the retained 800x1280
+display handoff so an incorrect board description fails before input is
+registered.
+
+Signed-off-by: MicroNUX <micronux@example.invalid>
+---
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 22fbf4c..fea02e1 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -17,6 +17,7 @@
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+ #include <linux/hrtimer.h>
++#include <linux/input.h>
+ #include <linux/interrupt.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+@@ -92,6 +93,16 @@
+ #define MICRONUX_FB_WRITE_GAP_US	2
+ #define MICRONUX_SCANOUT_START_TIMEOUT_MS 100
+ 
++#define MICRONUX_TOUCH_ADDRESS_PRIMARY	0x5d
++#define MICRONUX_TOUCH_ADDRESS_BACKUP	0x14
++#define MICRONUX_TOUCH_PRODUCT_ID	0x8140
++#define MICRONUX_TOUCH_STATUS		0x814e
++#define MICRONUX_TOUCH_POINT_DATA	0x814f
++#define MICRONUX_TOUCH_STATUS_READY	BIT(7)
++#define MICRONUX_TOUCH_COUNT_MASK	GENMASK(3, 0)
++#define MICRONUX_TOUCH_MAX_CONTACTS	10
++#define MICRONUX_TOUCH_POLL_MS		10
++
+ #define I2C_CTR				0x04
+ #define I2C_SR				0x08
+ #define I2C_FIFO_CONF			0x18
+@@ -113,9 +124,12 @@
+ 
+ #define I2C_CMD_RESTART			6
+ #define I2C_CMD_WRITE			1
++#define I2C_CMD_READ			3
+ #define I2C_CMD_STOP			2
+ #define I2C_CMD(opcode, bytes, ack_check)	\
+ 	((bytes) | ((ack_check) ? BIT(8) : 0) | ((opcode) << 11))
++#define I2C_CMD_READ_BYTES(bytes, nack)	\
++	((bytes) | ((nack) ? BIT(10) : 0) | (I2C_CMD_READ << 11))
+ 
+ #define DMA_LLI_SAR			0x00
+ #define DMA_LLI_DAR			0x08
+@@ -158,6 +172,7 @@ struct micronux_dsi {
+ 	void __iomem *descriptor;
+ 	struct fb_info *info;
+ 	struct backlight_device *backlight;
++	struct input_dev *touch;
+ 	int irq;
+ 	struct mutex lock;
+ 	struct micronux_display_handoff_v1 handoff;
+@@ -181,24 +196,15 @@ struct micronux_dsi {
+-static int micronux_i2c_write(struct micronux_dsi *dsi, u8 reg, u8 value)
++static int micronux_i2c_prepare_locked(struct micronux_dsi *dsi)
+ {
+-	u32 command, fifo, raw, status;
+-	u8 bytes[3] = {
+-		(u8)(dsi->handoff.i2c_address << 1), reg, value,
+-	};
+-	int ret;
++	u32 fifo;
+ 
+-	mutex_lock(&dsi->lock);
+-	if (!(readl(dsi->i2c + I2C_CTR) & I2C_MS_MODE)) {
+-		ret = -EIO;
+-		goto out;
+-	}
++	if (!(readl(dsi->i2c + I2C_CTR) & I2C_MS_MODE))
++		return -EIO;
+ 	if (readl(dsi->i2c + I2C_SR) & I2C_BUS_BUSY) {
+ 		writel(readl(dsi->i2c + I2C_CTR) | I2C_FSM_RST,
+ 		       dsi->i2c + I2C_CTR);
+ 		udelay(10);
+-		if (readl(dsi->i2c + I2C_SR) & I2C_BUS_BUSY) {
+-			ret = -EBUSY;
+-			goto out;
+-		}
++		if (readl(dsi->i2c + I2C_SR) & I2C_BUS_BUSY)
++			return -EBUSY;
+ 	}
+ 
+ 	writel(0, dsi->i2c + I2C_INT_ENA);
+@@ -200,31 +212,125 @@ static int micronux_i2c_write(struct micronux_dsi *dsi, u8 reg, u8 value)
+ 	       dsi->i2c + I2C_FIFO_CONF);
+ 	writel(fifo & ~(I2C_RX_FIFO_RST | I2C_TX_FIFO_RST),
+ 	       dsi->i2c + I2C_FIFO_CONF);
++	return 0;
++}
++
++static int micronux_i2c_start_locked(struct micronux_dsi *dsi,
++				     unsigned int stop_command)
++{
++	u32 command, raw, status;
++	int ret;
+ 
+-	writel(bytes[0], dsi->i2c + I2C_DATA);
+-	writel(bytes[1], dsi->i2c + I2C_DATA);
+-	writel(bytes[2], dsi->i2c + I2C_DATA);
+-	writel(I2C_CMD(I2C_CMD_RESTART, 0, false),
+-	       dsi->i2c + I2C_COMMAND(0));
+-	writel(I2C_CMD(I2C_CMD_WRITE, ARRAY_SIZE(bytes), true),
+-	       dsi->i2c + I2C_COMMAND(1));
+-	writel(I2C_CMD(I2C_CMD_STOP, 0, false),
+-	       dsi->i2c + I2C_COMMAND(2));
+ 	command = readl(dsi->i2c + I2C_CTR);
+ 	writel(command | I2C_CONF_UPGATE, dsi->i2c + I2C_CTR);
+ 	writel(command | I2C_TRANS_START, dsi->i2c + I2C_CTR);
+ 
+-	ret = readl_poll_timeout(dsi->i2c + I2C_COMMAND(2), status,
+-				 status & I2C_COMMAND_DONE, 10, 20000);
++	ret = readl_poll_timeout(dsi->i2c + I2C_COMMAND(stop_command),
++				 status, status & I2C_COMMAND_DONE, 10, 20000);
+ 	raw = readl(dsi->i2c + I2C_INT_RAW);
+ 	writel(raw, dsi->i2c + I2C_INT_CLR);
+ 	if (!ret && (raw & I2C_ERROR_MASK))
+ 		ret = -EIO;
++	return ret;
++}
++
++static int micronux_i2c_write_bytes(struct micronux_dsi *dsi, u8 address,
++				    const u8 *bytes, size_t length)
++{
++	int ret;
++	size_t i;
++
++	if (!length || length > 31 || address > 0x7f)
++		return -EINVAL;
++
++	mutex_lock(&dsi->lock);
++	ret = micronux_i2c_prepare_locked(dsi);
++	if (ret)
++		goto out;
++
++	writel(address << 1, dsi->i2c + I2C_DATA);
++	for (i = 0; i < length; i++)
++		writel(bytes[i], dsi->i2c + I2C_DATA);
++
++	writel(I2C_CMD(I2C_CMD_RESTART, 0, false),
++	       dsi->i2c + I2C_COMMAND(0));
++	writel(I2C_CMD(I2C_CMD_WRITE, length + 1, true),
++	       dsi->i2c + I2C_COMMAND(1));
++	writel(I2C_CMD(I2C_CMD_STOP, 0, false),
++	       dsi->i2c + I2C_COMMAND(2));
++	ret = micronux_i2c_start_locked(dsi, 2);
+ out:
+ 	mutex_unlock(&dsi->lock);
+ 	return ret;
+ }
+ 
++static int micronux_i2c_read_reg16(struct micronux_dsi *dsi, u8 address,
++				   u16 reg, u8 *bytes, size_t length)
++{
++	unsigned int stop_command;
++	int ret;
++	size_t i;
++
++	if (!bytes || !length || length > 32 || address > 0x7f)
++		return -EINVAL;
++
++	mutex_lock(&dsi->lock);
++	ret = micronux_i2c_prepare_locked(dsi);
++	if (ret)
++		goto out;
++
++	writel(address << 1, dsi->i2c + I2C_DATA);
++	writel(reg >> 8, dsi->i2c + I2C_DATA);
++	writel(reg & 0xff, dsi->i2c + I2C_DATA);
++	writel((address << 1) | 1, dsi->i2c + I2C_DATA);
++
++	writel(I2C_CMD(I2C_CMD_RESTART, 0, false),
++	       dsi->i2c + I2C_COMMAND(0));
++	writel(I2C_CMD(I2C_CMD_WRITE, 3, true),
++	       dsi->i2c + I2C_COMMAND(1));
++	writel(I2C_CMD(I2C_CMD_RESTART, 0, false),
++	       dsi->i2c + I2C_COMMAND(2));
++	writel(I2C_CMD(I2C_CMD_WRITE, 1, true),
++	       dsi->i2c + I2C_COMMAND(3));
++	if (length > 1) {
++		writel(I2C_CMD_READ_BYTES(length - 1, false),
++		       dsi->i2c + I2C_COMMAND(4));
++		writel(I2C_CMD_READ_BYTES(1, true),
++		       dsi->i2c + I2C_COMMAND(5));
++		stop_command = 6;
++	} else {
++		writel(I2C_CMD_READ_BYTES(1, true),
++		       dsi->i2c + I2C_COMMAND(4));
++		stop_command = 5;
++	}
++	writel(I2C_CMD(I2C_CMD_STOP, 0, false),
++	       dsi->i2c + I2C_COMMAND(stop_command));
++	ret = micronux_i2c_start_locked(dsi, stop_command);
++	if (!ret) {
++		for (i = 0; i < length; i++)
++			bytes[i] = readl(dsi->i2c + I2C_DATA) & 0xff;
++	}
++out:
++	mutex_unlock(&dsi->lock);
++	return ret;
++}
++
++static int micronux_i2c_write_reg8(struct micronux_dsi *dsi, u8 address,
++				   u8 reg, u8 value)
++{
++	u8 bytes[2] = { reg, value };
++
++	return micronux_i2c_write_bytes(dsi, address, bytes, sizeof(bytes));
++}
++
++static int micronux_i2c_write_reg16(struct micronux_dsi *dsi, u8 address,
++				    u16 reg, u8 value)
++{
++	u8 bytes[3] = { reg >> 8, reg & 0xff, value };
++
++	return micronux_i2c_write_bytes(dsi, address, bytes, sizeof(bytes));
++}
++
+ static int micronux_backlight_update(struct backlight_device *backlight)
+ {
+ 	struct micronux_dsi *dsi = bl_get_data(backlight);
+@@ -232,8 +338,8 @@ static int micronux_backlight_update(struct backlight_device *backlight)
+ 
+ 	if (backlight_is_blank(backlight))
+ 		brightness = 0;
+-	return micronux_i2c_write(dsi, dsi->handoff.backlight_register,
+-				  brightness);
++	return micronux_i2c_write_reg8(dsi, dsi->handoff.i2c_address,
++				       dsi->handoff.backlight_register, brightness);
+ }
+ 
+ static int micronux_backlight_get(struct backlight_device *backlight)
+@@ -247,6 +353,164 @@ static const struct backlight_ops micronux_backlight_ops = {
+ 	.get_brightness = micronux_backlight_get,
+ };
+ 
++static int micronux_touch_detect(struct micronux_dsi *dsi, u8 address)
++{
++	u8 product[4];
++	int ret;
++
++	ret = micronux_i2c_read_reg16(dsi, address,
++				       MICRONUX_TOUCH_PRODUCT_ID,
++				       product, sizeof(product));
++	if (ret)
++		return ret;
++	if (memcmp(product, "9271", sizeof(product)))
++		return -ENODEV;
++
++	memcpy(dsi->touch_product, product, sizeof(product));
++	dsi->touch_product[sizeof(product)] = '\0';
++	dsi->touch_address = address;
++	return 0;
++}
++
++static void micronux_touch_poll(struct input_dev *input)
++{
++	struct micronux_dsi *dsi = input_get_drvdata(input);
++	u8 point[8], status;
++	u32 count, pressure, x, y;
++	int ret;
++
++	ret = micronux_i2c_read_reg16(dsi, dsi->touch_address,
++				       MICRONUX_TOUCH_STATUS, &status, 1);
++	if (ret) {
++		WRITE_ONCE(dsi->touch_errors,
++			   READ_ONCE(dsi->touch_errors) + 1);
++		return;
++	}
++	WRITE_ONCE(dsi->touch_reads, READ_ONCE(dsi->touch_reads) + 1);
++	if (!(status & MICRONUX_TOUCH_STATUS_READY))
++		return;
++
++	count = status & MICRONUX_TOUCH_COUNT_MASK;
++	if (count > MICRONUX_TOUCH_MAX_CONTACTS) {
++		WRITE_ONCE(dsi->touch_errors,
++			   READ_ONCE(dsi->touch_errors) + 1);
++		goto clear_status;
++	}
++
++	if (!count) {
++		input_report_key(input, BTN_TOUCH, 0);
++		input_report_abs(input, ABS_PRESSURE, 0);
++		dsi->touch_down = false;
++		input_sync(input);
++		goto clear_status;
++	}
++
++	ret = micronux_i2c_read_reg16(dsi, dsi->touch_address,
++				       MICRONUX_TOUCH_POINT_DATA,
++				       point, sizeof(point));
++	if (ret) {
++		WRITE_ONCE(dsi->touch_errors,
++			   READ_ONCE(dsi->touch_errors) + 1);
++		goto clear_status;
++	}
++
++	x = point[1] | (point[2] << 8);
++	y = point[3] | (point[4] << 8);
++	pressure = point[5] | (point[6] << 8);
++	x = min(x, dsi->handoff.width - 1);
++	y = min(y, dsi->handoff.height - 1);
++	pressure = clamp_val(pressure, 1, 255);
++
++	input_report_key(input, BTN_TOUCH, 1);
++	input_report_abs(input, ABS_X, x);
++	input_report_abs(input, ABS_Y, y);
++	input_report_abs(input, ABS_PRESSURE, pressure);
++	dsi->touch_down = true;
++	input_sync(input);
++
++clear_status:
++	ret = micronux_i2c_write_reg16(dsi, dsi->touch_address,
++					MICRONUX_TOUCH_STATUS, 0);
++	if (ret)
++		WRITE_ONCE(dsi->touch_errors,
++			   READ_ONCE(dsi->touch_errors) + 1);
++}
++
++static int micronux_register_touch(struct micronux_dsi *dsi)
++{
++	struct input_dev *input;
++	u32 address, poll_ms, size;
++	int ret;
++
++	if (of_property_read_u32(dsi->dev->of_node,
++				 "touchscreen-size-x", &size) ||
++	    size != dsi->handoff.width)
++		return -EINVAL;
++	if (of_property_read_u32(dsi->dev->of_node,
++				 "touchscreen-size-y", &size) ||
++	    size != dsi->handoff.height)
++		return -EINVAL;
++
++	if (!of_property_read_u32(dsi->dev->of_node,
++				  "espressif,touch-address", &address)) {
++		if (address > 0x7f)
++			return -EINVAL;
++		ret = micronux_touch_detect(dsi, address);
++	} else {
++		ret = micronux_touch_detect(dsi,
++					    MICRONUX_TOUCH_ADDRESS_PRIMARY);
++		if (ret)
++			ret = micronux_touch_detect(dsi,
++						    MICRONUX_TOUCH_ADDRESS_BACKUP);
++	}
++	if (ret)
++		return ret;
++
++	poll_ms = MICRONUX_TOUCH_POLL_MS;
++	if (!of_property_read_u32(dsi->dev->of_node,
++				  "espressif,touch-poll-ms", &poll_ms) &&
++	    (poll_ms < 5 || poll_ms > 100))
++		return -EINVAL;
++	dsi->touch_poll_ms = poll_ms;
++
++	input = input_allocate_device();
++	if (!input)
++		return -ENOMEM;
++	input->name = "MicroNUX GT9271 Touchscreen";
++	input->phys = "esp32p4/input0";
++	input->id.bustype = BUS_I2C;
++	input->id.vendor = 0x27c6;
++	input->id.product = 0x9271;
++	input_set_drvdata(input, dsi);
++	input_set_capability(input, EV_KEY, BTN_TOUCH);
++	input_set_abs_params(input, ABS_X, 0, dsi->handoff.width - 1,
++			     0, 0);
++	input_set_abs_params(input, ABS_Y, 0, dsi->handoff.height - 1,
++			     0, 0);
++	input_set_abs_params(input, ABS_PRESSURE, 0, 255, 0, 0);
++
++	ret = input_setup_polling(input, micronux_touch_poll);
++	if (ret)
++		goto free_input;
++	input_set_min_poll_interval(input, 5);
++	input_set_max_poll_interval(input, 100);
++	input_set_poll_interval(input, poll_ms);
++	ret = input_register_device(input);
++	if (ret)
++		goto free_input;
++
++	dsi->touch = input;
++	dev_info(dsi->dev,
++		 "MICRONUX:M9:TOUCH state=ready product=%s address=0x%02x mode=poll interval_ms=%u resolution=%ux%u input=event\n",
++		 dsi->touch_product, dsi->touch_address, dsi->touch_poll_ms,
++		 dsi->handoff.width, dsi->handoff.height);
++	return 0;
++
++free_input:
++	input_free_device(input);
++	return ret;
++}
++
+ static int micronux_setcolreg(unsigned int regno, unsigned int red,
+ 			     unsigned int green, unsigned int blue,
+ 			     unsigned int transp, struct fb_info *info)
+@@ -578,11 +842,27 @@ static ssize_t diagnostics_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(diagnostics);
+ 
++static ssize_t touch_show(struct device *dev,
++			  struct device_attribute *attribute, char *buf)
++{
++	struct micronux_dsi *dsi = dev_get_drvdata(dev);
++
++	if (!dsi->touch)
++		return sysfs_emit(buf, "unavailable\n");
++	return sysfs_emit(buf,
++		"ready product=%s address=0x%02x mode=poll interval_ms=%u reads=%u errors=%u down=%u\n",
++		dsi->touch_product, dsi->touch_address, dsi->touch_poll_ms,
++		READ_ONCE(dsi->touch_reads), READ_ONCE(dsi->touch_errors),
++		dsi->touch_down);
++}
++static DEVICE_ATTR_RO(touch);
++
+ static struct attribute *micronux_display_attrs[] = {
+ 	&dev_attr_pattern.attr,
+ 	&dev_attr_ownership.attr,
+ 	&dev_attr_scanout.attr,
+ 	&dev_attr_diagnostics.attr,
++	&dev_attr_touch.attr,
+ 	NULL,
+ };
+ ATTRIBUTE_GROUPS(micronux_display);
+@@ -778,9 +1058,16 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 	ret = micronux_register_framebuffer(dsi);
+ 	if (ret)
+ 		goto darken;
++	ret = micronux_register_touch(dsi);
++	if (ret) {
++		dev_warn(&pdev->dev,
++			 "MICRONUX:M9:TOUCH state=unavailable error=%d mode=poll\n",
++			 ret);
++		dsi->touch = NULL;
++	}
+ 	ret = sysfs_create_groups(&pdev->dev.kobj, micronux_display_groups);
+ 	if (ret)
+-		goto unregister_fb;
++		goto unregister_touch;
+ 	writel(~0U, dsi->channel + DW_GDMA_CH_INT_CLEAR);
+ 	ret = devm_request_irq(&pdev->dev, dsi->irq, micronux_dma_irq, 0,
+ 			       dev_name(&pdev->dev), dsi);
+@@ -804,7 +1091,11 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 
+ remove_sysfs:
+ 	sysfs_remove_groups(&pdev->dev.kobj, micronux_display_groups);
+-unregister_fb:
++unregister_touch:
++	if (dsi->touch) {
++		input_unregister_device(dsi->touch);
++		dsi->touch = NULL;
++	}
+ 	unregister_framebuffer(info);
+ darken:
+ 	backlight->props.power = FB_BLANK_POWERDOWN;
+@@ -822,6 +1113,10 @@ static void micronux_dsi_remove(struct platform_device *pdev)
+ 	hrtimer_cancel(&dsi->scanout_timer);
+ 	writel(0, dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA);
+ 	sysfs_remove_groups(&pdev->dev.kobj, micronux_display_groups);
++	if (dsi->touch) {
++		input_unregister_device(dsi->touch);
++		dsi->touch = NULL;
++	}
+ 	unregister_framebuffer(dsi->info);
+ 	dsi->backlight->props.power = FB_BLANK_POWERDOWN;
+ 	backlight_update_status(dsi->backlight);

@@ -1,0 +1,793 @@
+From 09ef52f275cd53144dd820a526ced0b2c14e7ccf Mon Sep 17 00:00:00 2001
+From: MicroNUX <micronux@example.invalid>
+Date: Wed, 12 Aug 2026 00:00:00 -0700
+Subject: [PATCH 30/46] video: fbdev: add ABI-v3 native cold probe
+
+Select the display handoff ABI strictly from the device tree. Keep the
+existing ABI-v2 loader-adoption path for M7, while M9 accepts only the
+exact 192-byte ABI-v3 cold-relinquish contract.
+
+Validate the immutable panel and memory profile, every cold-init MMIO
+resource, silicon revision, reset and clock state, D-PHY LDO state, I2C
+release, GDMA interrupt route, DMA PMS windows, no-map display pool, and
+the dedicated cleared descriptor page outside the SD-DMA SRAM reserve,
+without writing display hardware.
+
+Stop M9 at an observable PROBED_QUIESCENT state. The adapter's ACKed
+PWM-zero and reset commands are command-history facts, not optical-state
+proof. Do not register framebuffer, backlight, touch input, or runtime IRQ
+until later native initialization stages have succeeded.
+
+Signed-off-by: MicroNUX <micronux@example.invalid>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 613 ++++++++++++++++++++++++++++--
+ 1 file changed, 585 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 8154876..26f2c9a 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -2,16 +2,15 @@
+ /*
+  * ESP32-P4 MIPI-DSI ownership-transfer framebuffer for MicroNUX.
+  *
+- * The loader performs the panel-specific DBI sequence, leaves DPI mode active,
+- * and publishes a bounded stopped DW-GDMA descriptor pool through a versioned
+- * contract. This driver validates that contract, claims every persistent
+- * controller resource, owns three framebuffers, and explicitly rearms one
+- * complete-frame descriptor from each transfer-done interrupt. No loader
+- * callback remains live.
++ * ABI v2 adopts a loader-initialized display for M7. ABI v3 strictly validates
++ * an M9 cold-relinquish contract and quiescent hardware state before native
++ * Linux initialization. The required ABI comes from the device tree; the two
++ * modes are never selected by probing live hardware or by fallback.
+  */
+ 
+ #include <linux/backlight.h>
+ #include <linux/bitops.h>
++#include <linux/build_bug.h>
+ #include <linux/crc32.h>
+ #include <linux/delay.h>
+ #include <linux/fb.h>
+@@ -32,10 +31,17 @@
+ #include <linux/workqueue.h>
+ 
+ #define MICRONUX_DISPLAY_MAGIC		0x4d4e5844
+-#define MICRONUX_DISPLAY_ABI_VERSION	2
++#define MICRONUX_DISPLAY_ABI_VERSION_V2	2
++#define MICRONUX_DISPLAY_ABI_VERSION_V3	3
++#define MICRONUX_DISPLAY_HANDOFF_V3_SIZE	0xc0
+ #define MICRONUX_DISPLAY_BUFFER_COUNT	3
+ #define MICRONUX_DISPLAY_OWNER_LINUX_PENDING 1
+ 
++#define MICRONUX_DISPLAY_COLD_BOOT_MODE	1
++#define MICRONUX_DISPLAY_SILICON_REVISION	103
++#define MICRONUX_DISPLAY_PANEL_PROFILE_JD9365 1
++#define MICRONUX_DISPLAY_PIXEL_FORMAT_RGB565_LE 1
++
+ #define MICRONUX_DISPLAY_HSYNC_PULSE	20
+ #define MICRONUX_DISPLAY_HSYNC_BACK_PORCH 20
+ #define MICRONUX_DISPLAY_HSYNC_FRONT_PORCH 40
+@@ -60,6 +66,24 @@
+ 					 MICRONUX_DISPLAY_LOADER_FRONT_VALID | \
+ 					 MICRONUX_DISPLAY_HOST_VPG_ACTIVE)
+ 
++#define MICRONUX_DISPLAY_V3_REQUIRED_FLAGS	0x00003fff
++#define MICRONUX_DISPLAY_COLD_GDMA_IRQ_SOURCE	24
++#define MICRONUX_DISPLAY_COLD_GDMA_CLIC_IRQ	18
++#define MICRONUX_DISPLAY_COLD_I2C_PORT	0
++#define MICRONUX_DISPLAY_COLD_I2C_SDA_GPIO	7
++#define MICRONUX_DISPLAY_COLD_I2C_SCL_GPIO	8
++#define MICRONUX_DISPLAY_COLD_I2C_RATE_HZ	100000
++#define MICRONUX_DISPLAY_COLD_RESET_ASSERT_COMMAND	0x11
++#define MICRONUX_DISPLAY_COLD_RESET_PREPARE_COMMAND	0x13
++#define MICRONUX_DISPLAY_COLD_REVEAL_COMMAND	0x17
++#define MICRONUX_DISPLAY_COLD_BRIGHTNESS	63
++#define MICRONUX_DISPLAY_COLD_RESET_HOLD_MS	10
++#define MICRONUX_DISPLAY_COLD_PWM_ZERO_SETTLE_MS	100
++#define MICRONUX_DISPLAY_COLD_PANEL_PAYLOAD_CRC32	0xcea07f9b
++#define MICRONUX_DISPLAY_COLD_SEQUENCE_ID	1
++#define MICRONUX_DISPLAY_COLD_FIRMWARE \
++	"micronux/jd9365-waveshare-10.1-v2.bin"
++
+ #define ESP32P4_LOADER_PSRAM_START	0x48000000
+ #define ESP32P4_LOADER_PSRAM_END		0x48400000
+ #define ESP32P4_DISPLAY_POOL_START	0x49300000
+@@ -69,12 +93,40 @@
+ #define ESP32P4_DISPLAY_SLOT_SIZE	0x00200000
+ #define ESP32P4_DISPLAY_GUARD_PATTERN	0xa5
+ #define ESP32P4_DISPLAY_GUARD_WORD	0xa5a5a5a5
++#define ESP32P4_DISPLAY_HANDOFF_ADDRESS	0x49f00000
++#define ESP32P4_UNCACHED_OFFSET		0x40000000
+ #define ESP32P4_INTERNAL_SRAM_START	0x4ff00000
+-#define ESP32P4_INTERNAL_SRAM_END	0x50000000
++#define ESP32P4_INTERNAL_SRAM_END	0x4ffc0000
++#define ESP32P4_SD_DMA_RESERVE_START	0x4ff80000
++#define ESP32P4_SD_DMA_RESERVE_END	0x4ff82000
+ #define ESP32P4_DSI_FIFO_ADDRESS		0x50105000
++#define ESP32P4_DSI_FIFO_WINDOW_END	0x50106000
+ #define ESP32P4_DPI_CLOCK_CTRL_ADDRESS	0x500e603c
+ #define ESP32P4_APLL_CLOCK_CTRL_ADDRESS	0x50111040
+ 
++#define ESP32P4_DSI_HOST_ADDRESS		0x500a0000
++#define ESP32P4_DSI_HOST_SIZE		0x00000800
++#define ESP32P4_DSI_BRIDGE_ADDRESS	0x500a0800
++#define ESP32P4_DSI_BRIDGE_SIZE		0x00000104
++#define ESP32P4_DMA_PMS_ADDRESS		0x500a6000
++#define ESP32P4_DMA_PMS_SIZE		0x00001000
++#define ESP32P4_GDMA_ADDRESS		0x50081000
++#define ESP32P4_GDMA_SIZE		0x00001000
++#define ESP32P4_I2C_ADDRESS		0x500c4000
++#define ESP32P4_I2C_SIZE		0x00001000
++#define ESP32P4_INTR_MATRIX_ADDRESS	0x500d6000
++#define ESP32P4_INTR_MATRIX_SIZE	0x00001000
++#define ESP32P4_GPIO_ADDRESS		0x500e0000
++#define ESP32P4_GPIO_SIZE		0x00001000
++#define ESP32P4_IOMUX_ADDRESS		0x500e1000
++#define ESP32P4_IOMUX_SIZE		0x00001000
++#define ESP32P4_HP_CLKRST_ADDRESS	0x500e6000
++#define ESP32P4_HP_CLKRST_SIZE		0x00001000
++#define ESP32P4_PMU_ADDRESS		0x50115000
++#define ESP32P4_PMU_SIZE		0x00001000
++#define ESP32P4_EFUSE_ADDRESS		0x5012d000
++#define ESP32P4_EFUSE_SIZE		0x00001000
++
+ #define DSI_HOST_VID_MODE_CFG		0x38
+ #define DSI_HOST_TO_CNT_CFG		0x78
+ #define DSI_HOST_HS_RD_TO_CNT		0x7c
+@@ -166,6 +218,42 @@
+ #define MICRONUX_VPG_TEST_MIN_MS	250
+ #define MICRONUX_VPG_TEST_MAX_MS	10000
+ 
++#define DMA_PMS_REGION_LOW(index)	(0x08 + (index) * 8)
++#define DMA_PMS_REGION_HIGH(index)	(0x0c + (index) * 8)
++#define DMA_PMS_GDMA_CH0_R		0x108
++#define DMA_PMS_GDMA_CH0_W		0x10c
++#define DMA_PMS_REGION_ADDRESS_MASK	GENMASK(31, 12)
++#define DMA_PMS_REGION1_MASK		BIT(1)
++#define DMA_PMS_REGION2_MASK		BIT(2)
++#define DMA_PMS_REGION3_MASK		BIT(3)
++#define DMA_PMS_REGION4_MASK		BIT(4)
++
++#define INTR_MATRIX_ROUTE(source)	((source) * sizeof(u32))
++#define INTR_MATRIX_ROUTE_MASK		GENMASK(5, 0)
++
++#define HP_CLKRST_SOC_CLK_CTRL0		0x14
++#define HP_CLKRST_SOC_CLK_CTRL1		0x18
++#define HP_CLKRST_SOC_CLK_CTRL2		0x1c
++#define HP_CLKRST_PERI_CLK_CTRL03	0x3c
++#define HP_CLKRST_HP_RST_EN0		0xc0
++#define HP_CLKRST_GDMA_CPU_CLK_EN	BIT(13)
++#define HP_CLKRST_GDMA_SYS_CLK_EN	BIT(5)
++#define HP_CLKRST_DSI_SYS_CLK_EN	BIT(12)
++#define HP_CLKRST_I2C0_APB_CLK_EN	BIT(12)
++#define HP_CLKRST_DSI_DPHY_CFG_CLK_EN	BIT(0)
++#define HP_CLKRST_DSI_DPHY_PLL_REFCLK_EN BIT(1)
++#define HP_CLKRST_DSI_DPI_CLK_EN	BIT(7)
++#define HP_CLKRST_GDMA_RESET		BIT(21)
++#define HP_CLKRST_DSI_BRIDGE_RESET	BIT(26)
++
++#define PMU_EXT_LDO_P0_0P2A		0x1c0
++#define PMU_EXT_LDO_XPD		BIT(8)
++
++#define EFUSE_RD_MAC_SYS_2		0x4c
++#define EFUSE_WAFER_MINOR_MASK		GENMASK(3, 0)
++#define EFUSE_WAFER_MAJOR_LO_MASK	GENMASK(5, 4)
++#define EFUSE_WAFER_MAJOR_HI		BIT(23)
++
+ #define MICRONUX_FAULT_DMA		0
+ #define MICRONUX_FAULT_UNDERRUN		1
+ #define MICRONUX_FAULT_STALE_FRAME	2
+@@ -223,6 +311,7 @@
+ #define DMA_LLI_VALID			BIT(31)
+ #define MICRONUX_DMA_DESCRIPTOR_SIZE	64
+ #define MICRONUX_FRAMEBUFFER_ALIGNMENT	8
++#define MICRONUX_COLD_PAGE_SIZE		0x1000
+ #define MICRONUX_DMA_DESCRIPTOR_COUNT	MICRONUX_DISPLAY_BUFFER_COUNT
+ 
+ struct micronux_display_handoff_v2 {
+@@ -258,12 +347,87 @@ struct micronux_display_handoff_v2 {
+ 	u32 crc32;
+ };
+ 
++struct micronux_display_handoff_v3 {
++	u32 magic;
++	u16 abi_version;
++	u16 struct_size;
++	u32 flags;
++	u32 boot_mode;
++	u32 ownership_state;
++	u32 silicon_revision;
++	u32 panel_profile_id;
++	u32 width;
++	u32 height;
++	u32 stride;
++	u32 pixel_format;
++	u32 pixel_clock_hz;
++	u32 lane_bit_rate_mbps;
++	u32 data_lanes;
++	u32 buffer_count;
++	u32 hsync_pulse_width;
++	u32 hsync_back_porch;
++	u32 hsync_front_porch;
++	u32 vsync_pulse_width;
++	u32 vsync_back_porch;
++	u32 vsync_front_porch;
++	u32 framebuffer_address[MICRONUX_DISPLAY_BUFFER_COUNT];
++	u32 framebuffer_size;
++	u32 dma_descriptor_address;
++	u32 dma_descriptor_size;
++	u32 dma_descriptor_count;
++	u32 dma_channel;
++	u32 dsi_fifo_address;
++	u32 gdma_irq_source;
++	u32 gdma_clic_irq;
++	u32 i2c_port;
++	u32 i2c_sda_gpio;
++	u32 i2c_scl_gpio;
++	u32 i2c_rate_hz;
++	u32 i2c_address;
++	u32 display_control_register;
++	u32 backlight_register;
++	u32 display_control_reset_assert_command;
++	u32 display_control_reset_prepare_command;
++	u32 display_control_reveal_command;
++	u32 backlight_brightness;
++	u32 reset_hold_ms;
++	u32 pwm_zero_settle_ms;
++	u32 panel_payload_crc32;
++	u32 quiesce_sequence_id;
++	u32 crc32;
++};
++
++static_assert(sizeof(struct micronux_display_handoff_v3) ==
++	      MICRONUX_DISPLAY_HANDOFF_V3_SIZE);
++static_assert(offsetof(struct micronux_display_handoff_v3,
++		       framebuffer_address) == 0x54);
++static_assert(offsetof(struct micronux_display_handoff_v3,
++		       gdma_irq_source) == 0x78);
++static_assert(offsetof(struct micronux_display_handoff_v3,
++		       panel_payload_crc32) == 0xb4);
++static_assert(offsetof(struct micronux_display_handoff_v3,
++		       quiesce_sequence_id) == 0xb8);
++static_assert(offsetof(struct micronux_display_handoff_v3, crc32) == 0xbc);
++
++enum micronux_display_state {
++	MICRONUX_DISPLAY_STATE_UNBOUND,
++	MICRONUX_DISPLAY_STATE_PROBED_QUIESCENT,
++	MICRONUX_DISPLAY_STATE_RUNTIME_READY,
++};
++
+ struct micronux_dsi {
+ 	struct device *dev;
+ 	void __iomem *host;
+ 	void __iomem *bridge;
++	void __iomem *dma_pms;
+ 	void __iomem *gdma;
+ 	void __iomem *i2c;
++	void __iomem *intr_matrix;
++	void __iomem *gpio;
++	void __iomem *iomux;
++	void __iomem *hp_clkrst;
++	void __iomem *pmu;
++	void __iomem *efuse;
+ 	void __iomem *channel;
+ 	void __iomem *descriptor[MICRONUX_DISPLAY_BUFFER_COUNT];
+ 	void __iomem *framebuffer[MICRONUX_DISPLAY_BUFFER_COUNT];
+@@ -282,6 +446,10 @@ struct micronux_dsi {
+ 	/* Serializes the read-to-clear DSI host status registers. */
+ 	spinlock_t host_status_lock;
+ 	struct micronux_display_handoff_v2 handoff;
++	struct micronux_display_handoff_v3 cold_handoff;
++	enum micronux_display_state display_state;
++	u32 required_handoff_abi;
++	u32 required_silicon_revision;
+ 	u32 uncached_offset;
+ 	u32 palette[16];
+ 	u32 scanout_frames;
+@@ -2104,7 +2272,85 @@ static struct attribute *micronux_display_attrs[] = {
+ };
+ ATTRIBUTE_GROUPS(micronux_display);
+ 
+-static int micronux_validate_handoff(struct micronux_dsi *dsi, u32 address)
++static ssize_t native_state_show(struct device *dev,
++				 struct device_attribute *attribute, char *buf)
++{
++	struct micronux_dsi *dsi = dev_get_drvdata(dev);
++
++	if (dsi->display_state == MICRONUX_DISPLAY_STATE_PROBED_QUIESCENT)
++		return sysfs_emit(buf, "PROBED_QUIESCENT\n");
++	if (dsi->display_state == MICRONUX_DISPLAY_STATE_RUNTIME_READY)
++		return sysfs_emit(buf, "RUNTIME_READY\n");
++	return sysfs_emit(buf, "UNBOUND\n");
++}
++static DEVICE_ATTR_RO(native_state);
++
++static int micronux_map_exact_resource(struct platform_device *pdev,
++				       const char *name,
++				       resource_size_t start,
++				       resource_size_t size,
++				       void __iomem **base)
++{
++	struct resource *resource;
++
++	resource = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++	if (!resource || resource->start != start ||
++	    resource_size(resource) != size) {
++		dev_err(&pdev->dev,
++			"invalid cold display MMIO resource: %s\n", name);
++		return -EINVAL;
++	}
++	*base = devm_ioremap_resource(&pdev->dev, resource);
++	return PTR_ERR_OR_ZERO(*base);
++}
++
++static int micronux_map_cold_resources(struct platform_device *pdev,
++				       struct micronux_dsi *dsi)
++{
++	struct {
++		const char *name;
++		resource_size_t start;
++		resource_size_t size;
++		void __iomem **base;
++	} resources[] = {
++		{ "dsi-host", ESP32P4_DSI_HOST_ADDRESS,
++		  ESP32P4_DSI_HOST_SIZE, &dsi->host },
++		{ "dsi-bridge", ESP32P4_DSI_BRIDGE_ADDRESS,
++		  ESP32P4_DSI_BRIDGE_SIZE, &dsi->bridge },
++		{ "dma-pms", ESP32P4_DMA_PMS_ADDRESS,
++		  ESP32P4_DMA_PMS_SIZE, &dsi->dma_pms },
++		{ "gdma", ESP32P4_GDMA_ADDRESS,
++		  ESP32P4_GDMA_SIZE, &dsi->gdma },
++		{ "i2c", ESP32P4_I2C_ADDRESS,
++		  ESP32P4_I2C_SIZE, &dsi->i2c },
++		{ "intr-matrix", ESP32P4_INTR_MATRIX_ADDRESS,
++		  ESP32P4_INTR_MATRIX_SIZE, &dsi->intr_matrix },
++		{ "gpio", ESP32P4_GPIO_ADDRESS,
++		  ESP32P4_GPIO_SIZE, &dsi->gpio },
++		{ "iomux", ESP32P4_IOMUX_ADDRESS,
++		  ESP32P4_IOMUX_SIZE, &dsi->iomux },
++		{ "hp-clkrst", ESP32P4_HP_CLKRST_ADDRESS,
++		  ESP32P4_HP_CLKRST_SIZE, &dsi->hp_clkrst },
++		{ "pmu", ESP32P4_PMU_ADDRESS,
++		  ESP32P4_PMU_SIZE, &dsi->pmu },
++		{ "efuse", ESP32P4_EFUSE_ADDRESS,
++		  ESP32P4_EFUSE_SIZE, &dsi->efuse },
++	};
++	u32 i;
++	int ret;
++
++	for (i = 0; i < ARRAY_SIZE(resources); i++) {
++		ret = micronux_map_exact_resource(pdev, resources[i].name,
++						  resources[i].start,
++						  resources[i].size,
++						  resources[i].base);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++static int micronux_validate_handoff_v2(struct micronux_dsi *dsi, u32 address)
+ {
+ 	struct micronux_display_handoff_v2 *handoff = &dsi->handoff;
+ 	void __iomem *channel;
+@@ -2119,7 +2365,7 @@ static int micronux_validate_handoff(struct micronux_dsi *dsi, u32 address)
+ 	crc = crc32_le(~0U, (u8 *)handoff,
+ 		       offsetof(struct micronux_display_handoff_v2, crc32)) ^ ~0U;
+ 	if (handoff->magic != MICRONUX_DISPLAY_MAGIC ||
+-	    handoff->abi_version != MICRONUX_DISPLAY_ABI_VERSION ||
++	    handoff->abi_version != MICRONUX_DISPLAY_ABI_VERSION_V2 ||
+ 	    handoff->struct_size != sizeof(*handoff) ||
+ 	    crc != handoff->crc32 ||
+ 	    (handoff->flags & MICRONUX_DISPLAY_REQUIRED_FLAGS) !=
+@@ -2223,6 +2469,242 @@ static int micronux_validate_handoff(struct micronux_dsi *dsi, u32 address)
+ 	return 0;
+ }
+ 
++static int micronux_cold_reject(struct micronux_dsi *dsi,
++				const char *reason)
++{
++	dev_err(dsi->dev,
++		"MICRONUX:M9.2:COLD-PROBE state=REJECTED_NO_WRITES reason=%s display-writes=0\n",
++		reason);
++	return -EINVAL;
++}
++
++static bool micronux_pms_region_matches(struct micronux_dsi *dsi,
++					u32 region, u32 low, u32 high)
++{
++	return readl(dsi->dma_pms + DMA_PMS_REGION_LOW(region)) ==
++		       (low & DMA_PMS_REGION_ADDRESS_MASK) &&
++	       readl(dsi->dma_pms + DMA_PMS_REGION_HIGH(region)) ==
++		       (high & DMA_PMS_REGION_ADDRESS_MASK);
++}
++
++static u32 micronux_cold_silicon_revision(struct micronux_dsi *dsi)
++{
++	u32 major, minor;
++	u32 value = readl(dsi->efuse + EFUSE_RD_MAC_SYS_2);
++
++	minor = value & EFUSE_WAFER_MINOR_MASK;
++	major = (value & EFUSE_WAFER_MAJOR_LO_MASK) >> 4;
++	if (value & EFUSE_WAFER_MAJOR_HI)
++		major |= BIT(2);
++	return major * 100 + minor;
++}
++
++static int micronux_validate_cold_hardware(struct micronux_dsi *dsi)
++{
++	struct micronux_display_handoff_v3 *handoff = &dsi->cold_handoff;
++	void __iomem *descriptor;
++	u32 clocks0, clocks1, clocks2, peri03, reset;
++	u32 descriptor_end, descriptor_start, front_end, front_start;
++	u32 fifo_end = ESP32P4_DSI_FIFO_WINDOW_END;
++	u32 fifo_start = ESP32P4_DSI_FIFO_ADDRESS;
++	u32 pool_end = ESP32P4_DISPLAY_POOL_END;
++	u32 pool_start = ESP32P4_DISPLAY_POOL_START;
++	u32 route;
++	u32 i;
++
++	if (micronux_cold_silicon_revision(dsi) !=
++	    dsi->required_silicon_revision)
++		return micronux_cold_reject(dsi, "silicon-readback");
++
++	reset = readl(dsi->hp_clkrst + HP_CLKRST_HP_RST_EN0);
++	clocks0 = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL0);
++	clocks1 = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL1);
++	clocks2 = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL2);
++	peri03 = readl(dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL03);
++	if ((reset & (HP_CLKRST_GDMA_RESET |
++		      HP_CLKRST_DSI_BRIDGE_RESET)) !=
++		     (HP_CLKRST_GDMA_RESET | HP_CLKRST_DSI_BRIDGE_RESET) ||
++	    (clocks0 & HP_CLKRST_GDMA_CPU_CLK_EN) ||
++	    (clocks1 & (HP_CLKRST_GDMA_SYS_CLK_EN |
++			HP_CLKRST_DSI_SYS_CLK_EN)) ||
++	    (peri03 & (HP_CLKRST_DSI_DPHY_CFG_CLK_EN |
++		       HP_CLKRST_DSI_DPHY_PLL_REFCLK_EN |
++		       HP_CLKRST_DSI_DPI_CLK_EN)))
++		return micronux_cold_reject(dsi, "display-reset-clock-state");
++	if (readl(dsi->pmu + PMU_EXT_LDO_P0_0P2A) & PMU_EXT_LDO_XPD)
++		return micronux_cold_reject(dsi, "dphy-ldo-enabled");
++	if (clocks2 & HP_CLKRST_I2C0_APB_CLK_EN)
++		return micronux_cold_reject(dsi, "i2c-not-released");
++
++	route = readl(dsi->intr_matrix +
++		      INTR_MATRIX_ROUTE(handoff->gdma_irq_source));
++	if ((route & INTR_MATRIX_ROUTE_MASK) != handoff->gdma_clic_irq)
++		return micronux_cold_reject(dsi, "gdma-irq-route");
++
++	front_start = handoff->framebuffer_address[0];
++	front_end = front_start + handoff->framebuffer_size;
++	descriptor_start = handoff->dma_descriptor_address;
++	descriptor_end = descriptor_start + MICRONUX_COLD_PAGE_SIZE;
++	if (!micronux_pms_region_matches(dsi, 1, front_start, front_end) ||
++	    !micronux_pms_region_matches(dsi, 2, pool_start, pool_end) ||
++	    !micronux_pms_region_matches(dsi, 3, descriptor_start,
++					 descriptor_end) ||
++	    !micronux_pms_region_matches(dsi, 4, fifo_start, fifo_end) ||
++	    readl(dsi->dma_pms + DMA_PMS_GDMA_CH0_R) !=
++		    (DMA_PMS_REGION1_MASK | DMA_PMS_REGION2_MASK |
++		     DMA_PMS_REGION3_MASK) ||
++	    readl(dsi->dma_pms + DMA_PMS_GDMA_CH0_W) !=
++		    (DMA_PMS_REGION3_MASK | DMA_PMS_REGION4_MASK))
++		return micronux_cold_reject(dsi, "dma-pms-policy");
++
++	descriptor = (void __iomem *)(uintptr_t)
++		(handoff->dma_descriptor_address + dsi->uncached_offset);
++	for (i = 0; i < MICRONUX_COLD_PAGE_SIZE; i++) {
++		if (readb(descriptor + i))
++			return micronux_cold_reject(dsi,
++						     "descriptor-storage-not-zero");
++	}
++
++	/*
++	 * Host, bridge, and GDMA registers are not readable with their clocks off
++	 * and resets asserted.  Their stopped/no-pending state is bounded by those
++	 * raw clock/reset readbacks and the loader's exact ABI-v3 claims.  The
++	 * loader command history is contract-bound: ACKed PWM0=0, ACKed control
++	 * 0x13, the required settle, ACKed control 0x11, then the required hold
++	 * before I2C release.  This makes no physical register-state claim. Stage B
++	 * must initialize I2C and reissue that safe sequence before enabling the LDO
++	 * or changing any display state. No unproven readback is used.
++	 */
++	return 0;
++}
++
++static int micronux_validate_handoff_v3(struct micronux_dsi *dsi, u32 address)
++{
++	struct micronux_display_handoff_v3 *handoff = &dsi->cold_handoff;
++	void __iomem *source;
++	u64 end[MICRONUX_DISPLAY_BUFFER_COUNT];
++	u64 descriptor_page_end;
++	u32 crc, expected_size, i, j;
++
++	source = (void __iomem *)(uintptr_t)(address + dsi->uncached_offset);
++	memcpy_fromio(handoff, source, sizeof(*handoff));
++	crc = crc32_le(~0U, (u8 *)handoff,
++		       offsetof(struct micronux_display_handoff_v3, crc32)) ^ ~0U;
++	if (handoff->magic != MICRONUX_DISPLAY_MAGIC)
++		return micronux_cold_reject(dsi, "magic");
++	if (handoff->abi_version != MICRONUX_DISPLAY_ABI_VERSION_V3 ||
++	    handoff->abi_version != dsi->required_handoff_abi)
++		return micronux_cold_reject(dsi, "abi-version");
++	if (handoff->struct_size != sizeof(*handoff))
++		return micronux_cold_reject(dsi, "structure-size");
++	if (crc != handoff->crc32)
++		return micronux_cold_reject(dsi, "crc32");
++	if (handoff->flags != MICRONUX_DISPLAY_V3_REQUIRED_FLAGS)
++		return micronux_cold_reject(dsi, "flags");
++
++	if (handoff->boot_mode != MICRONUX_DISPLAY_COLD_BOOT_MODE ||
++	    handoff->ownership_state != MICRONUX_DISPLAY_OWNER_LINUX_PENDING ||
++	    handoff->silicon_revision != dsi->required_silicon_revision ||
++	    handoff->panel_profile_id !=
++		    MICRONUX_DISPLAY_PANEL_PROFILE_JD9365 ||
++	    handoff->width != 800 || handoff->height != 1280 ||
++	    handoff->stride != 1600 ||
++	    handoff->pixel_format != MICRONUX_DISPLAY_PIXEL_FORMAT_RGB565_LE ||
++	    handoff->pixel_clock_hz != 80000000 ||
++	    handoff->lane_bit_rate_mbps != 1500 ||
++	    handoff->data_lanes != 2 ||
++	    handoff->buffer_count != MICRONUX_DISPLAY_BUFFER_COUNT ||
++	    handoff->hsync_pulse_width != MICRONUX_DISPLAY_HSYNC_PULSE ||
++	    handoff->hsync_back_porch != MICRONUX_DISPLAY_HSYNC_BACK_PORCH ||
++	    handoff->hsync_front_porch != MICRONUX_DISPLAY_HSYNC_FRONT_PORCH ||
++	    handoff->vsync_pulse_width != MICRONUX_DISPLAY_VSYNC_PULSE ||
++	    handoff->vsync_back_porch != MICRONUX_DISPLAY_VSYNC_BACK_PORCH ||
++	    handoff->vsync_front_porch != MICRONUX_DISPLAY_VSYNC_FRONT_PORCH)
++		return micronux_cold_reject(dsi, "panel-profile");
++
++	if (handoff->height > U32_MAX / handoff->stride)
++		return micronux_cold_reject(dsi, "frame-size-overflow");
++	expected_size = handoff->height * handoff->stride;
++	if (expected_size != 2048000 ||
++	    handoff->framebuffer_size != expected_size)
++		return micronux_cold_reject(dsi, "frame-size");
++	for (i = 0; i < MICRONUX_DISPLAY_BUFFER_COUNT; i++) {
++		end[i] = (u64)handoff->framebuffer_address[i] +
++			 handoff->framebuffer_size;
++		if (end[i] > U32_MAX ||
++		    !IS_ALIGNED(handoff->framebuffer_address[i],
++				MICRONUX_COLD_PAGE_SIZE))
++			return micronux_cold_reject(dsi, "framebuffer-bounds");
++	}
++	if (handoff->framebuffer_address[0] < ESP32P4_LOADER_PSRAM_START ||
++	    end[0] > ESP32P4_LOADER_PSRAM_END)
++		return micronux_cold_reject(dsi, "loader-front-bounds");
++	if (handoff->framebuffer_address[1] != ESP32P4_DISPLAY_BACK_ADDRESS ||
++	    handoff->framebuffer_address[2] != ESP32P4_DISPLAY_SPARE_ADDRESS)
++		return micronux_cold_reject(dsi, "display-pool-layout");
++	for (i = 1; i < MICRONUX_DISPLAY_BUFFER_COUNT; i++) {
++		if (handoff->framebuffer_address[i] <
++				ESP32P4_DISPLAY_POOL_START ||
++		    end[i] > ESP32P4_DISPLAY_POOL_END ||
++		    end[i] > handoff->framebuffer_address[i] +
++			     ESP32P4_DISPLAY_SLOT_SIZE)
++			return micronux_cold_reject(dsi, "display-pool-bounds");
++	}
++	for (i = 0; i < MICRONUX_DISPLAY_BUFFER_COUNT; i++) {
++		for (j = i + 1; j < MICRONUX_DISPLAY_BUFFER_COUNT; j++) {
++			if (handoff->framebuffer_address[i] < end[j] &&
++			    handoff->framebuffer_address[j] < end[i])
++				return micronux_cold_reject(dsi,
++						     "framebuffer-overlap");
++		}
++	}
++
++	descriptor_page_end = (u64)handoff->dma_descriptor_address +
++			      MICRONUX_COLD_PAGE_SIZE;
++	if (descriptor_page_end > U32_MAX)
++		return micronux_cold_reject(dsi, "descriptor-overflow");
++	if (handoff->dma_descriptor_address < ESP32P4_INTERNAL_SRAM_START ||
++	    descriptor_page_end > ESP32P4_INTERNAL_SRAM_END ||
++	    !IS_ALIGNED(handoff->dma_descriptor_address,
++			MICRONUX_COLD_PAGE_SIZE) ||
++	    handoff->dma_descriptor_size != MICRONUX_DMA_DESCRIPTOR_SIZE *
++					 MICRONUX_DMA_DESCRIPTOR_COUNT ||
++	    handoff->dma_descriptor_count != MICRONUX_DMA_DESCRIPTOR_COUNT)
++		return micronux_cold_reject(dsi, "descriptor-bounds");
++	if (handoff->dma_descriptor_address < ESP32P4_SD_DMA_RESERVE_END &&
++	    descriptor_page_end > ESP32P4_SD_DMA_RESERVE_START)
++		return micronux_cold_reject(dsi, "descriptor-sd-dma-overlap");
++
++	if (handoff->dma_channel != 0 ||
++	    handoff->dsi_fifo_address != ESP32P4_DSI_FIFO_ADDRESS ||
++	    handoff->gdma_irq_source != MICRONUX_DISPLAY_COLD_GDMA_IRQ_SOURCE ||
++	    handoff->gdma_clic_irq != MICRONUX_DISPLAY_COLD_GDMA_CLIC_IRQ ||
++	    handoff->gdma_clic_irq != dsi->irq ||
++	    handoff->i2c_port != MICRONUX_DISPLAY_COLD_I2C_PORT ||
++	    handoff->i2c_sda_gpio != MICRONUX_DISPLAY_COLD_I2C_SDA_GPIO ||
++	    handoff->i2c_scl_gpio != MICRONUX_DISPLAY_COLD_I2C_SCL_GPIO ||
++	    handoff->i2c_rate_hz != MICRONUX_DISPLAY_COLD_I2C_RATE_HZ ||
++	    handoff->i2c_address != 0x45 ||
++	    handoff->display_control_register != 0x95 ||
++	    handoff->backlight_register != 0x96 ||
++	    handoff->display_control_reset_assert_command !=
++		    MICRONUX_DISPLAY_COLD_RESET_ASSERT_COMMAND ||
++	    handoff->display_control_reset_prepare_command !=
++		    MICRONUX_DISPLAY_COLD_RESET_PREPARE_COMMAND ||
++	    handoff->display_control_reveal_command !=
++		    MICRONUX_DISPLAY_COLD_REVEAL_COMMAND ||
++	    handoff->backlight_brightness != MICRONUX_DISPLAY_COLD_BRIGHTNESS ||
++	    handoff->reset_hold_ms != MICRONUX_DISPLAY_COLD_RESET_HOLD_MS ||
++	    handoff->pwm_zero_settle_ms !=
++		    MICRONUX_DISPLAY_COLD_PWM_ZERO_SETTLE_MS ||
++	    handoff->panel_payload_crc32 !=
++		    MICRONUX_DISPLAY_COLD_PANEL_PAYLOAD_CRC32 ||
++	    handoff->quiesce_sequence_id != MICRONUX_DISPLAY_COLD_SEQUENCE_ID)
++		return micronux_cold_reject(dsi, "peripheral-contract");
++
++	return micronux_validate_cold_hardware(dsi);
++}
++
+ static void micronux_initialize_descriptors(struct micronux_dsi *dsi)
+ {
+ 	u8 index;
+@@ -2313,6 +2795,10 @@ static int micronux_validate_display_pool(struct device_node *node)
+ 	pool = of_parse_phandle(node, "memory-region", 0);
+ 	if (!pool)
+ 		return -EINVAL;
++	if (!of_property_read_bool(pool, "no-map")) {
++		of_node_put(pool);
++		return -EINVAL;
++	}
+ 	ret = of_address_to_resource(pool, 0, &resource);
+ 	of_node_put(pool);
+ 	if (ret)
+@@ -2329,6 +2815,7 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 	struct backlight_device *backlight;
+ 	struct micronux_dsi *dsi;
+ 	struct fb_info *info;
++	const char *firmware_name;
+ 	u32 handoff_address;
+ 	u8 index;
+ 	int ret;
+@@ -2347,25 +2834,57 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 	spin_lock_init(&dsi->host_status_lock);
+ 	INIT_WORK(&dsi->fault_work, micronux_fault_work);
+ 
+-	dsi->host = devm_platform_ioremap_resource_byname(pdev, "dsi-host");
+-	if (IS_ERR(dsi->host)) {
+-		ret = PTR_ERR(dsi->host);
+-		goto release;
+-	}
+-	dsi->bridge = devm_platform_ioremap_resource_byname(pdev, "dsi-bridge");
+-	if (IS_ERR(dsi->bridge)) {
+-		ret = PTR_ERR(dsi->bridge);
++	ret = of_property_read_u32(pdev->dev.of_node,
++				   "espressif,required-handoff-abi",
++				   &dsi->required_handoff_abi);
++	if (ret)
+ 		goto release;
+-	}
+-	dsi->gdma = devm_platform_ioremap_resource_byname(pdev, "gdma");
+-	if (IS_ERR(dsi->gdma)) {
+-		ret = PTR_ERR(dsi->gdma);
++	if (dsi->required_handoff_abi != MICRONUX_DISPLAY_ABI_VERSION_V2 &&
++	    dsi->required_handoff_abi != MICRONUX_DISPLAY_ABI_VERSION_V3) {
++		ret = -EINVAL;
+ 		goto release;
+ 	}
+-	dsi->i2c = devm_platform_ioremap_resource_byname(pdev, "i2c");
+-	if (IS_ERR(dsi->i2c)) {
+-		ret = PTR_ERR(dsi->i2c);
+-		goto release;
++	if (dsi->required_handoff_abi == MICRONUX_DISPLAY_ABI_VERSION_V3) {
++		ret = micronux_map_cold_resources(pdev, dsi);
++		if (ret)
++			goto release;
++		ret = of_property_read_u32(pdev->dev.of_node,
++					   "espressif,required-silicon-revision",
++					   &dsi->required_silicon_revision);
++		if (ret || dsi->required_silicon_revision !=
++			   MICRONUX_DISPLAY_SILICON_REVISION) {
++			ret = -EINVAL;
++			goto release;
++		}
++		ret = of_property_read_string(pdev->dev.of_node, "firmware-name",
++					      &firmware_name);
++		if (ret || strcmp(firmware_name,
++				  MICRONUX_DISPLAY_COLD_FIRMWARE)) {
++			ret = -EINVAL;
++			goto release;
++		}
++	} else {
++		dsi->host = devm_platform_ioremap_resource_byname(pdev, "dsi-host");
++		if (IS_ERR(dsi->host)) {
++			ret = PTR_ERR(dsi->host);
++			goto release;
++		}
++		dsi->bridge = devm_platform_ioremap_resource_byname(pdev,
++								    "dsi-bridge");
++		if (IS_ERR(dsi->bridge)) {
++			ret = PTR_ERR(dsi->bridge);
++			goto release;
++		}
++		dsi->gdma = devm_platform_ioremap_resource_byname(pdev, "gdma");
++		if (IS_ERR(dsi->gdma)) {
++			ret = PTR_ERR(dsi->gdma);
++			goto release;
++		}
++		dsi->i2c = devm_platform_ioremap_resource_byname(pdev, "i2c");
++		if (IS_ERR(dsi->i2c)) {
++			ret = PTR_ERR(dsi->i2c);
++			goto release;
++		}
+ 	}
+ 	dsi->irq = platform_get_irq(pdev, 0);
+ 	if (dsi->irq < 0) {
+@@ -2382,17 +2901,46 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 				   &dsi->uncached_offset);
+ 	if (ret)
+ 		goto release;
++	if (dsi->required_handoff_abi == MICRONUX_DISPLAY_ABI_VERSION_V3 &&
++	    (handoff_address != ESP32P4_DISPLAY_HANDOFF_ADDRESS ||
++	     dsi->uncached_offset != ESP32P4_UNCACHED_OFFSET)) {
++		ret = micronux_cold_reject(dsi, "handoff-address-alias");
++		goto release;
++	}
+ 	ret = micronux_validate_display_pool(pdev->dev.of_node);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "invalid display pool reservation: %d\n",
+ 			ret);
+ 		goto release;
+ 	}
+-	ret = micronux_validate_handoff(dsi, handoff_address);
++	if (dsi->required_handoff_abi == MICRONUX_DISPLAY_ABI_VERSION_V3)
++		ret = micronux_validate_handoff_v3(dsi, handoff_address);
++	else
++		ret = micronux_validate_handoff_v2(dsi, handoff_address);
+ 	if (ret) {
+-		dev_err(&pdev->dev, "invalid loader display handoff: %d\n", ret);
++		dev_err(&pdev->dev,
++			"invalid loader display handoff ABI %u: %d\n",
++			dsi->required_handoff_abi, ret);
+ 		goto release;
+ 	}
++	if (dsi->required_handoff_abi == MICRONUX_DISPLAY_ABI_VERSION_V3) {
++		dsi->display_state = MICRONUX_DISPLAY_STATE_PROBED_QUIESCENT;
++		platform_set_drvdata(pdev, dsi);
++		ret = device_create_file(&pdev->dev, &dev_attr_native_state);
++		if (ret) {
++			platform_set_drvdata(pdev, NULL);
++			goto release;
++		}
++		/*
++		 * Stage B adds a rootfs-triggered cold_init transition here. It will
++		 * request panel firmware, initialize and qualify scanout before reveal,
++		 * and only then register fbdev. boot_ready remains the later reveal
++		 * gate after userspace has rendered a complete status screen.
++		 */
++		dev_info(&pdev->dev,
++			 "MICRONUX:M9.2:COLD-PROBE state=PROBED_QUIESCENT abi=3 size=0x00c0 flags=0x00003fff profile=jd9365-waveshare-10.1 payload-crc=cea07f9b silicon=1.3 resources=validated source=none dsi-module-reset=asserted dphy-clocks=off ldo-control=off gdma-reset=asserted clocks=off dma-pms=validated irq-route=24:18 i2c=released commands=acked pwm-zero-write=acked reset-prepare-write=acked pwm-zero-settle=elapsed reset-assert-write=acked reset-hold=elapsed next=cold_init display-writes=0\n");
++		return 0;
++	}
+ 	/* Discard DBI/loader history before arming Linux runtime latches. */
+ 	micronux_discard_host_status(dsi);
+ 	dsi->channel = dsi->gdma +
+@@ -2453,6 +3001,7 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 		     HRTIMER_MODE_REL_PINNED);
+ 	dsi->scanout_timer.function = micronux_dma_poll;
+ 	WRITE_ONCE(dsi->scanout_ready, true);
++	dsi->display_state = MICRONUX_DISPLAY_STATE_RUNTIME_READY;
+ 	dev_info(&pdev->dev,
+ 		 "MICRONUX:M9.2:SCANOUT state=waiting trigger=userspace-boot-ready loader-source=vertical-bars buffers=3 front=0 back=1 spare=2 scanout=stopped backlight=off\n");
+ 	dev_info(&pdev->dev,
+@@ -2486,6 +3035,14 @@ static void micronux_dsi_remove(struct platform_device *pdev)
+ 	bool dark = false;
+ 	int ret;
+ 
++	if (dsi->display_state == MICRONUX_DISPLAY_STATE_PROBED_QUIESCENT) {
++		device_remove_file(&pdev->dev, &dev_attr_native_state);
++		dev_info(dsi->dev,
++			 "MICRONUX:M9.2:COLD-REMOVE state=quiescent display-writes=0\n");
++		framebuffer_release(dsi->info);
++		return;
++	}
++
+ 	/* Removing the group waits for the bounded one-shot store to finish. */
+ 	sysfs_remove_groups(&pdev->dev.kobj, micronux_display_groups);
+ 	cancel_delayed_work_sync(&dsi->render_work);
+-- 
+2.54.0.windows.1

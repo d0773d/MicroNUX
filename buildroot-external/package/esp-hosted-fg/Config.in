@@ -1,0 +1,7 @@
+config BR2_PACKAGE_ESP_HOSTED_FG
+	bool "esp-hosted-fg"
+	depends on BR2_LINUX_KERNEL
+	help
+	  Pinned Espressif ESP-Hosted-FG source used by the MicroNUX Linux
+	  kernel extension. The driver is linked into the ESP32-P4 NOMMU
+	  kernel and exposes the C6 station/AP data paths as Ethernet devices.

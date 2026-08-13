@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MicroNUX <micronux@example.invalid>
+Date: Wed, 12 Aug 2026 00:00:00 -0700
+Subject: [PATCH 29/46] video: fbdev: request HS in auto clock mode
+
+ESP-IDF and the upstream DesignWare MIPI DSI driver both keep
+PHY_TXREQUESTCLKHS asserted when automatic clock-lane control is enabled.
+MicroNUX instead cleared that request while switching from the loader VPG
+to framebuffer DPI.  The resulting LPCLK_CTRL value 0x2 coincided with the
+clock lane and both configured data lanes in STOPSTATE, a backed-up DPI
+payload path, and a fail-dark DPI_PLD_WR_ERR.
+
+Program the documented automatic state as 0x3 and require that exact value
+in source validation and telemetry.  Keep the tested frame-ACK-disabled
+policy, LP blanking, timings, buffers, and fail-dark gates unchanged.
+
+Signed-off-by: MicroNUX <micronux@example.invalid>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 15 +++++++--------
+ 1 file changed, 7 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 7c038da2eaa9..8154876a2ad4 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -105,6 +105,8 @@
+ #define DSI_HOST_LP_VIDEO_EN_MASK	(GENMASK(13, 8) | BIT(15))
+ #define DSI_HOST_PHY_TXREQUESTCLKHS	BIT(0)
+ #define DSI_HOST_AUTO_CLKLANE_CTRL	BIT(1)
++#define DSI_HOST_CLOCK_LANE_AUTO		(DSI_HOST_PHY_TXREQUESTCLKHS | \
++					 DSI_HOST_AUTO_CLKLANE_CTRL)
+ #define DSI_HOST_FRAME_BTA_ACK_EN_ACT	BIT(8)
+ #define DSI_HOST_LP_VIDEO_EN_ACT_MASK	(GENMASK(7, 2) | BIT(9))
+ 
+@@ -1318,8 +1320,7 @@ static void micronux_select_framebuffer(struct micronux_dsi *dsi)
+ 	host = readl(dsi->host + DSI_HOST_VID_MODE_CFG);
+ 	lpclk = readl(dsi->host + DSI_HOST_LPCLK_CTRL);
+ 
+-	lpclk &= ~DSI_HOST_PHY_TXREQUESTCLKHS;
+-	lpclk |= DSI_HOST_AUTO_CLKLANE_CTRL;
++	lpclk |= DSI_HOST_CLOCK_LANE_AUTO;
+ 	host &= ~(DSI_HOST_VPG_MASK | DSI_HOST_FRAME_BTA_ACK_EN);
+ 	host |= DSI_HOST_LP_VIDEO_EN_MASK;
+ 	writel(lpclk, dsi->host + DSI_HOST_LPCLK_CTRL);
+@@ -1346,9 +1347,8 @@ static bool micronux_source_policy_valid(struct micronux_dsi *dsi,
+ 	       !(host & DSI_HOST_FRAME_BTA_ACK_EN) &&
+ 	       (host & DSI_HOST_LP_VIDEO_EN_MASK) ==
+ 		DSI_HOST_LP_VIDEO_EN_MASK &&
+-	       (lpclk & (DSI_HOST_PHY_TXREQUESTCLKHS |
+-			 DSI_HOST_AUTO_CLKLANE_CTRL)) ==
+-	       DSI_HOST_AUTO_CLKLANE_CTRL &&
++	       (lpclk & DSI_HOST_CLOCK_LANE_AUTO) ==
++	       DSI_HOST_CLOCK_LANE_AUTO &&
+ 	       (!!(bridge & DSI_BRG_DPI_EN) == !vpg) &&
+ 	       !!channel;
+ }
+@@ -1941,9 +1941,8 @@ static ssize_t scanout_show(struct device *dev,
+ 	spin_unlock_irqrestore(&dsi->state_lock, flags);
+ 	frame_ack_disabled = !(host & DSI_HOST_FRAME_BTA_ACK_EN) &&
+ 			     !(active & DSI_HOST_FRAME_BTA_ACK_EN_ACT);
+-	clock_auto = (lpclk & (DSI_HOST_PHY_TXREQUESTCLKHS |
+-				  DSI_HOST_AUTO_CLKLANE_CTRL)) ==
+-		     DSI_HOST_AUTO_CLKLANE_CTRL;
++	clock_auto = (lpclk & DSI_HOST_CLOCK_LANE_AUTO) ==
++		     DSI_HOST_CLOCK_LANE_AUTO;
+ 	lp_enabled = (host & DSI_HOST_LP_VIDEO_EN_MASK) ==
+ 		     DSI_HOST_LP_VIDEO_EN_MASK &&
+ 		     !(active & DSI_HOST_LP_VIDEO_EN_ACT_MASK);
+-- 
+2.47.0

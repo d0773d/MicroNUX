@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MicroNUX <micronux@example.invalid>
+Date: Wed, 12 Aug 2026 00:00:00 -0700
+Subject: [PATCH 27/46] video: fbdev: require dark VPG display handoff
+
+Keep the DSI host supplied by its hardware video pattern generator while
+the loader's framebuffer DMA is stopped and Linux is booting.  Require that
+versioned contract before Linux accepts the retained display state,
+including a stopped GDMA channel and disabled bridge DPI source.
+
+The Linux startup path can then arm its framebuffer DMA while VPG remains
+the active source and use the ESP-IDF v6.0.1 source-switch order to select
+bridge DPI only while the backlight is dark.  This removes the previous
+multi-second host-starvation window instead of hiding the resulting host
+FIFO error.
+
+Signed-off-by: MicroNUX <micronux@example.invalid>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 111111111111..222222222222 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -50,13 +50,15 @@
+ #define MICRONUX_DISPLAY_BACKLIGHT_BLANKED BIT(4)
+ #define MICRONUX_DISPLAY_TRIPLE_BUFFER	BIT(5)
+ #define MICRONUX_DISPLAY_LOADER_FRONT_VALID BIT(6)
++#define MICRONUX_DISPLAY_HOST_VPG_ACTIVE BIT(7)
+ #define MICRONUX_DISPLAY_REQUIRED_FLAGS	(MICRONUX_DISPLAY_ACTIVE | \
+ 					 MICRONUX_DISPLAY_RGB565 | \
+ 					 MICRONUX_DISPLAY_DMA_IRQ_REARM | \
+ 					 MICRONUX_DISPLAY_I2C_TRANSFERRED | \
+ 					 MICRONUX_DISPLAY_BACKLIGHT_BLANKED | \
+ 					 MICRONUX_DISPLAY_TRIPLE_BUFFER | \
+-					 MICRONUX_DISPLAY_LOADER_FRONT_VALID)
++					 MICRONUX_DISPLAY_LOADER_FRONT_VALID | \
++					 MICRONUX_DISPLAY_HOST_VPG_ACTIVE)
+ 
+ #define ESP32P4_LOADER_PSRAM_START	0x48000000
+ #define ESP32P4_LOADER_PSRAM_END		0x48400000
+@@ -2183,10 +2185,16 @@ static int micronux_validate_handoff(struct micronux_dsi *dsi, u32 address)
+ 	    handoff->backlight_brightness > 255)
+ 		return -EINVAL;
+ 	channel = dsi->gdma + DW_GDMA_CH_BASE(handoff->dma_channel);
+-	if (readl(channel + DW_GDMA_CH_CFG_LO) !=
++	if ((readl(dsi->host + DSI_HOST_VID_MODE_CFG) &
++	     DSI_HOST_VPG_MASK) != DSI_HOST_VPG_EN ||
++	    (readl(dsi->bridge + DSI_BRG_DPI_MISC_CONFIG) &
++	     DSI_BRG_DPI_EN) ||
++	    (readl(dsi->gdma + DW_GDMA_CHEN) &
++	     BIT(handoff->dma_channel)) ||
++	    readl(channel + DW_GDMA_CH_CFG_LO) !=
+ 		    MICRONUX_DMA_CHANNEL_CFG_LO ||
+ 	    readl(channel + DW_GDMA_CH_CFG_HI) !=
+-		    MICRONUX_DMA_CHANNEL_CFG_HI)
++		    MICRONUX_DMA_CHANNEL_CFG_HI)
+ 		return -EINVAL;
+ 
+ 	descriptor = (void __iomem *)(uintptr_t)
+@@ -2446,9 +2454,9 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 	dsi->scanout_timer.function = micronux_dma_poll;
+ 	WRITE_ONCE(dsi->scanout_ready, true);
+ 	dev_info(&pdev->dev,
+-		 "MICRONUX:M9.2:SCANOUT state=waiting trigger=userspace-boot-ready buffers=3 front=0 back=1 spare=2 scanout=stopped backlight=off\n");
++		 "MICRONUX:M9.2:SCANOUT state=waiting trigger=userspace-boot-ready loader-source=vertical-bars buffers=3 front=0 back=1 spare=2 scanout=stopped backlight=off\n");
+ 	dev_info(&pdev->dev,
+-		 "MICRONUX:M9.2:CLAIM state=ready abi=2 owner=linux fb=fb%d resolution=%ux%u format=rgb565 timing=20/20/40:4/10/30 buffers=3 dma=ch%u:irq-rearm config=0000000f:0a020001 event=transfer-done-irq irq=%d health_poll_ms=50 commit_ms=20 underrun=monitored guards=pool-monitored write_chunk=512 write_gap_us=2 backlight=linux mmap=denied\n",
++		 "MICRONUX:M9.2:CLAIM state=ready abi=2 owner=linux loader-source=vpg fb=fb%d resolution=%ux%u format=rgb565 timing=20/20/40:4/10/30 buffers=3 dma=ch%u:irq-rearm config=0000000f:0a020001 event=transfer-done-irq irq=%d health_poll_ms=50 commit_ms=20 underrun=monitored guards=pool-monitored write_chunk=512 write_gap_us=2 backlight=linux mmap=denied\n",
+ 		 info->node, dsi->handoff.width, dsi->handoff.height,
+ 		 dsi->handoff.dma_channel, dsi->irq);
+ 	return 0;
+-- 
+2.51.0

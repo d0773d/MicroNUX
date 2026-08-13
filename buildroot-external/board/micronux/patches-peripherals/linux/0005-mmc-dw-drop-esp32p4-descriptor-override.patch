@@ -1,0 +1,23 @@
+From 7c89fa62e022050477acace06368fa757c75c51c Mon Sep 17 00:00:00 2001
+From: MicroNUX Project <micronux@example.invalid>
+Date: Sat, 8 Aug 2026 04:45:00 -0700
+Subject: [PATCH 05/46] mmc: dw: drop the ESP32-P4 descriptor override
+
+The controller-specific builder now supplies the complete descriptor, so the
+old data-address-only override is redundant.
+
+Signed-off-by: MicroNUX Project <micronux@example.invalid>
+---
+ drivers/mmc/host/dw_mmc.c | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -828,4 +828,0 @@ static int dw_mci_idmac_start_dma(struct dw_mci *host, unsigned int sg_len)
+-	if (host->quirks & DW_MMC_QUIRK_ESP32P4_POLLED_IDMAC)
+-		((struct idmac_desc *)host->sg_cpu)->des2 =
+-			cpu_to_le32(ESP32P4_IDMAC_DATA_DMA_ADDR);
+-
+-- 
+2.43.0

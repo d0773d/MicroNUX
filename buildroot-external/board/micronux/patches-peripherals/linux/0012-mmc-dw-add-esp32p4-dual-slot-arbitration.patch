@@ -1,0 +1,496 @@
+From 5ac9e42a80e4c29cbeb180677bbb7df68f32358a Mon Sep 17 00:00:00 2001
+From: MicroNUX contributors <micronux@users.noreply.github.com>
+Date: Sat, 8 Aug 2026 21:35:00 -0700
+Subject: [PATCH 12/46] mmc: dw: add ESP32-P4 dual-slot arbitration
+
+ESP32-P4 exposes one DesignWare controller with two independently wired
+physical slots: slot 0 is the removable microSD connector and slot 1 is the
+onboard ESP32-C6 SDIO transport.  Modern dw_mmc removed its unused generic
+multi-slot model, so the two devices could previously only be used in
+separate MicroNUX profiles.
+
+Restore a deliberately bounded two-slot model behind the explicit
+espressif,dual-slot device-tree property.  Each child node describes one
+physical slot.  Requests continue through the controller's existing shared
+queue, and every new request restores that slot's clock and bus width before
+issuing a card-numbered command.  The ESP32-P4 poll timer also re-kicks the
+bottom half when a polled completion is pending; this closes the handoff race
+where a second logical host completes while that work item is already running.
+SDIO and card-detect events are dispatched to both logical MMC hosts while DMA
+state remains controller-global.
+
+The existing single-slot path and espressif,slot-id property are unchanged.
+
+Signed-off-by: MicroNUX contributors <micronux@users.noreply.github.com>
+---
+ drivers/mmc/host/dw_mmc.c | 210 ++++++++++++++++++++++++++++++++++----
+ drivers/mmc/host/dw_mmc.h |   3 +
+ 2 files changed, 191 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+index 281f10db5b50..70e9d72493c0 100644
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -74,6 +74,9 @@ static void dw_mci_esp32p4_poll_timer(struct timer_list *timer)
+ 					     esp32p4_poll_timer);
+ 
+ 	dw_mci_interrupt(host->irq, host);
++	if (host->multi_slot && READ_ONCE(host->state) != STATE_IDLE &&
++	    READ_ONCE(host->pending_events))
++		queue_work(system_bh_wq, &host->bh_work);
+ 	mod_timer(&host->esp32p4_poll_timer, jiffies + 1);
+ }
+ 
+@@ -1406,6 +1406,10 @@ static void __dw_mci_start_request(struct dw_mci *host,
+ 	struct mmc_data	*data;
+ 	u32 cmdflags;
+ 
++	host->slot = slot;
++	if (host->multi_slot)
++		dw_mci_setup_bus(slot, true);
++
+ 	mrq = slot->mrq;
+ 
+ 	host->mrq = mrq;
+@@ -1632,7 +1636,8 @@ static void dw_mci_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
+ 		}
+ 
+ 		/* Adjust clock / bus width after power is up */
+-		dw_mci_setup_bus(slot, false);
++		if (!slot->host->multi_slot)
++			dw_mci_setup_bus(slot, false);
+ 
+ 		break;
+ 	case MMC_POWER_OFF:
+@@ -1640,5 +1645,6 @@ static void dw_mci_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
+ 		/* Turn clock off before power goes down */
+-		dw_mci_setup_bus(slot, false);
++		if (!slot->host->multi_slot)
++			dw_mci_setup_bus(slot, false);
+ 
+ 		if (!IS_ERR(mmc->supply.vmmc))
+ 			mmc_regulator_set_ocr(mmc, mmc->supply.vmmc, 0);
+@@ -2937,14 +2943,19 @@ static void dw_mci_handle_cd(struct dw_mci *host)
+ {
+-	struct dw_mci_slot *slot = host->slot;
++	struct dw_mci_slot *slot;
++	int i;
+ 
+-	mmc_detect_change(slot->mmc,
+-		msecs_to_jiffies(host->pdata->detect_delay_ms));
++	for (i = 0; i < ARRAY_SIZE(host->slots); i++) {
++		slot = host->slots[i];
++		if (slot)
++			mmc_detect_change(slot->mmc,
++				msecs_to_jiffies(host->pdata->detect_delay_ms));
++	}
+ }
+ 
+ static irqreturn_t dw_mci_interrupt(int irq, void *dev_id)
+ {
+ 	struct dw_mci *host = dev_id;
+ 	u32 pending;
+-	struct dw_mci_slot *slot = host->slot;
++	int i;
+ 
+ 	pending = mci_readl(host, MINTSTS); /* read-only mask reg */
+@@ -3046,13 +3058,17 @@ static irqreturn_t dw_mci_interrupt(int irq, void *dev_id)
+ 			dw_mci_handle_cd(host);
+ 		}
+ 
+-		if (pending & SDMMC_INT_SDIO(slot->sdio_id)) {
+-			mci_writel(host, RINTSTS,
+-				   SDMMC_INT_SDIO(slot->sdio_id));
+-			__dw_mci_enable_sdio_irq(slot, 0);
+-			sdio_signal_irq(slot->mmc);
++		for (i = 0; i < ARRAY_SIZE(host->slots); i++) {
++			struct dw_mci_slot *slot = host->slots[i];
++
++			if (slot &&
++			    (pending & SDMMC_INT_SDIO(slot->sdio_id))) {
++				mci_writel(host, RINTSTS,
++					   SDMMC_INT_SDIO(slot->sdio_id));
++				__dw_mci_enable_sdio_irq(slot, 0);
++				sdio_signal_irq(slot->mmc);
++			}
+ 		}
+-
+ 	}
+ 
+ 	if (host->use_dma != TRANS_MODE_IDMAC)
+@@ -3133,12 +3150,52 @@ static int dw_mci_init_slot_caps(struct dw_mci_slot *slot)
+ 	return 0;
+ }
+ 
+-static int dw_mci_init_slot(struct dw_mci *host)
++static int dw_mci_parse_slot_node(struct mmc_host *mmc,
++				  struct device_node *np)
++{
++	u32 bus_width = 1;
++
++	of_property_read_u32(np, "bus-width", &bus_width);
++	switch (bus_width) {
++	case 4:
++		mmc->caps |= MMC_CAP_4_BIT_DATA;
++		break;
++	case 1:
++		break;
++	default:
++		dev_err(mmc->parent, "invalid slot bus width %u\n", bus_width);
++		return -EINVAL;
++	}
++
++	of_property_read_u32(np, "max-frequency", &mmc->f_max);
++	if (of_property_read_bool(np, "non-removable"))
++		mmc->caps |= MMC_CAP_NONREMOVABLE;
++	else if (of_property_read_bool(np, "broken-cd"))
++		mmc->caps |= MMC_CAP_NEEDS_POLL;
++	if (of_property_read_bool(np, "disable-wp"))
++		mmc->caps2 |= MMC_CAP2_NO_WRITE_PROTECT;
++	if (of_property_read_bool(np, "keep-power-in-suspend"))
++		mmc->pm_caps |= MMC_PM_KEEP_POWER;
++	if (of_property_read_bool(np, "cap-sdio-irq"))
++		mmc->caps |= MMC_CAP_SDIO_IRQ;
++	if (of_property_read_bool(np, "no-sdio"))
++		mmc->caps2 |= MMC_CAP2_NO_SDIO;
++	if (of_property_read_bool(np, "no-sd"))
++		mmc->caps2 |= MMC_CAP2_NO_SD;
++	if (of_property_read_bool(np, "no-mmc"))
++		mmc->caps2 |= MMC_CAP2_NO_MMC;
++	of_property_read_u32(np, "post-power-on-delay-ms",
++			     &mmc->ios.power_delay_ms);
++
++	return 0;
++}
++
++static int dw_mci_init_slot(struct dw_mci *host, struct device_node *np,
++			    u32 slot_id, bool child_node)
+ {
+ 	struct mmc_host *mmc;
+ 	struct dw_mci_slot *slot;
+ 	int ret;
+-	u32 slot_id = 0;
+ 
+ 	mmc = mmc_alloc_host(sizeof(struct dw_mci_slot), host->dev);
+ 	if (!mmc)
+@@ -3149,8 +3211,7 @@ static int dw_mci_init_slot(struct dw_mci *host)
+ 
+ 	slot = mmc_priv(mmc);
+-	if (host->dev->of_node)
+-		of_property_read_u32(host->dev->of_node,
+-				     "espressif,slot-id", &slot_id);
++	if (!child_node && np)
++		of_property_read_u32(np, "espressif,slot-id", &slot_id);
+ 	if (slot_id > 1) {
+ 		dev_err(host->dev,
+ 			"invalid ESP32-P4 physical slot %u\n", slot_id);
+@@ -3160,7 +3221,6 @@ static int dw_mci_init_slot(struct dw_mci *host)
+ 	slot->sdio_id = host->sdio_id0 + slot->id;
+ 	slot->mmc = mmc;
+ 	slot->host = host;
+-	host->slot = slot;
+ 
+ 	mmc->ops = &dw_mci_ops;
+ 
+@@ -3172,7 +3232,10 @@ static int dw_mci_init_slot(struct dw_mci *host)
+ 	if (!mmc->ocr_avail)
+ 		mmc->ocr_avail = MMC_VDD_32_33 | MMC_VDD_33_34;
+ 
+-	ret = mmc_of_parse(mmc);
++	if (child_node)
++		ret = dw_mci_parse_slot_node(mmc, np);
++	else
++		ret = mmc_of_parse(mmc);
+ 	if (ret)
+ 		goto err_host_allocated;
+ 
+@@ -3218,11 +3281,21 @@ static int dw_mci_init_slot(struct dw_mci *host)
+ 			 "ESP32-P4 IDMAC internal-SRAM bounce: 4 KiB requests, 64-byte descriptors\n");
+ 	}
+ 
++	if (host->slots[slot_id]) {
++		dev_err(host->dev, "duplicate physical slot %u\n", slot_id);
++		ret = -EINVAL;
++		goto err_host_allocated;
++	}
++	host->slots[slot_id] = slot;
++	host->num_slots++;
++	if (!host->slot)
++		host->slot = slot;
++
+ 	dw_mci_get_cd(mmc);
+ 
+ 	ret = mmc_add_host(mmc);
+ 	if (ret)
+-		goto err_host_allocated;
++		goto err_slot_registered;
+ 
+ #if defined(CONFIG_DEBUG_FS)
+ 	dw_mci_init_debugfs(slot);
+@@ -3230,19 +3304,85 @@ static int dw_mci_init_slot(struct dw_mci *host)
+ 
+ 	return 0;
+ 
++err_slot_registered:
++	host->slots[slot_id] = NULL;
++	host->num_slots--;
++	if (host->slot == slot)
++		host->slot = NULL;
+ err_host_allocated:
+ 	mmc_free_host(mmc);
+ 	return ret;
+ }
+ 
+ static void dw_mci_cleanup_slot(struct dw_mci_slot *slot)
+ {
++	struct dw_mci *host = slot->host;
++	u32 slot_id = slot->id;
++
+ 	/* Debugfs stuff is cleaned up by mmc core */
+ 	mmc_remove_host(slot->mmc);
+-	slot->host->slot = NULL;
++	host->slots[slot_id] = NULL;
++	host->num_slots--;
++	if (host->slot == slot)
++		host->slot = NULL;
+ 	mmc_free_host(slot->mmc);
+ }
+ 
++static void dw_mci_cleanup_slots(struct dw_mci *host)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(host->slots); i++)
++		if (host->slots[i])
++			dw_mci_cleanup_slot(host->slots[i]);
++}
++
++static int dw_mci_init_slots(struct dw_mci *host)
++{
++	struct device_node *child;
++	u32 slot_id;
++	int ret;
++
++	host->multi_slot =
++		(host->quirks & DW_MMC_QUIRK_ESP32P4_POLLED_IDMAC) &&
++		host->dev->of_node &&
++		of_property_read_bool(host->dev->of_node,
++				      "espressif,dual-slot");
++	if (!host->multi_slot)
++		return dw_mci_init_slot(host, host->dev->of_node, 0, false);
++
++	for_each_available_child_of_node(host->dev->of_node, child) {
++		ret = of_property_read_u32(child, "reg", &slot_id);
++		if (ret || slot_id >= ARRAY_SIZE(host->slots)) {
++			dev_err(host->dev,
++				"dual-slot child has invalid or missing reg\n");
++			ret = -EINVAL;
++			of_node_put(child);
++			goto err_cleanup;
++		}
++
++		ret = dw_mci_init_slot(host, child, slot_id, true);
++		if (ret) {
++			of_node_put(child);
++			goto err_cleanup;
++		}
++	}
++
++	if (host->num_slots != ARRAY_SIZE(host->slots)) {
++		dev_err(host->dev, "dual-slot profile requires slots 0 and 1\n");
++		ret = -EINVAL;
++		goto err_cleanup;
++	}
++
++	dev_info(host->dev,
++		 "ESP32-P4 dual-slot arbitration enabled for microSD and C6 SDIO\n");
++	return 0;
++
++err_cleanup:
++	dw_mci_cleanup_slots(host);
++	return ret;
++}
++
+ static void dw_mci_init_dma(struct dw_mci *host)
+ {
+ 	int addr_config;
+@@ -3506,22 +3636,30 @@ static struct dw_mci_board *dw_mci_parse_dt(struct dw_mci *host)
+ static void dw_mci_enable_cd(struct dw_mci *host)
+ {
+ 	unsigned long irqflags;
+-	u32 temp;
++	u32 temp = 0;
++	int i;
+ 
+ 	/*
+ 	 * No need for CD if all slots have a non-error GPIO
+ 	 * as well as broken card detection is found.
+ 	 */
+-	if (host->slot->mmc->caps & MMC_CAP_NEEDS_POLL)
+-		return;
++	for (i = 0; i < ARRAY_SIZE(host->slots); i++) {
++		struct dw_mci_slot *slot = host->slots[i];
+ 
+-	if (mmc_gpio_get_cd(host->slot->mmc) < 0) {
+-		spin_lock_irqsave(&host->irq_lock, irqflags);
+-		temp = mci_readl(host, INTMASK);
+-		temp  |= SDMMC_INT_CD;
+-		mci_writel(host, INTMASK, temp);
+-		spin_unlock_irqrestore(&host->irq_lock, irqflags);
++		if (!slot || (slot->mmc->caps & MMC_CAP_NEEDS_POLL))
++			continue;
++		if (mmc_gpio_get_cd(slot->mmc) < 0) {
++			temp = SDMMC_INT_CD;
++			break;
++		}
+ 	}
++	if (!temp)
++		return;
++
++	spin_lock_irqsave(&host->irq_lock, irqflags);
++	temp |= mci_readl(host, INTMASK);
++	mci_writel(host, INTMASK, temp);
++	spin_unlock_irqrestore(&host->irq_lock, irqflags);
+ }
+ 
+ int dw_mci_probe(struct dw_mci *host)
+@@ -3719,9 +3856,9 @@ int dw_mci_probe(struct dw_mci *host)
+ 		 host->irq, width, fifo_size);
+ 
+ 	/* We need at least one slot to succeed */
+-	ret = dw_mci_init_slot(host);
++	ret = dw_mci_init_slots(host);
+ 	if (ret) {
+-		dev_dbg(host->dev, "slot %d init failed\n", i);
++		dev_dbg(host->dev, "slot initialization failed\n");
+ 		goto err_dmaunmap;
+ 	}
+ 
+@@ -3759,8 +3896,7 @@ void dw_mci_remove(struct dw_mci *host)
+ 		del_timer_sync(&host->esp32p4_poll_timer);
+ 
+-	dev_dbg(host->dev, "remove slot\n");
+-	if (host->slot)
+-		dw_mci_cleanup_slot(host->slot);
++	dev_dbg(host->dev, "remove slots\n");
++	dw_mci_cleanup_slots(host);
+ 
+ 	mci_writel(host, RINTSTS, 0xFFFFFFFF);
+ 	mci_writel(host, INTMASK, 0); /* disable all mmc interrupt first */
+@@ -3787,15 +3923,21 @@ int dw_mci_runtime_suspend(struct device *dev)
+ {
+ 	struct dw_mci *host = dev_get_drvdata(dev);
++	int i;
+ 
+ 	if (host->use_dma && host->dma_ops->exit)
+ 		host->dma_ops->exit(host);
+ 
+ 	clk_disable_unprepare(host->ciu_clk);
+ 
+-	if (host->slot &&
+-	    (mmc_can_gpio_cd(host->slot->mmc) ||
+-	     !mmc_card_is_removable(host->slot->mmc)))
+-		clk_disable_unprepare(host->biu_clk);
++	for (i = 0; i < ARRAY_SIZE(host->slots); i++) {
++		struct dw_mci_slot *slot = host->slots[i];
++
++		if (slot && (mmc_can_gpio_cd(slot->mmc) ||
++			     !mmc_card_is_removable(slot->mmc))) {
++			clk_disable_unprepare(host->biu_clk);
++			break;
++		}
++	}
+ 
+ 	return 0;
+ }
+@@ -3806,13 +3947,18 @@ int dw_mci_runtime_resume(struct device *dev)
+ {
+ 	int ret = 0;
+ 	struct dw_mci *host = dev_get_drvdata(dev);
++	int i;
+ 
+-	if (host->slot &&
+-	    (mmc_can_gpio_cd(host->slot->mmc) ||
+-	     !mmc_card_is_removable(host->slot->mmc))) {
+-		ret = clk_prepare_enable(host->biu_clk);
+-		if (ret)
+-			return ret;
++	for (i = 0; i < ARRAY_SIZE(host->slots); i++) {
++		struct dw_mci_slot *slot = host->slots[i];
++
++		if (slot && (mmc_can_gpio_cd(slot->mmc) ||
++			     !mmc_card_is_removable(slot->mmc))) {
++			ret = clk_prepare_enable(host->biu_clk);
++			if (ret)
++				return ret;
++			break;
++		}
+ 	}
+ 
+ 	ret = clk_prepare_enable(host->ciu_clk);
+@@ -3844,15 +3990,24 @@ int dw_mci_runtime_resume(struct device *dev)
+ 	mci_writel(host, CTRL, SDMMC_CTRL_INT_ENABLE);
+ 
+ 
+-	if (host->slot && host->slot->mmc->pm_flags & MMC_PM_KEEP_POWER)
+-		dw_mci_set_ios(host->slot->mmc, &host->slot->mmc->ios);
++	for (i = 0; i < ARRAY_SIZE(host->slots); i++) {
++		struct dw_mci_slot *slot = host->slots[i];
++
++		if (slot && slot->mmc->pm_flags & MMC_PM_KEEP_POWER)
++			dw_mci_set_ios(slot->mmc, &slot->mmc->ios);
++	}
+ 
+ 	/* Force setup bus to guarantee available clock output */
+-	dw_mci_setup_bus(host->slot, true);
++	if (host->slot)
++		dw_mci_setup_bus(host->slot, true);
+ 
+ 	/* Re-enable SDIO interrupts. */
+-	if (sdio_irq_claimed(host->slot->mmc))
+-		__dw_mci_enable_sdio_irq(host->slot, 1);
++	for (i = 0; i < ARRAY_SIZE(host->slots); i++) {
++		struct dw_mci_slot *slot = host->slots[i];
++
++		if (slot && sdio_irq_claimed(slot->mmc))
++			__dw_mci_enable_sdio_irq(slot, 1);
++	}
+ 
+ 	/* Now that slots are all setup, we can enable card detect */
+ 	dw_mci_enable_cd(host);
+@@ -3860,10 +4016,15 @@ int dw_mci_runtime_resume(struct device *dev)
+ 	return 0;
+ 
+ err:
+-	if (host->slot &&
+-	    (mmc_can_gpio_cd(host->slot->mmc) ||
+-	     !mmc_card_is_removable(host->slot->mmc)))
+-		clk_disable_unprepare(host->biu_clk);
++	for (i = 0; i < ARRAY_SIZE(host->slots); i++) {
++		struct dw_mci_slot *slot = host->slots[i];
++
++		if (slot && (mmc_can_gpio_cd(slot->mmc) ||
++			     !mmc_card_is_removable(slot->mmc))) {
++			clk_disable_unprepare(host->biu_clk);
++			break;
++		}
++	}
+ 
+ 	return ret;
+ }
+diff --git a/drivers/mmc/host/dw_mmc.h b/drivers/mmc/host/dw_mmc.h
+index 9e453ad33e16..40e4c80af19c 100644
+--- a/drivers/mmc/host/dw_mmc.h
++++ b/drivers/mmc/host/dw_mmc.h
+@@ -211,6 +211,9 @@ struct dw_mci {
+ 	struct clk		*biu_clk;
+ 	struct clk		*ciu_clk;
+ 	struct dw_mci_slot	*slot;
++	struct dw_mci_slot	*slots[2];
++	unsigned int		num_slots;
++	bool			multi_slot;
+ 
+ 	/* FIFO push and pull */
+ 	int			fifo_depth;
+-- 
+2.50.1

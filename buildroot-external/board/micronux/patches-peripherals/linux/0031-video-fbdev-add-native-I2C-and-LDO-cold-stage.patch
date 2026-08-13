@@ -1,0 +1,874 @@
+From 70117bd22759d818ecac09398159f8eaf44ec790 Mon Sep 17 00:00:00 2001
+From: MicroNUX <micronux@example.invalid>
+Date: Wed, 12 Aug 2026 00:06:29 -0700
+Subject: [PATCH 31/46] video: fbdev: add native I2C and LDO cold stage
+
+Add a root-only, write-once cold_init control for ABI-v3 cold probe.
+Reclaim I2C0 with the pinned ESP-IDF v6.0.1 clock, timing, GPIO,
+and IOMUX configuration. Reissue the ACKed PWM-zero, reset-prepare,
+and reset-assert command sequence without claiming external readback.
+
+Calculate the 2500-mV LDO3 settings from silicon eFuse calibration and
+apply the IDF voltage, owner, ripple-suppression, and enable sequence.
+Verify the programmed fields, then release and gate I2C0 before entering
+LDO_READY. Leave the DSI and GDMA blocks reset and clocks disabled.
+
+On any failure, best-effort reissue PWM-zero and reset-assert, clear LDO
+XPD, gate I2C0, and enter FAILED_QUIESCENT with retry limited to reboot.
+Do not register fbdev, backlight, or an IRQ in this stage.
+
+Signed-off-by: MicroNUX <micronux@example.invalid>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 732 +++++++++++++++++++++++++++++-
+ 1 file changed, 723 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 26f2c9a..ec07595 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include <linux/backlight.h>
++#include <linux/bitfield.h>
+ #include <linux/bitops.h>
+ #include <linux/build_bug.h>
+ #include <linux/crc32.h>
+@@ -81,6 +82,12 @@
+ #define MICRONUX_DISPLAY_COLD_PWM_ZERO_SETTLE_MS	100
+ #define MICRONUX_DISPLAY_COLD_PANEL_PAYLOAD_CRC32	0xcea07f9b
+ #define MICRONUX_DISPLAY_COLD_SEQUENCE_ID	1
++#define MICRONUX_DISPLAY_COLD_LDO_CHANNEL	3
++#define MICRONUX_DISPLAY_COLD_LDO_UNIT		2
++#define MICRONUX_DISPLAY_COLD_LDO_MV		2500
++#define MICRONUX_DISPLAY_COLD_I2C_SOURCE_HZ	40000000
++#define MICRONUX_DISPLAY_COLD_I2C_FILTER	7
++#define MICRONUX_DISPLAY_COLD_I2C_TIMEOUT_US	2000
+ #define MICRONUX_DISPLAY_COLD_FIRMWARE \
+ 	"micronux/jd9365-waveshare-10.1-v2.bin"
+ 
+@@ -235,7 +242,9 @@
+ #define HP_CLKRST_SOC_CLK_CTRL1		0x18
+ #define HP_CLKRST_SOC_CLK_CTRL2		0x1c
+ #define HP_CLKRST_PERI_CLK_CTRL03	0x3c
++#define HP_CLKRST_PERI_CLK_CTRL10	0x40
+ #define HP_CLKRST_HP_RST_EN0		0xc0
++#define HP_CLKRST_HP_RST_EN1		0xc4
+ #define HP_CLKRST_GDMA_CPU_CLK_EN	BIT(13)
+ #define HP_CLKRST_GDMA_SYS_CLK_EN	BIT(5)
+ #define HP_CLKRST_DSI_SYS_CLK_EN	BIT(12)
+@@ -245,14 +254,33 @@
+ #define HP_CLKRST_DSI_DPI_CLK_EN	BIT(7)
+ #define HP_CLKRST_GDMA_RESET		BIT(21)
+ #define HP_CLKRST_DSI_BRIDGE_RESET	BIT(26)
++#define HP_CLKRST_I2C0_RESET		BIT(22)
++#define HP_CLKRST_I2C0_CLK_SRC_RC_FAST	BIT(0)
++#define HP_CLKRST_I2C0_CLK_EN		BIT(1)
++#define HP_CLKRST_I2C0_CLK_DIV_NUM	GENMASK(9, 2)
++#define HP_CLKRST_I2C0_CLK_DIV_NUMERATOR GENMASK(17, 10)
++#define HP_CLKRST_I2C0_CLK_DIV_DENOMINATOR GENMASK(25, 18)
+ 
+ #define PMU_EXT_LDO_P0_0P2A		0x1c0
+-#define PMU_EXT_LDO_XPD		BIT(8)
++#define PMU_EXT_LDO_P0_0P2A_ANA		0x1c4
++#define PMU_EXT_LDO_FORCE_TIEH_SEL	BIT(7)
++#define PMU_EXT_LDO_XPD			BIT(8)
++#define PMU_EXT_LDO_TIEH_SEL		GENMASK(11, 9)
++#define PMU_EXT_LDO_TIEH		BIT(14)
++#define PMU_EXT_LDO_MUL		GENMASK(25, 23)
++#define PMU_EXT_LDO_EN_VDET		BIT(26)
++#define PMU_EXT_LDO_DREF		GENMASK(31, 28)
+ 
+ #define EFUSE_RD_MAC_SYS_2		0x4c
++#define EFUSE_RD_MAC_SYS_3		0x50
+ #define EFUSE_WAFER_MINOR_MASK		GENMASK(3, 0)
+ #define EFUSE_WAFER_MAJOR_LO_MASK	GENMASK(5, 4)
+ #define EFUSE_WAFER_MAJOR_HI		BIT(23)
++#define EFUSE_BLOCK_VERSION_MINOR	GENMASK(10, 8)
++#define EFUSE_BLOCK_VERSION_MAJOR	GENMASK(12, 11)
++#define EFUSE_LDO_VO3_K		GENMASK(13, 6)
++#define EFUSE_LDO_VO3_VOS		GENMASK(19, 14)
++#define EFUSE_LDO_VO3_C		GENMASK(25, 20)
+ 
+ #define MICRONUX_FAULT_DMA		0
+ #define MICRONUX_FAULT_UNDERRUN		1
+@@ -271,13 +299,23 @@
+ #define MICRONUX_TOUCH_MAX_CONTACTS	10
+ #define MICRONUX_TOUCH_POLL_MS		10
+ 
++#define I2C_SCL_LOW_PERIOD		0x00
+ #define I2C_CTR				0x04
+ #define I2C_SR				0x08
++#define I2C_TO				0x0c
+ #define I2C_FIFO_CONF			0x18
+ #define I2C_DATA			0x1c
+ #define I2C_INT_RAW			0x20
+ #define I2C_INT_CLR			0x24
+ #define I2C_INT_ENA			0x28
++#define I2C_SDA_HOLD			0x30
++#define I2C_SDA_SAMPLE			0x34
++#define I2C_SCL_HIGH_PERIOD		0x38
++#define I2C_SCL_START_HOLD		0x40
++#define I2C_SCL_RSTART_SETUP		0x44
++#define I2C_SCL_STOP_HOLD		0x48
++#define I2C_SCL_STOP_SETUP		0x4c
++#define I2C_FILTER_CFG			0x50
+ #define I2C_COMMAND(index)		(0x58 + (index) * 4)
+ 
+ #define I2C_BUS_BUSY			BIT(4)
+@@ -289,6 +327,39 @@
+ #define I2C_TX_FIFO_RST			BIT(13)
+ #define I2C_COMMAND_DONE		BIT(31)
+ #define I2C_ERROR_MASK			(BIT(5) | BIT(8) | BIT(10))
++#define I2C_TIMEOUT_VALUE		GENMASK(4, 0)
++#define I2C_TIMEOUT_ENABLE		BIT(5)
++#define I2C_NONFIFO_ENABLE		BIT(10)
++#define I2C_TIMING_9BIT		GENMASK(8, 0)
++#define I2C_SCL_WAIT_HIGH		GENMASK(15, 9)
++#define I2C_FILTER_SCL_THRESHOLD	GENMASK(3, 0)
++#define I2C_FILTER_SDA_THRESHOLD	GENMASK(7, 4)
++#define I2C_FILTER_SCL_ENABLE		BIT(8)
++#define I2C_FILTER_SDA_ENABLE		BIT(9)
++
++#define GPIO_OUT_W1TS			0x08
++#define GPIO_ENABLE_W1TC		0x28
++#define GPIO_PIN(gpio)			(0x74 + (gpio) * sizeof(u32))
++#define GPIO_PIN_PAD_DRIVER		BIT(2)
++#define GPIO_FUNC_IN_SEL(signal)	(0x158 + (signal) * sizeof(u32))
++#define GPIO_FUNC_IN_SOURCE		GENMASK(5, 0)
++#define GPIO_FUNC_IN_INVERT		BIT(6)
++#define GPIO_FUNC_IN_MATRIX		BIT(7)
++#define GPIO_FUNC_OUT_SEL(gpio)		(0x558 + (gpio) * sizeof(u32))
++#define GPIO_FUNC_OUT_SOURCE		GENMASK(8, 0)
++#define GPIO_FUNC_OUT_INVERT		BIT(9)
++#define GPIO_FUNC_OUT_OEN_GPIO		BIT(10)
++#define GPIO_FUNC_OUT_OEN_INVERT	BIT(11)
++#define GPIO_I2C0_SCL_SIGNAL		68
++#define GPIO_I2C0_SDA_SIGNAL		69
++#define GPIO_MATRIX_CONST_ZERO_INPUT	0x3e
++
++#define IOMUX_GPIO(gpio)		(0x04 + (gpio) * sizeof(u32))
++#define IOMUX_PULLDOWN_ENABLE		BIT(7)
++#define IOMUX_PULLUP_ENABLE		BIT(8)
++#define IOMUX_INPUT_ENABLE		BIT(9)
++#define IOMUX_FUNCTION			GENMASK(14, 12)
++#define IOMUX_FUNCTION_GPIO		1
+ 
+ #define I2C_CMD_RESTART			6
+ #define I2C_CMD_WRITE			1
+@@ -412,9 +483,34 @@ static_assert(offsetof(struct micronux_display_handoff_v3, crc32) == 0xbc);
+ enum micronux_display_state {
+ 	MICRONUX_DISPLAY_STATE_UNBOUND,
+ 	MICRONUX_DISPLAY_STATE_PROBED_QUIESCENT,
++	MICRONUX_DISPLAY_STATE_COLD_INITIALIZING,
++	MICRONUX_DISPLAY_STATE_LDO_READY,
++	MICRONUX_DISPLAY_STATE_FAILED_QUIESCENT,
+ 	MICRONUX_DISPLAY_STATE_RUNTIME_READY,
+ };
+ 
++struct micronux_i2c_timing {
++	u32 clkm_div;
++	u32 scl_low;
++	u32 scl_wait_high;
++	u32 scl_high;
++	u32 sda_hold;
++	u32 sda_sample;
++	u32 setup;
++	u32 hold;
++	u32 bus_timeout;
++	u32 device_timeout;
++};
++
++struct micronux_ldo_calibration {
++	u32 block_version;
++	int k_1000;
++	int vos_1000;
++	int c_1000;
++	u8 dref;
++	u8 mul;
++};
++
+ struct micronux_dsi {
+ 	struct device *dev;
+ 	void __iomem *host;
+@@ -486,6 +582,8 @@ struct micronux_dsi {
+ 	u8 touch_address;
+ 	char touch_product[5];
+ 	bool touch_down;
++	bool cold_i2c_active;
++	bool cold_ldo_enabled;
+ 	struct hrtimer scanout_timer;
+ 	struct work_struct fault_work;
+ };
+@@ -2272,19 +2370,607 @@ static struct attribute *micronux_display_attrs[] = {
+ };
+ ATTRIBUTE_GROUPS(micronux_display);
+ 
++static int micronux_cold_i2c_calculate_timing(struct micronux_i2c_timing *timing)
++{
++	u32 half_cycle, source_clock, source_per_us;
++
++	source_clock = MICRONUX_DISPLAY_COLD_I2C_SOURCE_HZ;
++	timing->clkm_div = source_clock /
++		(MICRONUX_DISPLAY_COLD_I2C_RATE_HZ * 1024) + 1;
++	if (!timing->clkm_div)
++		return -EINVAL;
++	half_cycle = source_clock / timing->clkm_div /
++		MICRONUX_DISPLAY_COLD_I2C_RATE_HZ / 2;
++	if (half_cycle < 4)
++		return -EINVAL;
++
++	timing->scl_low = half_cycle;
++	timing->scl_wait_high = half_cycle / 2 - 2;
++	timing->scl_high = half_cycle - timing->scl_wait_high;
++	timing->sda_hold = half_cycle / 4;
++	timing->sda_sample = half_cycle / 2;
++	timing->setup = half_cycle;
++	timing->hold = half_cycle;
++	timing->bus_timeout = fls(5 * half_cycle) + 2;
++	source_per_us = source_clock / 1000000;
++	timing->device_timeout = fls(source_per_us *
++		MICRONUX_DISPLAY_COLD_I2C_TIMEOUT_US);
++
++	if (timing->scl_wait_high >= timing->sda_sample ||
++	    timing->sda_sample >= timing->scl_high ||
++	    timing->clkm_div > 256 ||
++	    timing->scl_low > 512 || timing->scl_high > 511 ||
++	    timing->scl_wait_high > 127 ||
++	    timing->device_timeout > FIELD_MAX(I2C_TIMEOUT_VALUE))
++		return -EINVAL;
++	return 0;
++}
++
++static void micronux_cold_i2c_pin(struct micronux_dsi *dsi, u32 gpio,
++				  u32 signal)
++{
++	u32 value;
++
++	/* This is the exact HP-I2C pin order used by ESP-IDF v6.0.1. */
++	writel(BIT(gpio), dsi->gpio + GPIO_OUT_W1TS);
++	value = readl(dsi->iomux + IOMUX_GPIO(gpio));
++	value &= ~(IOMUX_PULLDOWN_ENABLE | IOMUX_FUNCTION);
++	value |= IOMUX_PULLUP_ENABLE | IOMUX_INPUT_ENABLE |
++		 FIELD_PREP(IOMUX_FUNCTION, IOMUX_FUNCTION_GPIO);
++	writel(value, dsi->iomux + IOMUX_GPIO(gpio));
++
++	value = readl(dsi->gpio + GPIO_PIN(gpio));
++	writel(value | GPIO_PIN_PAD_DRIVER,
++	       dsi->gpio + GPIO_PIN(gpio));
++
++	value = readl(dsi->gpio + GPIO_FUNC_OUT_SEL(gpio));
++	value &= ~(GPIO_FUNC_OUT_SOURCE | GPIO_FUNC_OUT_INVERT |
++		   GPIO_FUNC_OUT_OEN_GPIO | GPIO_FUNC_OUT_OEN_INVERT);
++	value |= FIELD_PREP(GPIO_FUNC_OUT_SOURCE, signal);
++	writel(value, dsi->gpio + GPIO_FUNC_OUT_SEL(gpio));
++
++	value = readl(dsi->gpio + GPIO_FUNC_IN_SEL(signal));
++	value &= ~(GPIO_FUNC_IN_SOURCE | GPIO_FUNC_IN_INVERT |
++		   GPIO_FUNC_IN_MATRIX);
++	value |= FIELD_PREP(GPIO_FUNC_IN_SOURCE, gpio) |
++		 GPIO_FUNC_IN_MATRIX;
++	writel(value, dsi->gpio + GPIO_FUNC_IN_SEL(signal));
++}
++
++static void micronux_cold_i2c_release_pins(struct micronux_dsi *dsi)
++{
++	u32 value;
++
++	value = readl(dsi->gpio + GPIO_PIN(MICRONUX_DISPLAY_COLD_I2C_SDA_GPIO));
++	writel(value & ~GPIO_PIN_PAD_DRIVER,
++	       dsi->gpio + GPIO_PIN(MICRONUX_DISPLAY_COLD_I2C_SDA_GPIO));
++	value = readl(dsi->gpio + GPIO_PIN(MICRONUX_DISPLAY_COLD_I2C_SCL_GPIO));
++	writel(value & ~GPIO_PIN_PAD_DRIVER,
++	       dsi->gpio + GPIO_PIN(MICRONUX_DISPLAY_COLD_I2C_SCL_GPIO));
++	writel(BIT(MICRONUX_DISPLAY_COLD_I2C_SDA_GPIO) |
++	       BIT(MICRONUX_DISPLAY_COLD_I2C_SCL_GPIO),
++	       dsi->gpio + GPIO_ENABLE_W1TC);
++
++	value = readl(dsi->gpio + GPIO_FUNC_IN_SEL(GPIO_I2C0_SDA_SIGNAL));
++	value &= ~(GPIO_FUNC_IN_SOURCE | GPIO_FUNC_IN_INVERT);
++	value |= FIELD_PREP(GPIO_FUNC_IN_SOURCE,
++			    GPIO_MATRIX_CONST_ZERO_INPUT) |
++		 GPIO_FUNC_IN_MATRIX;
++	writel(value, dsi->gpio + GPIO_FUNC_IN_SEL(GPIO_I2C0_SDA_SIGNAL));
++	value = readl(dsi->gpio + GPIO_FUNC_IN_SEL(GPIO_I2C0_SCL_SIGNAL));
++	value &= ~(GPIO_FUNC_IN_SOURCE | GPIO_FUNC_IN_INVERT);
++	value |= FIELD_PREP(GPIO_FUNC_IN_SOURCE,
++			    GPIO_MATRIX_CONST_ZERO_INPUT) |
++		 GPIO_FUNC_IN_MATRIX;
++	writel(value, dsi->gpio + GPIO_FUNC_IN_SEL(GPIO_I2C0_SCL_SIGNAL));
++}
++
++static bool micronux_i2c_matches(struct micronux_dsi *dsi,
++				 const struct micronux_i2c_timing *timing)
++{
++	u32 peri, value;
++
++	if (!(readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL2) &
++	      HP_CLKRST_I2C0_APB_CLK_EN) ||
++	    (readl(dsi->hp_clkrst + HP_CLKRST_HP_RST_EN1) &
++	     HP_CLKRST_I2C0_RESET))
++		return false;
++	peri = readl(dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL10);
++	if ((peri & (HP_CLKRST_I2C0_CLK_SRC_RC_FAST |
++		     HP_CLKRST_I2C0_CLK_EN |
++		     HP_CLKRST_I2C0_CLK_DIV_NUM |
++		     HP_CLKRST_I2C0_CLK_DIV_NUMERATOR |
++		     HP_CLKRST_I2C0_CLK_DIV_DENOMINATOR)) !=
++	    (HP_CLKRST_I2C0_CLK_EN |
++	     FIELD_PREP(HP_CLKRST_I2C0_CLK_DIV_NUM,
++			timing->clkm_div - 1)))
++		return false;
++
++	value = readl(dsi->iomux +
++		      IOMUX_GPIO(MICRONUX_DISPLAY_COLD_I2C_SDA_GPIO));
++	if ((value & (IOMUX_PULLDOWN_ENABLE | IOMUX_PULLUP_ENABLE |
++		      IOMUX_INPUT_ENABLE | IOMUX_FUNCTION)) !=
++	    (IOMUX_PULLUP_ENABLE | IOMUX_INPUT_ENABLE |
++	     FIELD_PREP(IOMUX_FUNCTION, IOMUX_FUNCTION_GPIO)))
++		return false;
++	value = readl(dsi->iomux +
++		      IOMUX_GPIO(MICRONUX_DISPLAY_COLD_I2C_SCL_GPIO));
++	if ((value & (IOMUX_PULLDOWN_ENABLE | IOMUX_PULLUP_ENABLE |
++		      IOMUX_INPUT_ENABLE | IOMUX_FUNCTION)) !=
++	    (IOMUX_PULLUP_ENABLE | IOMUX_INPUT_ENABLE |
++	     FIELD_PREP(IOMUX_FUNCTION, IOMUX_FUNCTION_GPIO)))
++		return false;
++	if (!(readl(dsi->gpio +
++		    GPIO_PIN(MICRONUX_DISPLAY_COLD_I2C_SDA_GPIO)) &
++	      GPIO_PIN_PAD_DRIVER) ||
++	    !(readl(dsi->gpio +
++		    GPIO_PIN(MICRONUX_DISPLAY_COLD_I2C_SCL_GPIO)) &
++	      GPIO_PIN_PAD_DRIVER))
++		return false;
++	value = readl(dsi->gpio +
++		      GPIO_FUNC_OUT_SEL(MICRONUX_DISPLAY_COLD_I2C_SDA_GPIO));
++	if ((value & (GPIO_FUNC_OUT_SOURCE | GPIO_FUNC_OUT_INVERT |
++		      GPIO_FUNC_OUT_OEN_GPIO | GPIO_FUNC_OUT_OEN_INVERT)) !=
++	    FIELD_PREP(GPIO_FUNC_OUT_SOURCE, GPIO_I2C0_SDA_SIGNAL))
++		return false;
++	value = readl(dsi->gpio +
++		      GPIO_FUNC_OUT_SEL(MICRONUX_DISPLAY_COLD_I2C_SCL_GPIO));
++	if ((value & (GPIO_FUNC_OUT_SOURCE | GPIO_FUNC_OUT_INVERT |
++		      GPIO_FUNC_OUT_OEN_GPIO | GPIO_FUNC_OUT_OEN_INVERT)) !=
++	    FIELD_PREP(GPIO_FUNC_OUT_SOURCE, GPIO_I2C0_SCL_SIGNAL))
++		return false;
++	if ((readl(dsi->gpio + GPIO_FUNC_IN_SEL(GPIO_I2C0_SDA_SIGNAL)) &
++	     (GPIO_FUNC_IN_SOURCE | GPIO_FUNC_IN_INVERT |
++	      GPIO_FUNC_IN_MATRIX)) !=
++	    (FIELD_PREP(GPIO_FUNC_IN_SOURCE,
++			MICRONUX_DISPLAY_COLD_I2C_SDA_GPIO) |
++	     GPIO_FUNC_IN_MATRIX) ||
++	    (readl(dsi->gpio + GPIO_FUNC_IN_SEL(GPIO_I2C0_SCL_SIGNAL)) &
++	     (GPIO_FUNC_IN_SOURCE | GPIO_FUNC_IN_INVERT |
++	      GPIO_FUNC_IN_MATRIX)) !=
++	    (FIELD_PREP(GPIO_FUNC_IN_SOURCE,
++			MICRONUX_DISPLAY_COLD_I2C_SCL_GPIO) |
++	     GPIO_FUNC_IN_MATRIX))
++		return false;
++
++	if ((readl(dsi->i2c + I2C_CTR) &
++	     (BIT(0) | BIT(1) | BIT(3) | I2C_MS_MODE | BIT(6) | BIT(7) |
++	      BIT(9))) != I2C_MS_MODE ||
++	    (readl(dsi->i2c + I2C_FIFO_CONF) & I2C_NONFIFO_ENABLE))
++		return false;
++	if ((readl(dsi->i2c + I2C_SCL_LOW_PERIOD) & I2C_TIMING_9BIT) !=
++	    timing->scl_low - 1 ||
++	    (readl(dsi->i2c + I2C_SCL_HIGH_PERIOD) &
++	     (I2C_TIMING_9BIT | I2C_SCL_WAIT_HIGH)) !=
++	    (timing->scl_high |
++	     FIELD_PREP(I2C_SCL_WAIT_HIGH, timing->scl_wait_high)) ||
++	    (readl(dsi->i2c + I2C_SDA_HOLD) & I2C_TIMING_9BIT) !=
++	    timing->sda_hold - 1 ||
++	    (readl(dsi->i2c + I2C_SDA_SAMPLE) & I2C_TIMING_9BIT) !=
++	    timing->sda_sample - 1 ||
++	    (readl(dsi->i2c + I2C_SCL_RSTART_SETUP) & I2C_TIMING_9BIT) !=
++	    timing->setup - 1 ||
++	    (readl(dsi->i2c + I2C_SCL_STOP_SETUP) & I2C_TIMING_9BIT) !=
++	    timing->setup - 1 ||
++	    (readl(dsi->i2c + I2C_SCL_START_HOLD) & I2C_TIMING_9BIT) !=
++	    timing->hold - 1 ||
++	    (readl(dsi->i2c + I2C_SCL_STOP_HOLD) & I2C_TIMING_9BIT) !=
++	    timing->hold - 1)
++		return false;
++	if ((readl(dsi->i2c + I2C_TO) &
++	     (I2C_TIMEOUT_VALUE | I2C_TIMEOUT_ENABLE)) !=
++	    (FIELD_PREP(I2C_TIMEOUT_VALUE, timing->device_timeout) |
++	     I2C_TIMEOUT_ENABLE) ||
++	    (readl(dsi->i2c + I2C_FILTER_CFG) &
++	     (I2C_FILTER_SCL_THRESHOLD | I2C_FILTER_SDA_THRESHOLD |
++	      I2C_FILTER_SCL_ENABLE | I2C_FILTER_SDA_ENABLE)) !=
++	    (FIELD_PREP(I2C_FILTER_SCL_THRESHOLD,
++			MICRONUX_DISPLAY_COLD_I2C_FILTER) |
++	     FIELD_PREP(I2C_FILTER_SDA_THRESHOLD,
++			MICRONUX_DISPLAY_COLD_I2C_FILTER) |
++	     I2C_FILTER_SCL_ENABLE | I2C_FILTER_SDA_ENABLE))
++		return false;
++	return true;
++}
++
++static int micronux_cold_i2c_initialize(struct micronux_dsi *dsi)
++{
++	struct micronux_i2c_timing timing = { };
++	u32 ctr, fifo, peri, reset, value;
++	int ret;
++
++	ret = micronux_cold_i2c_calculate_timing(&timing);
++	if (ret)
++		return ret;
++
++	value = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL2);
++	writel(value | HP_CLKRST_I2C0_APB_CLK_EN,
++	       dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL2);
++	dsi->cold_i2c_active = true;
++	reset = readl(dsi->hp_clkrst + HP_CLKRST_HP_RST_EN1);
++	writel(reset | HP_CLKRST_I2C0_RESET,
++	       dsi->hp_clkrst + HP_CLKRST_HP_RST_EN1);
++	writel(reset & ~HP_CLKRST_I2C0_RESET,
++	       dsi->hp_clkrst + HP_CLKRST_HP_RST_EN1);
++	peri = readl(dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL10);
++	writel(peri | HP_CLKRST_I2C0_CLK_EN,
++	       dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL10);
++
++	micronux_cold_i2c_pin(dsi, MICRONUX_DISPLAY_COLD_I2C_SDA_GPIO,
++			      GPIO_I2C0_SDA_SIGNAL);
++	micronux_cold_i2c_pin(dsi, MICRONUX_DISPLAY_COLD_I2C_SCL_GPIO,
++			      GPIO_I2C0_SCL_SIGNAL);
++
++	ctr = readl(dsi->i2c + I2C_CTR);
++	ctr &= ~(BIT(0) | BIT(1) | BIT(3) | BIT(6) | BIT(7) | BIT(9));
++	ctr |= I2C_MS_MODE;
++	writel(ctr, dsi->i2c + I2C_CTR);
++	fifo = readl(dsi->i2c + I2C_FIFO_CONF) & ~I2C_NONFIFO_ENABLE;
++	writel(fifo | I2C_RX_FIFO_RST | I2C_TX_FIFO_RST,
++	       dsi->i2c + I2C_FIFO_CONF);
++	writel(fifo & ~(I2C_RX_FIFO_RST | I2C_TX_FIFO_RST),
++	       dsi->i2c + I2C_FIFO_CONF);
++	writel(ctr | I2C_CONF_UPGATE, dsi->i2c + I2C_CTR);
++
++	peri = readl(dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL10);
++	peri &= ~(HP_CLKRST_I2C0_CLK_SRC_RC_FAST |
++		  HP_CLKRST_I2C0_CLK_DIV_NUM |
++		  HP_CLKRST_I2C0_CLK_DIV_NUMERATOR |
++		  HP_CLKRST_I2C0_CLK_DIV_DENOMINATOR);
++	peri |= HP_CLKRST_I2C0_CLK_EN |
++		FIELD_PREP(HP_CLKRST_I2C0_CLK_DIV_NUM,
++			   timing.clkm_div - 1);
++	writel(peri, dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL10);
++
++	writel(timing.scl_low - 1, dsi->i2c + I2C_SCL_LOW_PERIOD);
++	writel(timing.scl_high |
++	       FIELD_PREP(I2C_SCL_WAIT_HIGH, timing.scl_wait_high),
++	       dsi->i2c + I2C_SCL_HIGH_PERIOD);
++	writel(timing.sda_hold - 1, dsi->i2c + I2C_SDA_HOLD);
++	writel(timing.sda_sample - 1, dsi->i2c + I2C_SDA_SAMPLE);
++	writel(timing.setup - 1, dsi->i2c + I2C_SCL_RSTART_SETUP);
++	writel(timing.setup - 1, dsi->i2c + I2C_SCL_STOP_SETUP);
++	writel(timing.hold - 1, dsi->i2c + I2C_SCL_START_HOLD);
++	writel(timing.hold - 1, dsi->i2c + I2C_SCL_STOP_HOLD);
++	/* ESP-IDF writes the bus timeout, then the device's 2000-us timeout. */
++	writel(FIELD_PREP(I2C_TIMEOUT_VALUE, timing.bus_timeout) |
++	       I2C_TIMEOUT_ENABLE, dsi->i2c + I2C_TO);
++	writel(FIELD_PREP(I2C_FILTER_SCL_THRESHOLD,
++			  MICRONUX_DISPLAY_COLD_I2C_FILTER) |
++	       FIELD_PREP(I2C_FILTER_SDA_THRESHOLD,
++			  MICRONUX_DISPLAY_COLD_I2C_FILTER) |
++	       I2C_FILTER_SCL_ENABLE | I2C_FILTER_SDA_ENABLE,
++	       dsi->i2c + I2C_FILTER_CFG);
++	writel(FIELD_PREP(I2C_TIMEOUT_VALUE, timing.device_timeout) |
++	       I2C_TIMEOUT_ENABLE, dsi->i2c + I2C_TO);
++	writel(0, dsi->i2c + I2C_INT_ENA);
++	writel(~0U, dsi->i2c + I2C_INT_CLR);
++	writel(readl(dsi->i2c + I2C_CTR) | I2C_CONF_UPGATE,
++	       dsi->i2c + I2C_CTR);
++
++	if (!micronux_i2c_matches(dsi, &timing))
++		return -EIO;
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:COLD-INIT stage=i2c0 state=READY idf=v6.0.1 source=xtal-40000000 bus-hz=100000 sda=7 scl=8 filter=7 timeout-us=2000 irq=unused\n");
++	return 0;
++}
++
++static bool micronux_cold_i2c_gate(struct micronux_dsi *dsi)
++{
++	bool gated;
++	u32 value;
++
++	value = readl(dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL10);
++	writel(value & ~HP_CLKRST_I2C0_CLK_EN,
++	       dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL10);
++	value = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL2);
++	writel(value & ~HP_CLKRST_I2C0_APB_CLK_EN,
++	       dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL2);
++	gated = !(readl(dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL10) &
++		  HP_CLKRST_I2C0_CLK_EN) &&
++		!(readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL2) &
++		  HP_CLKRST_I2C0_APB_CLK_EN);
++	if (!gated)
++		return false;
++	if (dsi->cold_i2c_active)
++		micronux_cold_i2c_release_pins(dsi);
++	dsi->cold_i2c_active = false;
++	return true;
++}
++
++static void micronux_cold_ldo_calculate(struct micronux_dsi *dsi,
++					struct micronux_ldo_calibration *cal)
++{
++	u32 efuse, sys2;
++	u8 efuse_c = 0, efuse_k = 0, efuse_vos = 0;
++	u8 dref, mul;
++	int min_diff = 400000000;
++
++	sys2 = readl(dsi->efuse + EFUSE_RD_MAC_SYS_2);
++	cal->block_version =
++		FIELD_GET(EFUSE_BLOCK_VERSION_MAJOR, sys2) * 100 +
++		FIELD_GET(EFUSE_BLOCK_VERSION_MINOR, sys2);
++	cal->k_1000 = 1000;
++	cal->vos_1000 = 0;
++	cal->c_1000 = 1000;
++	if (cal->block_version >= 1) {
++		efuse = readl(dsi->efuse + EFUSE_RD_MAC_SYS_3);
++		efuse_k = FIELD_GET(EFUSE_LDO_VO3_K, efuse);
++		efuse_vos = FIELD_GET(EFUSE_LDO_VO3_VOS, efuse);
++		efuse_c = FIELD_GET(EFUSE_LDO_VO3_C, efuse);
++		if (efuse_k)
++			cal->k_1000 = efuse_k & 0x80 ?
++				-1 * (efuse_k & 0x7f) + 975 :
++				efuse_k + 975;
++		if (efuse_vos)
++			cal->vos_1000 = efuse_vos & 0x20 ?
++				-1 * (efuse_vos & 0x1f) - 3 :
++				efuse_vos - 3;
++		if (efuse_c)
++			cal->c_1000 = efuse_c & 0x20 ?
++				-1 * (efuse_c & 0x1f) + 990 :
++				efuse_c + 990;
++	}
++
++	cal->dref = 0;
++	cal->mul = 0;
++	for (dref = 0; dref < 16; dref++) {
++		int vref_20 = dref < 9 ? 10 + dref : 20 + (dref - 9) * 2;
++
++		for (mul = 0; mul < 8; mul++) {
++			int diff, vout_80000000;
++
++			vout_80000000 =
++				(vref_20 * cal->k_1000 + 20 * cal->vos_1000) *
++				(4000 + mul * cal->c_1000);
++			diff = MICRONUX_DISPLAY_COLD_LDO_MV * 80000 -
++				vout_80000000;
++			if (diff < 0)
++				diff = -diff;
++			if (diff < min_diff) {
++				min_diff = diff;
++				cal->dref = dref;
++				cal->mul = mul;
++			}
++		}
++	}
++}
++
++static bool micronux_cold_ldo_disable(struct micronux_dsi *dsi)
++{
++	u32 value;
++
++	value = readl(dsi->pmu + PMU_EXT_LDO_P0_0P2A);
++	writel(value & ~PMU_EXT_LDO_XPD,
++	       dsi->pmu + PMU_EXT_LDO_P0_0P2A);
++	dsi->cold_ldo_enabled = false;
++	return !(readl(dsi->pmu + PMU_EXT_LDO_P0_0P2A) & PMU_EXT_LDO_XPD);
++}
++
++static int micronux_cold_ldo_enable(struct micronux_dsi *dsi,
++				    struct micronux_ldo_calibration *cal)
++{
++	u32 ana, control;
++
++	if (MICRONUX_DISPLAY_COLD_LDO_CHANNEL != 3 ||
++	    MICRONUX_DISPLAY_COLD_LDO_UNIT != 2)
++		return -EINVAL;
++	micronux_cold_ldo_calculate(dsi, cal);
++
++	/*
++	 * ESP-IDF v6.0.1 maps channel VO3 (unit 2) to ext_ldo[1]. Apply
++	 * ldo_ll_adjust_voltage(), ldo_ll_set_owner(), ripple suppression,
++	 * then ldo_ll_enable() in the same order as esp_ldo_acquire_channel().
++	 */
++	control = readl(dsi->pmu + PMU_EXT_LDO_P0_0P2A);
++	writel(control & ~PMU_EXT_LDO_TIEH,
++	       dsi->pmu + PMU_EXT_LDO_P0_0P2A);
++	ana = readl(dsi->pmu + PMU_EXT_LDO_P0_0P2A_ANA);
++	ana &= ~PMU_EXT_LDO_DREF;
++	ana |= FIELD_PREP(PMU_EXT_LDO_DREF, cal->dref);
++	writel(ana, dsi->pmu + PMU_EXT_LDO_P0_0P2A_ANA);
++	ana = readl(dsi->pmu + PMU_EXT_LDO_P0_0P2A_ANA);
++	ana &= ~PMU_EXT_LDO_MUL;
++	ana |= FIELD_PREP(PMU_EXT_LDO_MUL, cal->mul);
++	writel(ana, dsi->pmu + PMU_EXT_LDO_P0_0P2A_ANA);
++	control = readl(dsi->pmu + PMU_EXT_LDO_P0_0P2A);
++	writel(control | PMU_EXT_LDO_FORCE_TIEH_SEL,
++	       dsi->pmu + PMU_EXT_LDO_P0_0P2A);
++	control = readl(dsi->pmu + PMU_EXT_LDO_P0_0P2A);
++	writel(control & ~PMU_EXT_LDO_TIEH_SEL,
++	       dsi->pmu + PMU_EXT_LDO_P0_0P2A);
++	ana = readl(dsi->pmu + PMU_EXT_LDO_P0_0P2A_ANA);
++	writel(ana | PMU_EXT_LDO_EN_VDET,
++	       dsi->pmu + PMU_EXT_LDO_P0_0P2A_ANA);
++	control = readl(dsi->pmu + PMU_EXT_LDO_P0_0P2A);
++	writel(control | PMU_EXT_LDO_XPD,
++	       dsi->pmu + PMU_EXT_LDO_P0_0P2A);
++	dsi->cold_ldo_enabled = true;
++
++	control = readl(dsi->pmu + PMU_EXT_LDO_P0_0P2A);
++	ana = readl(dsi->pmu + PMU_EXT_LDO_P0_0P2A_ANA);
++	if ((control & (PMU_EXT_LDO_FORCE_TIEH_SEL | PMU_EXT_LDO_XPD |
++			PMU_EXT_LDO_TIEH_SEL | PMU_EXT_LDO_TIEH)) !=
++	    (PMU_EXT_LDO_FORCE_TIEH_SEL | PMU_EXT_LDO_XPD) ||
++	    (ana & (PMU_EXT_LDO_DREF | PMU_EXT_LDO_MUL |
++		    PMU_EXT_LDO_EN_VDET)) !=
++	    (FIELD_PREP(PMU_EXT_LDO_DREF, cal->dref) |
++	     FIELD_PREP(PMU_EXT_LDO_MUL, cal->mul) |
++	     PMU_EXT_LDO_EN_VDET))
++		return -EIO;
++	return 0;
++}
++
++static bool micronux_cold_display_blocks_quiescent(struct micronux_dsi *dsi)
++{
++	u32 clocks0, clocks1, peri03, reset;
++
++	reset = readl(dsi->hp_clkrst + HP_CLKRST_HP_RST_EN0);
++	clocks0 = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL0);
++	clocks1 = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL1);
++	peri03 = readl(dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL03);
++	return (reset & (HP_CLKRST_GDMA_RESET |
++			 HP_CLKRST_DSI_BRIDGE_RESET)) ==
++		       (HP_CLKRST_GDMA_RESET | HP_CLKRST_DSI_BRIDGE_RESET) &&
++	       !(clocks0 & HP_CLKRST_GDMA_CPU_CLK_EN) &&
++	       !(clocks1 & (HP_CLKRST_GDMA_SYS_CLK_EN |
++			     HP_CLKRST_DSI_SYS_CLK_EN)) &&
++	       !(peri03 & (HP_CLKRST_DSI_DPHY_CFG_CLK_EN |
++			    HP_CLKRST_DSI_DPHY_PLL_REFCLK_EN |
++			    HP_CLKRST_DSI_DPI_CLK_EN));
++}
++
++static int micronux_cold_reissue_quiescent_commands(struct micronux_dsi *dsi)
++{
++	struct micronux_display_handoff_v3 *handoff = &dsi->cold_handoff;
++	int ret;
++
++	ret = micronux_i2c_write_reg8(dsi, handoff->i2c_address,
++				      handoff->backlight_register, 0);
++	if (ret)
++		return ret;
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:COLD-INIT stage=pwm-zero state=ACKED value=0\n");
++	ret = micronux_i2c_write_reg8(dsi, handoff->i2c_address,
++				      handoff->display_control_register,
++				      handoff->display_control_reset_prepare_command);
++	if (ret)
++		return ret;
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:COLD-INIT stage=reset-prepare state=ACKED command=0x13\n");
++	msleep(handoff->pwm_zero_settle_ms);
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:COLD-INIT stage=pwm-zero-settle state=ELAPSED duration-ms=100\n");
++	ret = micronux_i2c_write_reg8(dsi, handoff->i2c_address,
++				      handoff->display_control_register,
++				      handoff->display_control_reset_assert_command);
++	if (ret)
++		return ret;
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:COLD-INIT stage=reset-assert state=ACKED command=0x11 physical-state=unobserved\n");
++	msleep(handoff->reset_hold_ms);
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:COLD-INIT stage=reset-hold state=ELAPSED duration-ms=10\n");
++	return 0;
++}
++
++static void micronux_cold_fail_quiescent(struct micronux_dsi *dsi,
++					 const char *stage, int error)
++{
++	struct micronux_display_handoff_v3 *handoff = &dsi->cold_handoff;
++	bool display_blocks, i2c_gated, ldo_off;
++	int pwm_ret = -ENODEV, reset_ret = -ENODEV;
++	u8 address = handoff->i2c_address;
++	u8 control = handoff->display_control_register;
++	u8 pwm = handoff->backlight_register;
++	u8 reset = handoff->display_control_reset_assert_command;
++
++	if (dsi->cold_i2c_active) {
++		pwm_ret = micronux_i2c_write_reg8(dsi, address, pwm, 0);
++		reset_ret = micronux_i2c_write_reg8(dsi, address, control, reset);
++		if (!reset_ret)
++			msleep(handoff->reset_hold_ms);
++	}
++	ldo_off = micronux_cold_ldo_disable(dsi);
++	i2c_gated = micronux_cold_i2c_gate(dsi);
++	display_blocks = micronux_cold_display_blocks_quiescent(dsi);
++	dsi->display_state = MICRONUX_DISPLAY_STATE_FAILED_QUIESCENT;
++	dev_err(dsi->dev,
++		"MICRONUX:M9.2:COLD-INIT state=FAILED_QUIESCENT stage=%s error=%d pwm-zero-command=%s reset-assert-command=%s ldo3-xpd=%s i2c0=%s dsi-gdma=%s retry=reboot-only optical-state=unobserved fb=unregistered irq=unregistered\n",
++		stage, error, pwm_ret ? "failed" : "acked",
++		reset_ret ? "failed" : "acked", ldo_off ? "clear" : "error",
++		i2c_gated ? "gated" : "gate-error",
++		display_blocks ? "reset-off" : "state-error");
++}
++
++static int micronux_cold_initialize_ldo_stage(struct micronux_dsi *dsi)
++{
++	struct micronux_ldo_calibration cal = { };
++	int ret;
++
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:COLD-INIT state=START trigger=sysfs stage=i2c0-ldo3 writes=authorized-once\n");
++	ret = micronux_cold_i2c_initialize(dsi);
++	if (ret) {
++		micronux_cold_fail_quiescent(dsi, "i2c0", ret);
++		return ret;
++	}
++	ret = micronux_cold_reissue_quiescent_commands(dsi);
++	if (ret) {
++		micronux_cold_fail_quiescent(dsi, "safe-commands", ret);
++		return ret;
++	}
++	ret = micronux_cold_ldo_enable(dsi, &cal);
++	if (ret) {
++		micronux_cold_fail_quiescent(dsi, "ldo3", ret);
++		return ret;
++	}
++	if (!micronux_cold_display_blocks_quiescent(dsi)) {
++		ret = -EIO;
++		micronux_cold_fail_quiescent(dsi, "display-block-state", ret);
++		return ret;
++	}
++	if (!micronux_cold_i2c_gate(dsi)) {
++		ret = -EIO;
++		micronux_cold_fail_quiescent(dsi, "i2c0-release", ret);
++		return ret;
++	}
++	dsi->display_state = MICRONUX_DISPLAY_STATE_LDO_READY;
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:COLD-INIT state=LDO_READY ldo-channel=3 ldo-unit=2 voltage-mv=2500 efuse-block=%u k1000=%d vos1000=%d c1000=%d dref=%u mul=%u i2c0=released-gated pwm-zero-command=acked reset-prepare-command=acked reset-assert-command=acked physical-panel-state=unobserved dsi-module-reset=asserted dphy-clocks=off gdma-reset=asserted clocks=off fb=unregistered irq=unregistered next=native-dsi\n",
++		 cal.block_version, cal.k_1000, cal.vos_1000, cal.c_1000,
++		 cal.dref, cal.mul);
++	return 0;
++}
++
+ static ssize_t native_state_show(struct device *dev,
+ 				 struct device_attribute *attribute, char *buf)
+ {
+ 	struct micronux_dsi *dsi = dev_get_drvdata(dev);
++	enum micronux_display_state state = READ_ONCE(dsi->display_state);
+ 
+-	if (dsi->display_state == MICRONUX_DISPLAY_STATE_PROBED_QUIESCENT)
++	if (state == MICRONUX_DISPLAY_STATE_PROBED_QUIESCENT)
+ 		return sysfs_emit(buf, "PROBED_QUIESCENT\n");
+-	if (dsi->display_state == MICRONUX_DISPLAY_STATE_RUNTIME_READY)
++	if (state == MICRONUX_DISPLAY_STATE_COLD_INITIALIZING)
++		return sysfs_emit(buf, "COLD_INITIALIZING\n");
++	if (state == MICRONUX_DISPLAY_STATE_LDO_READY)
++		return sysfs_emit(buf, "LDO_READY\n");
++	if (state == MICRONUX_DISPLAY_STATE_FAILED_QUIESCENT)
++		return sysfs_emit(buf, "FAILED_QUIESCENT\n");
++	if (state == MICRONUX_DISPLAY_STATE_RUNTIME_READY)
+ 		return sysfs_emit(buf, "RUNTIME_READY\n");
+ 	return sysfs_emit(buf, "UNBOUND\n");
+ }
+ static DEVICE_ATTR_RO(native_state);
+ 
++static ssize_t cold_init_store(struct device *dev,
++			       struct device_attribute *attribute,
++			       const char *buf, size_t count)
++{
++	struct micronux_dsi *dsi = dev_get_drvdata(dev);
++	bool start;
++	int ret;
++
++	ret = kstrtobool(buf, &start);
++	if (ret)
++		return ret;
++	if (!start)
++		return -EINVAL;
++
++	mutex_lock(&dsi->mode_lock);
++	if (dsi->display_state !=
++	    MICRONUX_DISPLAY_STATE_PROBED_QUIESCENT) {
++		ret = -EALREADY;
++		goto unlock;
++	}
++	dsi->display_state = MICRONUX_DISPLAY_STATE_COLD_INITIALIZING;
++	ret = micronux_cold_initialize_ldo_stage(dsi);
++unlock:
++	mutex_unlock(&dsi->mode_lock);
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_WO(cold_init);
++
+ static int micronux_map_exact_resource(struct platform_device *pdev,
+ 				       const char *name,
+ 				       resource_size_t start,
+@@ -2931,11 +3617,16 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 			platform_set_drvdata(pdev, NULL);
+ 			goto release;
+ 		}
++		ret = device_create_file(&pdev->dev, &dev_attr_cold_init);
++		if (ret) {
++			device_remove_file(&pdev->dev, &dev_attr_native_state);
++			platform_set_drvdata(pdev, NULL);
++			goto release;
++		}
+ 		/*
+-		 * Stage B adds a rootfs-triggered cold_init transition here. It will
+-		 * request panel firmware, initialize and qualify scanout before reveal,
+-		 * and only then register fbdev. boot_ready remains the later reveal
+-		 * gate after userspace has rendered a complete status screen.
++		 * cold_init temporarily owns I2C0 for the ACKed quiescent adapter
++		 * command sequence, enables eFuse-calibrated LDO3, then releases I2C0.
++		 * Later stages add firmware, DSI/GDMA, qualification, and fbdev.
+ 		 */
+ 		dev_info(&pdev->dev,
+ 			 "MICRONUX:M9.2:COLD-PROBE state=PROBED_QUIESCENT abi=3 size=0x00c0 flags=0x00003fff profile=jd9365-waveshare-10.1 payload-crc=cea07f9b silicon=1.3 resources=validated source=none dsi-module-reset=asserted dphy-clocks=off ldo-control=off gdma-reset=asserted clocks=off dma-pms=validated irq-route=24:18 i2c=released commands=acked pwm-zero-write=acked reset-prepare-write=acked pwm-zero-settle=elapsed reset-assert-write=acked reset-hold=elapsed next=cold_init display-writes=0\n");
+@@ -3032,13 +3723,36 @@ release:
+ static void micronux_dsi_remove(struct platform_device *pdev)
+ {
+ 	struct micronux_dsi *dsi = platform_get_drvdata(pdev);
++	struct micronux_display_handoff_v3 *cold = &dsi->cold_handoff;
++	enum micronux_display_state state;
+ 	bool dark = false;
+ 	int ret;
+ 
+-	if (dsi->display_state == MICRONUX_DISPLAY_STATE_PROBED_QUIESCENT) {
++	if (dsi->required_handoff_abi == MICRONUX_DISPLAY_ABI_VERSION_V3) {
++		device_remove_file(&pdev->dev, &dev_attr_cold_init);
+ 		device_remove_file(&pdev->dev, &dev_attr_native_state);
++		state = READ_ONCE(dsi->display_state);
++		if (state == MICRONUX_DISPLAY_STATE_PROBED_QUIESCENT) {
++			dev_info(dsi->dev,
++				 "MICRONUX:M9.2:COLD-REMOVE state=PROBED_QUIESCENT display-writes=0\n");
++			framebuffer_release(dsi->info);
++			return;
++		}
++		mutex_lock(&dsi->mode_lock);
++		if (dsi->cold_i2c_active) {
++			micronux_i2c_write_reg8(dsi, cold->i2c_address,
++						cold->backlight_register, 0);
++			ret = micronux_i2c_write_reg8(dsi, cold->i2c_address,
++						      cold->display_control_register,
++						      cold->display_control_reset_assert_command);
++			if (!ret)
++				msleep(cold->reset_hold_ms);
++		}
++		micronux_cold_ldo_disable(dsi);
++		micronux_cold_i2c_gate(dsi);
++		mutex_unlock(&dsi->mode_lock);
+ 		dev_info(dsi->dev,
+-			 "MICRONUX:M9.2:COLD-REMOVE state=quiescent display-writes=0\n");
++			 "MICRONUX:M9.2:COLD-REMOVE state=QUIESCENT ldo3-xpd=clear i2c0=gated physical-panel-state=unobserved\n");
+ 		framebuffer_release(dsi->info);
+ 		return;
+ 	}
+-- 
+2.54.0.windows.1

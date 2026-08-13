@@ -1,0 +1,22 @@
+#!/bin/sh
+
+if ! /bin/busybox mount -t devtmpfs devtmpfs /dev; then
+	echo 'MICRONUX:M6:FAIL devtmpfs-mount'
+	exit 1
+fi
+if ! /bin/busybox mount -t proc proc /proc; then
+	echo 'MICRONUX:M6:FAIL proc-mount'
+	exit 1
+fi
+if ! /bin/busybox mount -t sysfs sysfs /sys; then
+	echo 'MICRONUX:M6:FAIL sysfs-mount'
+	exit 1
+fi
+
+export HOME=/root
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PS1='micronux# '
+
+echo 'MICRONUX:M6:SHELL ready console=ttyGS0 storage=microsd-idmac-sram-poll'
+exec /bin/busybox setsid /bin/busybox cttyhack /bin/busybox sh -i \
+	</dev/ttyGS0 >/dev/ttyGS0 2>&1

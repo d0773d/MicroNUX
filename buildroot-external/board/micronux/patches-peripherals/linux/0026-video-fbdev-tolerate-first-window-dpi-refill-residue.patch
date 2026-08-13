@@ -1,0 +1,40 @@
+From 40c1c409ad9dc9c945d59bbba4856a2cfc2ea7b5 Mon Sep 17 00:00:00 2001
+From: MicroNUX <micronux@example.invalid>
+Date: Tue, 11 Aug 2026 21:20:00 -0700
+Subject: [PATCH 26/46] video: fbdev: tolerate first-window DPI refill residue
+
+Kit C reports both DPI payload-path status bits while the stopped
+bridge refills its first dark frames.  Treat them as residue only at the
+end of the first qualification window.  Keep the second window strict so a
+persistent payload failure still blocks reveal and leaves the panel dark.
+
+Signed-off-by: MicroNUX <micronux@example.invalid>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 2075280..61831b2 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -87,7 +87,7 @@
+ #define DSI_HOST_INT_STATUS0_VALID	GENMASK(20, 0)
+ #define DSI_HOST_INT_STATUS1_VALID	(BIT(19) | GENMASK(12, 0))
+ #define DSI_HOST_INT_STATUS1_DPI_PATH	(BIT(7) | BIT(19))
+-#define DSI_HOST_INT_STATUS1_FB_STARTUP_GRACE BIT(19)
++#define DSI_HOST_INT_STATUS1_FB_STARTUP_GRACE DSI_HOST_INT_STATUS1_DPI_PATH
+ #define DSI_HOST_INT_STATUS1_FATAL	DSI_HOST_INT_STATUS1_DPI_PATH
+ #define DSI_HOST_VID_MODE_CFG_ACT	0x138
+ #define DSI_HOST_VID_PKT_STATUS		0x168
+@@ -1397,7 +1397,7 @@ static int micronux_restore_framebuffer_source(struct micronux_dsi *dsi,
+ 	/*
+ 	 * The bridge update has no completion acknowledgment.  Give its DPI
+-	 * input one dark qualification window, forgive one delayed underflow sample
+-	 * only, then keep the following qualification window strict.
++	 * input one dark qualification window, forgive DPI-path refill residue only,
++	 * then keep the following qualification window strict.
+ 	 */
+ 	transition_status_seen |= micronux_sample_host_status(dsi,
+ 			DSI_HOST_INT_STATUS1_FB_STARTUP_GRACE);
+-- 
+2.54.0.windows.1

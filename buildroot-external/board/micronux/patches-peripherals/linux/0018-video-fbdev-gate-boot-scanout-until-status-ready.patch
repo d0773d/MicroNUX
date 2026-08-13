@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MicroNUX <micronux@example.invalid>
+Date: Mon, 10 Aug 2026 18:10:00 -0700
+Subject: [PATCH 18/46] video: fbdev: gate boot scanout until status is ready
+
+fbcon unblanks the framebuffer as soon as it registers, several seconds before
+userspace finishes drawing the MicroNUX status page. Starting DSI scanout while
+that full-screen PSRAM update is in progress exposes the panel fallback color
+and consumes the memory bandwidth needed by the framebuffer writer.
+
+Keep both scanout and the backlight off until userspace writes boot_ready after
+rendering the status page. Then require four complete DMA frames within a
+bounded 500 ms startup window and without a latched bridge underrun before
+restoring the backlight. Normal fbdev blanking continues to work after this
+one-way boot readiness gate is opened.
+
+Signed-off-by: MicroNUX <micronux@example.invalid>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 101 +++++++++++++++---------------
+ 1 file changed, 52 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -25,7 +25,6 @@
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
+-#include <linux/workqueue.h>
+ 
+ #define MICRONUX_DISPLAY_MAGIC		0x4d4e5844
+ #define MICRONUX_DISPLAY_ABI_VERSION	1
+@@ -92,6 +91,7 @@
+ #define MICRONUX_FB_WRITE_CHUNK		512
+ #define MICRONUX_FB_WRITE_GAP_US	2
+-#define MICRONUX_SCANOUT_START_TIMEOUT_MS 100
++#define MICRONUX_SCANOUT_START_TIMEOUT_MS 500
++#define MICRONUX_SCANOUT_STABLE_FRAMES	4
+ 
+ #define MICRONUX_TOUCH_ADDRESS_PRIMARY	0x5d
+ #define MICRONUX_TOUCH_ADDRESS_BACKUP	0x14
+@@ -183,6 +183,7 @@ struct micronux_dsi {
+ 	u32 bridge_underruns;
+ 	bool scanout_ready;
+ 	bool scanout_active;
++	bool boot_display_ready;
+ 	u32 touch_reads;
+ 	u32 touch_errors;
+ 	u32 touch_poll_ms;
+@@ -190,7 +191,6 @@ struct micronux_dsi {
+ 	char touch_product[5];
+ 	bool touch_down;
+ 	struct hrtimer scanout_timer;
+-	struct delayed_work scanout_enable_work;
+ };
+ 
+ static int micronux_i2c_prepare_locked(struct micronux_dsi *dsi)
+@@ -725,6 +725,12 @@ static int micronux_fb_blank(int blank, struct fb_info *info)
+ 
+ 	if (!dsi->backlight)
+ 		return 0;
++	/* fbcon unblanks during registration, before the status page exists. */
++	if (blank == FB_BLANK_UNBLANK &&
++	    !READ_ONCE(dsi->boot_display_ready)) {
++		dsi->backlight->props.power = FB_BLANK_POWERDOWN;
++		return backlight_update_status(dsi->backlight);
++	}
+ 	if (!dsi->scanout_ready) {
+ 		dsi->backlight->props.power = blank;
+ 		return backlight_update_status(dsi->backlight);
+@@ -755,7 +761,9 @@ static int micronux_fb_blank(int blank, struct fb_info *info)
+ 	initial_frame = READ_ONCE(dsi->scanout_frames);
+ 	micronux_dma_start_reload(dsi);
+ 	micronux_select_framebuffer(dsi);
+-	ret = read_poll_timeout(READ_ONCE, frame, frame != initial_frame,
++	ret = read_poll_timeout(READ_ONCE, frame,
++				(u32)(frame - initial_frame) >=
++				MICRONUX_SCANOUT_STABLE_FRAMES,
+ 				1000, MICRONUX_SCANOUT_START_TIMEOUT_MS * 1000,
+ 				false, dsi->scanout_frames);
+ 	bridge_status = readl(dsi->bridge + DSI_BRG_INT_RAW);
+@@ -779,57 +787,51 @@ static int micronux_fb_blank(int blank, struct fb_info *info)
+ 	return ret;
+ }
+ 
+-static void micronux_enable_scanout_work(struct work_struct *work)
++static ssize_t boot_ready_show(struct device *dev,
++			       struct device_attribute *attribute, char *buf)
+ {
+-	struct micronux_dsi *dsi = container_of(to_delayed_work(work),
+-					       struct micronux_dsi,
+-					       scanout_enable_work);
+-	u32 bridge_status, frame, initial_frame;
++	struct micronux_dsi *dsi = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%u\n",
++			  READ_ONCE(dsi->boot_display_ready));
++}
++
++static ssize_t boot_ready_store(struct device *dev,
++				struct device_attribute *attribute,
++				const char *buf, size_t count)
++{
++	struct micronux_dsi *dsi = dev_get_drvdata(dev);
++	bool ready;
+ 	int ret;
+ 
+-	writel(DSI_BRG_INT_UNDERRUN, dsi->bridge + DSI_BRG_INT_CLR);
+-	writel(readl(dsi->bridge + DSI_BRG_DMA_BLOCK_INTERVAL) |
+-	       DSI_BRG_RAW_NUM_AUTO_RELOAD,
+-	       dsi->bridge + DSI_BRG_DMA_BLOCK_INTERVAL);
+-	writel(readl(dsi->bridge + DSI_BRG_RAW_NUM_CONFIG) |
+-	       DSI_BRG_RAW_NUM_TOTAL_SET,
+-	       dsi->bridge + DSI_BRG_RAW_NUM_CONFIG);
+-	initial_frame = READ_ONCE(dsi->scanout_frames);
+-	micronux_dma_start_reload(dsi);
+-	micronux_select_framebuffer(dsi);
+-	ret = read_poll_timeout(READ_ONCE, frame, frame != initial_frame,
+-				1000, MICRONUX_SCANOUT_START_TIMEOUT_MS * 1000,
+-				false, dsi->scanout_frames);
+-	bridge_status = readl(dsi->bridge + DSI_BRG_INT_RAW);
+-	if (ret || READ_ONCE(dsi->last_dma_error) ||
+-	    (bridge_status & DSI_BRG_INT_UNDERRUN)) {
+-		if (bridge_status & DSI_BRG_INT_UNDERRUN) {
+-			writel(DSI_BRG_INT_UNDERRUN,
+-			       dsi->bridge + DSI_BRG_INT_CLR);
+-			WRITE_ONCE(dsi->bridge_underruns, 1);
+-		}
+-		dev_err(dsi->dev,
+-			"MICRONUX:M7:DSI-SCANOUT state=fail reason=first-frame frames=%u error=%08x underruns=%u backlight=off\n",
+-			READ_ONCE(dsi->scanout_frames),
+-			READ_ONCE(dsi->last_dma_error),
+-			READ_ONCE(dsi->bridge_underruns));
+-		return;
++	ret = kstrtobool(buf, &ready);
++	if (ret)
++		return ret;
++	if (!ready) {
++		WRITE_ONCE(dsi->boot_display_ready, false);
++		ret = micronux_fb_blank(FB_BLANK_POWERDOWN, dsi->info);
++		return ret ? ret : count;
+ 	}
+-	hrtimer_start(&dsi->scanout_timer, ns_to_ktime(MICRONUX_DMA_POLL_NS),
+-		      HRTIMER_MODE_REL_PINNED);
+-	dsi->scanout_active = true;
+-	dsi->backlight->props.power = FB_BLANK_UNBLANK;
+-	ret = backlight_update_status(dsi->backlight);
++	if (!READ_ONCE(dsi->scanout_ready))
++		return -EAGAIN;
++
++	WRITE_ONCE(dsi->boot_display_ready, true);
++	ret = micronux_fb_blank(FB_BLANK_UNBLANK, dsi->info);
+ 	if (ret) {
+-		hrtimer_cancel(&dsi->scanout_timer);
++		WRITE_ONCE(dsi->boot_display_ready, false);
++		dsi->backlight->props.power = FB_BLANK_POWERDOWN;
++		backlight_update_status(dsi->backlight);
+ 		dev_err(dsi->dev,
+-			"MICRONUX:M7:DSI-SCANOUT state=fail reason=backlight error=%d\n",
++			"MICRONUX:M7:DSI-SCANOUT state=fail reason=boot-ready error=%d backlight=off\n",
+ 			ret);
+-		return;
++		return ret;
+ 	}
+ 	dev_info(dsi->dev,
+-		 "MICRONUX:M7:DSI-SCANOUT state=ready handoff=blanked-restart first-frame=confirmed scanout=hardware-reload-running backlight=restored\n");
++		 "MICRONUX:M7:DSI-SCANOUT state=ready handoff=blanked-restart stable-frames=%u scanout=hardware-reload-running backlight=restored reveal=userspace-ready\n",
++		 MICRONUX_SCANOUT_STABLE_FRAMES);
++	return count;
+ }
++static DEVICE_ATTR_RW(boot_ready);
+ 
+ static ssize_t pattern_show(struct device *dev,
+ 			    struct device_attribute *attribute, char *buf)
+@@ -937,6 +939,7 @@ static ssize_t touch_show(struct device *dev,
+ static DEVICE_ATTR_RO(touch);
+ 
+ static struct attribute *micronux_display_attrs[] = {
++	&dev_attr_boot_ready.attr,
+ 	&dev_attr_pattern.attr,
+ 	&dev_attr_ownership.attr,
+ 	&dev_attr_scanout.attr,
+@@ -1078,8 +1081,6 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 	dsi->dev = &pdev->dev;
+ 	dsi->info = info;
+ 	mutex_init(&dsi->lock);
+-	INIT_DELAYED_WORK(&dsi->scanout_enable_work,
+-			  micronux_enable_scanout_work);
+ 
+ 	dsi->host = devm_platform_ioremap_resource_byname(pdev, "dsi-host");
+ 	if (IS_ERR(dsi->host)) {
+@@ -1162,7 +1163,8 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 		     HRTIMER_MODE_REL_PINNED);
+ 	dsi->scanout_timer.function = micronux_dma_poll;
+ 	dsi->scanout_ready = true;
+-	schedule_delayed_work(&dsi->scanout_enable_work, 0);
++	dev_info(&pdev->dev,
++		 "MICRONUX:M7:DSI-SCANOUT state=waiting trigger=userspace-boot-ready scanout=stopped backlight=off\n");
+ 	dev_info(&pdev->dev,
+ 		 "MICRONUX:M7:DSI-LINUX state=ready owner=linux fb=fb%d resolution=%ux%u format=rgb565 dma=ch%u:auto-reload event=block-done-irq irq=%d health_poll_us=50 enable_delay_ms=0 underrun=monitored write_chunk=512 write_gap_us=2 backlight=linux mmap=denied\n",
+ 		 info->node, dsi->handoff.width, dsi->handoff.height,
+@@ -1189,7 +1191,6 @@ static void micronux_dsi_remove(struct platform_device *pdev)
+ {
+ 	struct micronux_dsi *dsi = platform_get_drvdata(pdev);
+ 
+-	cancel_delayed_work_sync(&dsi->scanout_enable_work);
+ 	dsi->scanout_ready = false;
+ 	hrtimer_cancel(&dsi->scanout_timer);
+ 	writel(0, dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA);
+-- 
+2.47.3

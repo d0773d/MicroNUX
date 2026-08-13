@@ -1,0 +1,31 @@
+From 26d1d4d0983ae2ab8a0cc4eddd6b8f8b59878972 Mon Sep 17 00:00:00 2001
+From: MicroNUX Project <micronux@example.invalid>
+Date: Sun, 9 Aug 2026 18:10:00 -0700
+Subject: [PATCH] elf2flt: align data for ESP32-P4 PMP
+
+MicroNUX uses one PMP TOR boundary between executable text and writable
+data.  The ESP32-P4 implements a 128-byte PMP granule, so make bFLT's data
+start meet that boundary without changing other Buildroot profiles.  The
+bFLT header is 64 bytes and remains mapped before text, so bias the linked
+data VMA by that amount instead of merely aligning the ELF data VMA.
+
+Signed-off-by: MicroNUX Project <micronux@example.invalid>
+---
+ elf2flt.ld.in | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/elf2flt.ld.in b/elf2flt.ld.in
+index 9d226bb..d790aaa 100644
+--- a/elf2flt.ld.in
++++ b/elf2flt.ld.in
+@@ -94,7 +94,7 @@ SECTIONS {
+ 		@SYMBOL_PREFIX@_etext = . ;
+ 	} > flatmem :text
+ 
+-	.data ALIGN(0x20): {
++	.data ALIGN(. + 0x40, 0x80) - 0x40 : {
+ 		@SYMBOL_PREFIX@_sdata = . ;
+ 		@SYMBOL_PREFIX@__data_start = . ;
+ 		@SYMBOL_PREFIX@data_start = . ;
+-- 
+2.43.0

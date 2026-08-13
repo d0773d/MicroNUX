@@ -1,0 +1,10 @@
+# M9 gives native Linux a fail-closed, cold JD9365 display contract. Do not
+# combine this profile with any loader-owned panel, probe, splash, or scanout.
+CONFIG_MICRONUX_M9_JD9365_COLD_RELINQUISH=y
+CONFIG_MICRONUX_M7_EARLY_UMODE_DENY=y
+# CONFIG_MICRONUX_MIPI_DSI is not set
+# CONFIG_MICRONUX_MIPI_DSI_PROBE is not set
+
+CONFIG_IDF_TARGET="esp32p4"
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y

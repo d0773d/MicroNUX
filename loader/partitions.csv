@@ -1,0 +1,6 @@
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+factory,    app,  factory, 0x10000,  0x1F0000,
+linux,      data, 0x40,    0x200000, 0x600000,
+dtb,        data, 0x41,    0x800000, 0x200000,
+metadata,   data, 0x42,    0xA00000, 0x10000,

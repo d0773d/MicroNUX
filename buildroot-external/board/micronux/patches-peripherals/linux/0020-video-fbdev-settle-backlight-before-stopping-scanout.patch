@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MicroNUX <micronux@example.invalid>
+Date: Mon, 10 Aug 2026 21:35:00 -0700
+Subject: [PATCH 20/46] video: fbdev: settle backlight before stopping scanout
+
+The Kit C display adapter accepts its brightness-off I2C write before the
+backlight has become physically dark. Stopping the only valid DPI stream
+immediately after that write exposes the JD9365 cyan no-video state during
+fbcon and application transitions.
+
+Keep the current valid frame scanning for the Waveshare-defined 100 ms
+backlight-off interval, then quiesce the bridge and GDMA. The existing
+unblank path already primes four complete frames while dark before restoring
+brightness.
+
+Signed-off-by: MicroNUX <micronux@example.invalid>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -92,6 +92,7 @@
+ #define MICRONUX_FB_WRITE_GAP_US	2
+ #define MICRONUX_SCANOUT_START_TIMEOUT_MS 500
+ #define MICRONUX_SCANOUT_STABLE_FRAMES	4
++#define MICRONUX_BACKLIGHT_OFF_SETTLE_MS 100
+ 
+ #define MICRONUX_TOUCH_ADDRESS_PRIMARY	0x5d
+ #define MICRONUX_TOUCH_ADDRESS_BACKUP	0x14
+@@ -741,6 +742,9 @@ static int micronux_fb_blank(int blank, struct fb_info *info)
+ 		ret = backlight_update_status(dsi->backlight);
+ 		if (ret || !dsi->scanout_active)
+ 			return ret;
++		/* Keep valid video present until the LEDs are physically dark. */
++		msleep(MICRONUX_BACKLIGHT_OFF_SETTLE_MS);
++		dev_dbg(dsi->dev, "backlight-off settled before scanout stop\n");
+ 		ret = micronux_dma_stop_reload(dsi);
+ 		if (!ret)
+ 			dsi->scanout_active = false;
+-- 
+2.47.3

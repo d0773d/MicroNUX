@@ -1,0 +1,126 @@
+menu "MicroNUX loader profile"
+
+    config MICRONUX_M7_EARLY_UMODE_DENY
+        bool "Install the M7 pre-v3 U-mode deny PMP baseline"
+        depends on IDF_TARGET_ESP32P4
+        depends on ESP32P4_SELECTS_REV_LESS_V3
+        depends on !ESP_SYSTEM_MEMPROT
+        default n
+        help
+            Select only with the tracked MicroNUX ESP-IDF v6.0.1 patch.
+            Before app_main(), CPU-control, internal RAM, ROM/flash, LP-memory,
+            and peripheral regions become unlocked PMP deny entries. M-mode
+            remains able to access them. Entries 7-10 and 12 stay free, and
+            the Linux handoff pair at 13-14 stays unlocked, so Linux can
+            install its verified U-return rules. The loader audits all 16
+            entries and refuses handoff on any mismatch.
+
+    config MICRONUX_M9_JD9365_COLD_RELINQUISH
+        bool "Relinquish a cold JD9365 display to M9 Linux"
+        depends on IDF_TARGET_ESP32P4
+        depends on ESP32P4_SELECTS_REV_LESS_V3
+        depends on !ESP_SYSTEM_MEMPROT
+        select MICRONUX_M7_EARLY_UMODE_DENY
+        default n
+        help
+            Prepare only the Waveshare 10.1-inch 800x1280 JD9365 resource
+            contract for native Linux cold initialization. The loader sends
+            acknowledged PWM-zero, reset-prepare, and reset-assert
+            commands to the write-only external controller, leaves the D-PHY
+            LDO, DSI host/bridge, and GDMA quiescent, reserves cleared
+            framebuffer and descriptor storage, and commits ABI v3 only as
+            the final write before the Linux jump. It never creates an
+            ESP-IDF panel, starts scanout, or draws a splash.
+
+    config MICRONUX_C6_SDIO_PROFILE
+        bool "Prepare ESP32-C6 SDIO slot 1 instead of microSD slot 0"
+        default n
+        help
+            Select the independent M6 networking profile. The loader resets
+            the onboard ESP32-C6, routes its four-bit SDIO bus through the
+            GPIO matrix, and hands DesignWare MSHC slot 1 to Linux. The
+            default storage profile remains slot 0 and does not reset the C6.
+
+    config MICRONUX_SDMMC_DUAL_SLOT_PROFILE
+        bool "Prepare both microSD slot 0 and ESP32-C6 SDIO slot 1"
+        depends on MICRONUX_C6_SDIO_PROFILE
+        default n
+        help
+            Extend the C6 profile with the onboard microSD connector. The
+            loader powers and routes both physical slots, then Linux owns the
+            shared controller and serializes requests between storage and
+            networking. Leave disabled for the isolated C6 regression profile.
+
+    config MICRONUX_C6_PROVISIONING
+        bool "Provision Wi-Fi through the factory ESP32-C6 before Linux"
+        depends on MICRONUX_C6_SDIO_PROFILE
+        default n
+        help
+            Run Espressif Unified Provisioning on the ESP32-P4 host before
+            Linux. The factory ESP32-C6 remains the ESP-Hosted slave on SDIO.
+            An unprovisioned device advertises over BLE, falls back to SoftAP
+            while idle, stores Wi-Fi configuration in the C6, and reboots
+            before the Linux handoff. Protocomm Security 2 is mandatory.
+
+    config MICRONUX_MIPI_DSI
+        bool "Enable the MIPI-DSI electrical proof profile"
+        depends on !MICRONUX_M9_JD9365_COLD_RELINQUISH
+        default n
+        help
+            Initialize one explicitly selected Waveshare MIPI-DSI panel and
+            show the ESP32-P4 hardware vertical color-bar pattern before the
+            Linux handoff. The scanout buffer stays in the loader-owned PSRAM
+            reservation; this option does not grant Linux framebuffer
+            ownership. Select only the exact attached panel profile.
+
+    config MICRONUX_MIPI_DSI_PROBE
+        bool "Probe for a MIPI display adapter without powering the panel"
+        depends on !MICRONUX_MIPI_DSI
+        depends on !MICRONUX_M9_JD9365_COLD_RELINQUISH
+        default n
+        help
+            Check only whether the Waveshare display adapter acknowledges at
+            I2C address 0x45. The probe performs no I2C register writes, does
+            not enable the panel rail, D-PHY, scanout, or backlight, and
+            releases the I2C controller before Linux handoff. An ACK proves
+            attachment, not the panel controller model; the physical label is
+            still required before selecting an electrical proof profile.
+
+    if MICRONUX_MIPI_DSI
+
+        choice MICRONUX_MIPI_PANEL
+            prompt "Attached Waveshare MIPI-DSI panel"
+            default MICRONUX_MIPI_PANEL_UNSELECTED
+            help
+                The controller, resolution, timing, and lane rate must match
+                the exact attached panel. The safe default refuses to power
+                the D-PHY, panel, or backlight.
+
+            config MICRONUX_MIPI_PANEL_UNSELECTED
+                bool "No panel selected (refuse to power display)"
+
+            config MICRONUX_MIPI_PANEL_JD9365_800_1280
+                bool "JD9365 800x1280 (10.1-DSI-TOUCH-A, Kit C)"
+
+            config MICRONUX_MIPI_PANEL_ILI9881C_720_1280
+                bool "ILI9881C 720x1280 (7-inch DSI Touch A)"
+
+            config MICRONUX_MIPI_PANEL_HX8394_720_1280
+                bool "HX8394 720x1280 (5-inch DSI Touch A)"
+
+            config MICRONUX_MIPI_PANEL_EK79007_1024_600
+                bool "EK79007 1024x600 (7-inch DSI Touch C)"
+
+        endchoice
+
+        config MICRONUX_MIPI_BACKLIGHT_PERCENT
+            int "Diagnostic backlight brightness percent"
+            range 1 100
+            default 25
+            help
+                Backlight level applied only after panel initialization and
+                the hardware color-bar generator both succeed.
+
+    endif
+
+endmenu

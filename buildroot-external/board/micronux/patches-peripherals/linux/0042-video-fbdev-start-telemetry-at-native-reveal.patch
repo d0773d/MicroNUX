@@ -1,0 +1,44 @@
+From 32df3ba16167162125fa41cf4f3476e3e801f361 Mon Sep 17 00:00:00 2001
+From: d0773d <dottedquad@gmail.com>
+Date: Wed, 12 Aug 2026 10:12:59 -0700
+Subject: [PATCH 42/46] video: fbdev: start telemetry at native reveal
+
+Cold publication resets telemetry before userspace renders the status
+page, so framebuffer updates before the panel may illuminate can leave
+historical latency samples in visible-runtime diagnostics.
+
+Reset again at the final dark health boundary, retaining the current
+arm timestamp so the crossing interval remains observable. This makes
+cumulative diagnostics describe visible runtime without hiding a slow
+transfer spanning reveal.
+
+Signed-off-by: d0773d <dottedquad@gmail.com>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 460454f..2089446 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -1432,6 +1432,9 @@ static int micronux_cold_i2c_initialize(struct micronux_dsi *dsi);
+ static int micronux_register_native_backlight(struct micronux_dsi *dsi);
+ static int
+ micronux_native_requalify_front(struct micronux_dsi *dsi, u64 target);
++static void
++micronux_native_reset_telemetry(struct micronux_dsi *dsi,
++				bool reset_last_arm);
+ static bool micronux_native_final_status_clean(struct micronux_dsi *dsi);
+ static const struct attribute_group micronux_native_runtime_group;
+ static void micronux_native_unregister_runtime_objects(struct micronux_dsi *dsi);
+@@ -1569,6 +1572,8 @@ static ssize_t micronux_native_boot_ready_store(struct micronux_dsi *dsi,
+ 	}
+ 
+ 	/* PWM is still the ACKed zero from Stage B; reveal control comes first. */
++	/* Start the visible-runtime epoch at the final dark boundary. */
++	micronux_native_reset_telemetry(dsi, false);
+ 	WRITE_ONCE(dsi->native_reveal_may_be_lit, true);
+ 	/* Publish possible illumination before the external gate write. */
+ 	smp_wmb();
+-- 
+2.54.0.windows.1

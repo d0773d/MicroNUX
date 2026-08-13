@@ -4,10 +4,15 @@ out/
 output/
 .cache/
 CMakeFiles/
+__pycache__/
+*.pyc
 
 # ESP-IDF generated state
 sdkconfig
-sdkconfig.old
+sdkconfig.*
+!sdkconfig.defaults
+!sdkconfig.*.defaults
+managed_components/
 
 # Buildroot generated output
 buildroot/output/

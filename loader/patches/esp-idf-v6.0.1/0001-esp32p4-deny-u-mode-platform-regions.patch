@@ -1,0 +1,134 @@
+From 9bc159ac466ca94d263957699313b1321737dcdf Mon Sep 17 00:00:00 2001
+From: MicroNUX <micronux@localhost>
+Date: Sun, 9 Aug 2026 10:00:00 -0700
+Subject: [PATCH] esp32p4: deny U-mode access to platform regions
+
+MicroNUX runs its NOMMU Linux kernel in M-mode and applications in U-mode.
+For pre-v3 ESP32-P4 silicon, make the bootloader and application PMP entries
+covering CPU control, internal RAM, ROM/flash, LP memory, and peripheral MMIO
+unlocked deny regions. M-mode continues to bypass these permissions while
+U-mode cannot use the platform grants that ESP-IDF normally locks.
+
+Reset every affected entry before installing it so permissions inherited from
+the bootloader cannot survive. Applying this patch to the verified M7
+worktree is the early-boot opt-in; the project Kconfig symbol separately makes
+the loader audit mandatory. Leave entries 7-10 and 12 unused so Linux can
+install its dynamic return rules, including the direct-address-space deny.
+---
+ .../port/esp32p4/cpu_region_protect.c         | 38 +++++++++++++++------
+ 1 file changed, 28 insertions(+), 10 deletions(-)
+
+diff --git a/components/esp_hw_support/port/esp32p4/cpu_region_protect.c b/components/esp_hw_support/port/esp32p4/cpu_region_protect.c
+index d56b6f8e4b..b750ce6e54 100644
+--- a/components/esp_hw_support/port/esp32p4/cpu_region_protect.c
++++ b/components/esp_hw_support/port/esp32p4/cpu_region_protect.c
+@@ -18,6 +18,8 @@
+ #include "soc/chip_revision.h"
+ #include "hal/config.h"
+ 
++#define MICRONUX_M7_EARLY_UMODE_DENY 1
++
+ #ifdef BOOTLOADER_BUILD
+ // Without L bit set
+ #define CONDITIONAL_NONE        0x0
+@@ -25,6 +27,14 @@
+ #define CONDITIONAL_RX          PMP_R | PMP_X
+ #define CONDITIONAL_RW          PMP_R | PMP_W
+ #define CONDITIONAL_RWX         PMP_R | PMP_W | PMP_X
++#elif MICRONUX_M7_EARLY_UMODE_DENY
++// MicroNUX runs the trusted kernel in M-mode; unlocked deny entries apply only
++// to U-mode and must remain writable for the later Linux overlay.
++#define CONDITIONAL_NONE        0x0
++#define CONDITIONAL_R           0x0
++#define CONDITIONAL_RX          0x0
++#define CONDITIONAL_RW          0x0
++#define CONDITIONAL_RWX         0x0
+ #else
+ // With L bit set
+ #define CONDITIONAL_NONE        NONE
+@@ -238,25 +248,33 @@ static void esp_cpu_configure_region_protection_rev_v3(void)
+ #else
+ static void esp_cpu_configure_region_protection_rev_less_than_v3(void)
+ {
++#if MICRONUX_M7_EARLY_UMODE_DENY
++    const unsigned NONE    = 0;
++    __attribute__((unused)) const unsigned R       = 0;
++    const unsigned RW      = 0;
++    const unsigned RX      = 0;
++    const unsigned RWX     = 0;
++#else
+     const unsigned NONE    = PMP_L;
+     __attribute__((unused)) const unsigned R       = PMP_L | PMP_R;
+     const unsigned RW      = PMP_L | PMP_R | PMP_W;
+     const unsigned RX      = PMP_L | PMP_R | PMP_X;
+     const unsigned RWX     = PMP_L | PMP_R | PMP_W | PMP_X;
++#endif
+ 
+     // 1. CPU Subsystem region - contains debug mode code and interrupt config registers
+     const uint32_t pmpaddr0 = PMPADDR_NAPOT(SOC_CPU_SUBSYSTEM_LOW, SOC_CPU_SUBSYSTEM_HIGH);
+-    PMP_ENTRY_SET(0, pmpaddr0, PMP_NAPOT | RW);
++    PMP_RESET_AND_ENTRY_SET(0, pmpaddr0, PMP_NAPOT | RW);
+     _Static_assert(SOC_CPU_SUBSYSTEM_LOW < SOC_CPU_SUBSYSTEM_HIGH, "Invalid CPU subsystem region");
+ 
+     // 2. CPU Peripherals
+     const uint32_t pmpaddr1 = PMPADDR_NAPOT(CPU_PERIPH_LOW, CPU_PERIPH_HIGH);
+-    PMP_ENTRY_SET(1, pmpaddr1, PMP_NAPOT | RW);
++    PMP_RESET_AND_ENTRY_SET(1, pmpaddr1, PMP_NAPOT | RW);
+     _Static_assert(CPU_PERIPH_LOW < CPU_PERIPH_HIGH, "Invalid CPU peripheral region");
+ 
+     // 3. I/D-ROM
+     const uint32_t pmpaddr2 = PMPADDR_NAPOT(SOC_IROM_MASK_LOW, SOC_IROM_MASK_HIGH);
+-    PMP_ENTRY_SET(2, pmpaddr2, PMP_NAPOT | RX);
++    PMP_RESET_AND_ENTRY_SET(2, pmpaddr2, PMP_NAPOT | RX);
+     _Static_assert(SOC_IROM_MASK_LOW < SOC_IROM_MASK_HIGH, "Invalid I/D-ROM region");
+ 
+     if (esp_cpu_dbgr_is_attached()) {
+@@ -264,8 +281,8 @@ static void esp_cpu_configure_region_protection_rev_less_than_v3(void)
+         ESP_FAULT_ASSERT(esp_cpu_dbgr_is_attached());
+ 
+         // 4. IRAM and DRAM
+-        PMP_ENTRY_SET(3, SOC_IRAM_LOW, NONE);
+-        PMP_ENTRY_SET(4, SOC_IRAM_HIGH, PMP_TOR | RWX);
++        PMP_RESET_AND_ENTRY_SET(3, SOC_IRAM_LOW, NONE);
++        PMP_RESET_AND_ENTRY_SET(4, SOC_IRAM_HIGH, PMP_TOR | RWX);
+         _Static_assert(SOC_IRAM_LOW < SOC_IRAM_HIGH, "Invalid RAM region");
+     } else {
+ #if CONFIG_ESP_SYSTEM_MEMPROT && CONFIG_ESP_SYSTEM_MEMPROT_PMP && !BOOTLOADER_BUILD
+@@ -282,8 +299,8 @@ static void esp_cpu_configure_region_protection_rev_less_than_v3(void)
+         PMP_ENTRY_SET(5, SOC_DRAM_HIGH, PMP_TOR | RW);
+ #else
+         // 4. IRAM and DRAM
+-        PMP_ENTRY_SET(3, SOC_IRAM_LOW, CONDITIONAL_NONE);
+-        PMP_ENTRY_SET(4, SOC_IRAM_HIGH, PMP_TOR | CONDITIONAL_RWX);
++        PMP_RESET_AND_ENTRY_SET(3, SOC_IRAM_LOW, CONDITIONAL_NONE);
++        PMP_RESET_AND_ENTRY_SET(4, SOC_IRAM_HIGH, PMP_TOR | CONDITIONAL_RWX);
+         _Static_assert(SOC_IRAM_LOW < SOC_IRAM_HIGH, "Invalid RAM region");
+ #endif
+     }
+@@ -323,7 +340,7 @@ static void esp_cpu_configure_region_protection_rev_less_than_v3(void)
+ #else
+     // 5. I_Cache / D_Cache (flash)
+     const uint32_t pmpaddr6 = PMPADDR_NAPOT(SOC_IROM_LOW, SOC_IROM_HIGH);
+-    PMP_ENTRY_SET(6, pmpaddr6, PMP_NAPOT | CONDITIONAL_RX);
++    PMP_RESET_AND_ENTRY_SET(6, pmpaddr6, PMP_NAPOT | CONDITIONAL_RX);
+     _Static_assert(SOC_IROM_LOW < SOC_IROM_HIGH, "Invalid I/D_Cache region");
+ #endif
+ 
+@@ -350,13 +367,13 @@ static void esp_cpu_configure_region_protection_rev_less_than_v3(void)
+     PMP_ENTRY_SET(14, SOC_RTC_IRAM_HIGH, PMP_TOR | RW);
+ #else
+     const uint32_t pmpaddr11 = PMPADDR_NAPOT(SOC_RTC_IRAM_LOW, SOC_RTC_IRAM_HIGH);
+-    PMP_ENTRY_SET(11, pmpaddr11, PMP_NAPOT | CONDITIONAL_RWX);
++    PMP_RESET_AND_ENTRY_SET(11, pmpaddr11, PMP_NAPOT | CONDITIONAL_RWX);
+     _Static_assert(SOC_RTC_IRAM_LOW < SOC_RTC_IRAM_HIGH, "Invalid RTC IRAM region");
+ #endif
+ 
+     // 7. Peripheral addresses
+     const uint32_t pmpaddr15 = PMPADDR_NAPOT(SOC_PERIPHERAL_LOW, SOC_PERIPHERAL_HIGH);
+-    PMP_ENTRY_SET(15, pmpaddr15, PMP_NAPOT | RW);
++    PMP_RESET_AND_ENTRY_SET(15, pmpaddr15, PMP_NAPOT | RW);
+     _Static_assert(SOC_PERIPHERAL_LOW < SOC_PERIPHERAL_HIGH, "Invalid peripheral region");
+ }
+ #endif
+-- 
+2.51.0.windows.1

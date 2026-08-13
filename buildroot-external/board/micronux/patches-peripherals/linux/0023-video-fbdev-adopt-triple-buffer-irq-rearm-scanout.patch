@@ -1,0 +1,1236 @@
+From 871d5d146acb535990eaef52a5347a5b08997ff6 Mon Sep 17 00:00:00 2001
+From: MicroNUX <micronux@example.invalid>
+Date: Tue, 11 Aug 2026 12:22:35 -0700
+Subject: [PATCH 23/46] video: fbdev: adopt triple-buffer IRQ-rearm scanout
+
+Replace the inherited circular auto-reload contract with ABI v2, three
+protected RGB565 framebuffers, and one marked-last descriptor per buffer.
+Render only into a non-front buffer, batch fbcon primitives into complete
+frames, rotate roles only after successful transfer-completion rearm, and
+explicitly rearm the selected descriptor from the DMA interrupt.
+
+Signed-off-by: MicroNUX <micronux@example.invalid>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 758 ++++++++++++++++++++++++++----
+ 1 file changed, 662 insertions(+), 96 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 56a7ded..107e361 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -3,10 +3,11 @@
+  * ESP32-P4 MIPI-DSI ownership-transfer framebuffer for MicroNUX.
+  *
+  * The loader performs the panel-specific DBI sequence, leaves DPI mode active,
+- * and publishes a bounded DW-GDMA descriptor ring through a versioned
++ * and publishes a bounded stopped DW-GDMA descriptor pool through a versioned
+  * contract. This driver validates that contract, claims every persistent
+- * controller resource, programs hardware auto-reload scanout, and exposes
+- * standard fbdev and backlight interfaces. No loader callback remains live.
++ * controller resource, owns three framebuffers, and explicitly rearms one
++ * complete-frame descriptor from each transfer-done interrupt. No loader
++ * callback remains live.
+  */
+ 
+ #include <linux/backlight.h>
+@@ -23,6 +24,7 @@
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/of.h>
++#include <linux/of_address.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+@@ -30,21 +32,41 @@
+ #include <linux/workqueue.h>
+ 
+ #define MICRONUX_DISPLAY_MAGIC		0x4d4e5844
+-#define MICRONUX_DISPLAY_ABI_VERSION	1
++#define MICRONUX_DISPLAY_ABI_VERSION	2
++#define MICRONUX_DISPLAY_BUFFER_COUNT	3
++#define MICRONUX_DISPLAY_OWNER_LINUX_PENDING 1
++
++#define MICRONUX_DISPLAY_HSYNC_PULSE	20
++#define MICRONUX_DISPLAY_HSYNC_BACK_PORCH 20
++#define MICRONUX_DISPLAY_HSYNC_FRONT_PORCH 40
++#define MICRONUX_DISPLAY_VSYNC_PULSE	4
++#define MICRONUX_DISPLAY_VSYNC_BACK_PORCH 10
++#define MICRONUX_DISPLAY_VSYNC_FRONT_PORCH 30
+ 
+ #define MICRONUX_DISPLAY_ACTIVE		BIT(0)
+ #define MICRONUX_DISPLAY_RGB565		BIT(1)
+-#define MICRONUX_DISPLAY_DMA_RING	BIT(2)
++#define MICRONUX_DISPLAY_DMA_IRQ_REARM	BIT(2)
+ #define MICRONUX_DISPLAY_I2C_TRANSFERRED BIT(3)
+ #define MICRONUX_DISPLAY_BACKLIGHT_BLANKED BIT(4)
++#define MICRONUX_DISPLAY_TRIPLE_BUFFER	BIT(5)
++#define MICRONUX_DISPLAY_LOADER_FRONT_VALID BIT(6)
+ #define MICRONUX_DISPLAY_REQUIRED_FLAGS	(MICRONUX_DISPLAY_ACTIVE | \
+ 					 MICRONUX_DISPLAY_RGB565 | \
+-					 MICRONUX_DISPLAY_DMA_RING | \
++					 MICRONUX_DISPLAY_DMA_IRQ_REARM | \
+ 					 MICRONUX_DISPLAY_I2C_TRANSFERRED | \
+-					 MICRONUX_DISPLAY_BACKLIGHT_BLANKED)
++					 MICRONUX_DISPLAY_BACKLIGHT_BLANKED | \
++					 MICRONUX_DISPLAY_TRIPLE_BUFFER | \
++					 MICRONUX_DISPLAY_LOADER_FRONT_VALID)
+ 
+ #define ESP32P4_LOADER_PSRAM_START	0x48000000
+ #define ESP32P4_LOADER_PSRAM_END		0x48400000
++#define ESP32P4_DISPLAY_POOL_START	0x49300000
++#define ESP32P4_DISPLAY_BACK_ADDRESS	0x49300000
++#define ESP32P4_DISPLAY_SPARE_ADDRESS	0x49500000
++#define ESP32P4_DISPLAY_POOL_END		0x49700000
++#define ESP32P4_DISPLAY_SLOT_SIZE	0x00200000
++#define ESP32P4_DISPLAY_GUARD_PATTERN	0xa5
++#define ESP32P4_DISPLAY_GUARD_WORD	0xa5a5a5a5
+ #define ESP32P4_INTERNAL_SRAM_START	0x4ff00000
+ #define ESP32P4_INTERNAL_SRAM_END	0x50000000
+ #define ESP32P4_DSI_FIFO_ADDRESS		0x50105000
+@@ -89,6 +111,7 @@
+ #define DSI_BRG_DPI_CONFIG_UPDATE	0x44
+ #define DSI_BRG_RAW_NUM_CONFIG		0x0c
+ #define DSI_BRG_RAW_NUM_TOTAL_SET	BIT(31)
++#define DSI_BRG_FIFO_FLOW_STATUS	0x14
+ #define DSI_BRG_DMA_BLOCK_INTERVAL	0x1c
+ #define DSI_BRG_RAW_NUM_AUTO_RELOAD	BIT(28)
+ #define DSI_BRG_INT_ENA			0x50
+@@ -119,12 +142,16 @@
+ #define DW_GDMA_INT_SCANOUT_MASK	(DW_GDMA_INT_BLOCK_TFR_DONE | \
+ 					 DW_GDMA_INT_DMA_TFR_DONE | \
+ 					 DW_GDMA_INT_ERROR_MASK)
+-#define DW_GDMA_CFG_MULTIBLOCK_MASK	GENMASK(3, 0)
+-#define DW_GDMA_CFG_SRC_RELOAD		BIT(0)
+-#define DW_GDMA_CFG_DST_RELOAD		BIT(2)
++#define DW_GDMA_LLP_MEMORY_PORT		BIT(0)
++#define MICRONUX_DMA_BLOCK_TRANSFER_SIZE 0x0003e7ff
++#define MICRONUX_DMA_DESCRIPTOR_CTRL_LO	0x001e1b41
++#define MICRONUX_DMA_DESCRIPTOR_CTRL_HI	0x400f87c0
++#define MICRONUX_DMA_CHANNEL_CFG_LO	0x0000000f
++#define MICRONUX_DMA_CHANNEL_CFG_HI	0x0a020001
+ #define MICRONUX_HEALTH_POLL_MS		50
+ #define MICRONUX_FB_WRITE_CHUNK		512
+ #define MICRONUX_FB_WRITE_GAP_US	2
++#define MICRONUX_RENDER_COMMIT_MS	20
+ #define MICRONUX_SCANOUT_START_TIMEOUT_MS 500
+ #define MICRONUX_SCANOUT_STABLE_FRAMES	4
+ #define MICRONUX_FRAME_REVEAL_RECENT_MS	250
+@@ -137,6 +164,7 @@
+ #define MICRONUX_FAULT_UNDERRUN		1
+ #define MICRONUX_FAULT_STALE_FRAME	2
+ #define MICRONUX_FAULT_DSI_HOST		3
++#define MICRONUX_FAULT_POOL_GUARD	4
+ #define MICRONUX_STALE_POLL_LIMIT	6
+ 
+ #define MICRONUX_TOUCH_ADDRESS_PRIMARY	0x5d
+@@ -178,18 +206,20 @@
+ 	((bytes) | ((nack) ? BIT(10) : 0) | (I2C_CMD_READ << 11))
+ 
+ #define DMA_LLI_SAR			0x00
++#define DMA_LLI_SAR_HI			0x04
+ #define DMA_LLI_DAR			0x08
++#define DMA_LLI_DAR_HI			0x0c
+ #define DMA_LLI_BLOCK_TS		0x10
+ #define DMA_LLI_LLP			0x18
++#define DMA_LLI_LLP_HI			0x1c
+ #define DMA_LLI_CTRL_LO		0x20
+ #define DMA_LLI_CTRL_HI		0x24
+ #define DMA_LLI_VALID			BIT(31)
+-#define DMA_LLI_LAST			BIT(30)
+-#define DMA_LLI_INTERRUPT		BIT(26)
+ #define MICRONUX_DMA_DESCRIPTOR_SIZE	64
+-#define MICRONUX_DMA_DESCRIPTOR_COUNT	4
++#define MICRONUX_FRAMEBUFFER_ALIGNMENT	8
++#define MICRONUX_DMA_DESCRIPTOR_COUNT	MICRONUX_DISPLAY_BUFFER_COUNT
+ 
+-struct micronux_display_handoff_v1 {
++struct micronux_display_handoff_v2 {
+ 	u32 magic;
+ 	u16 abi_version;
+ 	u16 struct_size;
+@@ -197,12 +227,26 @@ struct micronux_display_handoff_v1 {
+ 	u32 width;
+ 	u32 height;
+ 	u32 stride;
+-	u32 framebuffer_address;
++	u32 pixel_clock_hz;
++	u32 lane_bit_rate_mbps;
++	u32 data_lanes;
++	u32 buffer_count;
++	u32 ownership_state;
++	u32 hsync_pulse_width;
++	u32 hsync_back_porch;
++	u32 hsync_front_porch;
++	u32 vsync_pulse_width;
++	u32 vsync_back_porch;
++	u32 vsync_front_porch;
++	u32 framebuffer_address[MICRONUX_DISPLAY_BUFFER_COUNT];
+ 	u32 framebuffer_size;
+ 	u32 dma_descriptor_address;
+ 	u32 dma_descriptor_size;
++	u32 dma_descriptor_count;
+ 	u32 dma_channel;
++	u32 dsi_fifo_address;
+ 	u32 i2c_address;
++	u32 display_control_register;
+ 	u32 backlight_register;
+ 	u32 backlight_brightness;
+ 	u32 crc32;
+@@ -215,7 +259,8 @@ struct micronux_dsi {
+ 	void __iomem *gdma;
+ 	void __iomem *i2c;
+ 	void __iomem *channel;
+-	void __iomem *descriptor;
++	void __iomem *descriptor[MICRONUX_DISPLAY_BUFFER_COUNT];
++	void __iomem *framebuffer[MICRONUX_DISPLAY_BUFFER_COUNT];
+ 	struct fb_info *info;
+ 	struct backlight_device *backlight;
+ 	struct input_dev *touch;
+@@ -223,14 +268,25 @@ struct micronux_dsi {
+ 	struct mutex lock;
+ 	/* Serializes scanout source and backlight transitions. */
+ 	struct mutex mode_lock;
++	/* Serializes fbdev writes and back-buffer preparation. */
++	struct mutex render_lock;
++	struct delayed_work render_work;
++	/* Protects front, queued, and render buffer roles from the DMA IRQ. */
++	spinlock_t state_lock;
+ 	/* Serializes the read-to-clear DSI host status registers. */
+ 	spinlock_t host_status_lock;
+-	struct micronux_display_handoff_v1 handoff;
++	struct micronux_display_handoff_v2 handoff;
+ 	u32 uncached_offset;
+ 	u32 palette[16];
+ 	u32 scanout_frames;
++	u32 rearm_attempts;
++	u32 rearm_failures;
++	u32 flip_requests;
++	u32 flip_completions;
++	u32 source_generation;
+ 	u32 last_dma_error;
+ 	u32 bridge_underruns;
++	u32 pool_guard_errors;
+ 	u32 host_error0;
+ 	u32 host_error1;
+ 	u32 vpg_dpi_status1;
+@@ -240,6 +296,11 @@ struct micronux_dsi {
+ 	unsigned long last_frame_jiffies;
+ 	u8 watchdog_stale_polls;
+ 	u8 applied_brightness;
++	u8 front_index;
++	u8 render_index;
++	s8 queued_index;
++	bool render_needs_sync;
++	bool render_dirty;
+ 	bool scanout_ready;
+ 	bool scanout_active;
+ 	bool boot_display_ready;
+@@ -446,6 +507,43 @@ static bool micronux_host_status_clean(struct micronux_dsi *dsi)
+ 	       !READ_ONCE(dsi->host_error1);
+ }
+ 
++static void micronux_initialize_pool_guards(struct micronux_dsi *dsi)
++{
++	u32 guard_size = ESP32P4_DISPLAY_SLOT_SIZE -
++			 dsi->handoff.framebuffer_size;
++	u8 index;
++
++	for (index = 1; index < MICRONUX_DISPLAY_BUFFER_COUNT; index++)
++		memset_io(dsi->framebuffer[index] +
++			  dsi->handoff.framebuffer_size,
++			  ESP32P4_DISPLAY_GUARD_PATTERN, guard_size);
++}
++
++static bool micronux_pool_guards_valid(struct micronux_dsi *dsi, bool full)
++{
++	u32 guard_size = ESP32P4_DISPLAY_SLOT_SIZE -
++			 dsi->handoff.framebuffer_size;
++	u32 offset;
++	u8 index;
++
++	for (index = 1; index < MICRONUX_DISPLAY_BUFFER_COUNT; index++) {
++		void __iomem *guard = dsi->framebuffer[index] +
++				      dsi->handoff.framebuffer_size;
++
++		if (readl(guard) != ESP32P4_DISPLAY_GUARD_WORD ||
++		    readl(guard + guard_size - sizeof(u32)) !=
++			    ESP32P4_DISPLAY_GUARD_WORD)
++			return false;
++		if (!full)
++			continue;
++		for (offset = sizeof(u32); offset < guard_size - sizeof(u32);
++		     offset += sizeof(u32))
++			if (readl(guard + offset) != ESP32P4_DISPLAY_GUARD_WORD)
++				return false;
++	}
++	return true;
++}
++
+ static bool micronux_source_policy_valid(struct micronux_dsi *dsi,
+ 					 bool vpg);
+ 
+@@ -462,6 +560,7 @@ static bool micronux_visible_source_valid(struct micronux_dsi *dsi)
+ 	if (!READ_ONCE(dsi->boot_display_ready) ||
+ 	    !READ_ONCE(dsi->scanout_active) ||
+ 	    READ_ONCE(dsi->fault_bits) ||
++	    !micronux_pool_guards_valid(dsi, false) ||
+ 	    !micronux_host_status_clean(dsi) ||
+ 	    READ_ONCE(dsi->last_dma_error) ||
+ 	    (readl(dsi->bridge + DSI_BRG_INT_RAW) & DSI_BRG_INT_UNDERRUN))
+@@ -739,10 +838,148 @@ static int micronux_fb_mmap(struct fb_info *info, struct vm_area_struct *vma)
+ 	return -EPERM;
+ }
+ 
++static void micronux_set_render_mapping_locked(struct micronux_dsi *dsi)
++{
++	u8 index = dsi->render_index;
++
++	dsi->info->screen_base = dsi->framebuffer[index];
++	dsi->info->fix.smem_start = dsi->handoff.framebuffer_address[index];
++}
++
++static void micronux_copy_frame(struct micronux_dsi *dsi, u8 destination,
++				u8 source)
++{
++	u8 __iomem *dst = dsi->framebuffer[destination];
++	u8 __iomem *src = dsi->framebuffer[source];
++	u32 offset = 0;
++
++	while (offset < dsi->handoff.framebuffer_size) {
++		u32 chunk = min_t(u32, MICRONUX_FB_WRITE_CHUNK,
++				  dsi->handoff.framebuffer_size - offset);
++
++		fb_memcpy_toio(dst + offset,
++			       (const void __force *)(src + offset), chunk);
++		offset += chunk;
++		if (offset < dsi->handoff.framebuffer_size)
++			udelay(MICRONUX_FB_WRITE_GAP_US);
++	}
++}
++
++/* Caller holds render_lock; the source stays front or queued while copied. */
++static void micronux_prepare_render_locked(struct micronux_dsi *dsi)
++{
++	unsigned long flags;
++	u8 destination, source;
++
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	if (!dsi->render_needs_sync) {
++		spin_unlock_irqrestore(&dsi->state_lock, flags);
++		return;
++	}
++	destination = dsi->render_index;
++	source = dsi->queued_index >= 0 ? dsi->queued_index :
++		 dsi->front_index;
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++
++	micronux_copy_frame(dsi, destination, source);
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	dsi->render_needs_sync = false;
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++}
++
++static u8 micronux_free_buffer_locked(struct micronux_dsi *dsi,
++				      u8 front, s8 queued)
++{
++	u8 index;
++
++	for (index = 0; index < MICRONUX_DISPLAY_BUFFER_COUNT; index++)
++		if (index != front && index != queued)
++			return index;
++	return dsi->render_index;
++}
++
++/* Publish a complete back buffer; the IRQ selects it at a frame boundary. */
++static void micronux_queue_render_locked(struct micronux_dsi *dsi)
++{
++	unsigned long flags;
++	u8 rendered = dsi->render_index;
++	u8 front;
++	s8 queued;
++
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	if (READ_ONCE(dsi->fault_bits)) {
++		spin_unlock_irqrestore(&dsi->state_lock, flags);
++		return;
++	}
++	if (!dsi->scanout_active) {
++		if (dsi->queued_index != rendered)
++			dsi->flip_requests++;
++		dsi->queued_index = rendered;
++		spin_unlock_irqrestore(&dsi->state_lock, flags);
++		return;
++	}
++	dsi->queued_index = rendered;
++	dsi->flip_requests++;
++	front = dsi->front_index;
++	queued = dsi->queued_index;
++	dsi->render_index = micronux_free_buffer_locked(dsi, front, queued);
++	dsi->render_needs_sync = true;
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++	micronux_set_render_mapping_locked(dsi);
++}
++
++static void micronux_commit_render_locked(struct micronux_dsi *dsi)
++{
++	if (!dsi->render_dirty)
++		return;
++	dsi->render_dirty = false;
++	micronux_queue_render_locked(dsi);
++}
++
++static void micronux_render_work(struct work_struct *work)
++{
++	struct micronux_dsi *dsi = container_of(to_delayed_work(work),
++						 struct micronux_dsi, render_work);
++
++	mutex_lock(&dsi->render_lock);
++	micronux_commit_render_locked(dsi);
++	mutex_unlock(&dsi->render_lock);
++}
++
++/* Batch fbcon primitives into one complete page flip per display interval. */
++static void micronux_mark_render_dirty_locked(struct micronux_dsi *dsi)
++{
++	dsi->render_dirty = true;
++	mod_delayed_work(system_wq, &dsi->render_work,
++			 msecs_to_jiffies(MICRONUX_RENDER_COMMIT_MS));
++}
++
++static void micronux_flush_render(struct micronux_dsi *dsi)
++{
++	cancel_delayed_work_sync(&dsi->render_work);
++	mutex_lock(&dsi->render_lock);
++	micronux_commit_render_locked(dsi);
++	mutex_unlock(&dsi->render_lock);
++}
++
++static ssize_t micronux_fb_read(struct fb_info *info, char __user *buf,
++				size_t count, loff_t *ppos)
++{
++	struct micronux_dsi *dsi = info->par;
++	ssize_t ret;
++
++	mutex_lock(&dsi->render_lock);
++	micronux_prepare_render_locked(dsi);
++	ret = fb_io_read(info, buf, count, ppos);
++	mutex_unlock(&dsi->render_lock);
++	return ret;
++}
++
+ static ssize_t micronux_fb_write(struct fb_info *info,
+ 				 const char __user *buf,
+ 				 size_t count, loff_t *ppos)
+ {
++	struct micronux_dsi *dsi = info->par;
+ 	unsigned long offset = *ppos;
+ 	unsigned long total_size = info->screen_size;
+ 	u8 __iomem *dst;
+@@ -750,23 +987,29 @@ static ssize_t micronux_fb_write(struct fb_info *info,
+ 	ssize_t written = 0;
+ 	int error = 0;
+ 
++	mutex_lock(&dsi->render_lock);
++	micronux_prepare_render_locked(dsi);
+ 	if (!info->screen_base)
+-		return -ENODEV;
++		goto no_device;
+ 	if (!total_size)
+ 		total_size = info->fix.smem_len;
+-	if (offset > total_size)
+-		return -EFBIG;
++	if (offset > total_size) {
++		error = -EFBIG;
++		goto out_unlock;
++	}
+ 	if (count > total_size - offset) {
+ 		count = total_size - offset;
+ 		error = -ENOSPC;
+ 	}
+ 	if (!count)
+-		return error;
++		goto out_unlock;
+ 
+ 	bounce = kmalloc(min_t(size_t, count, MICRONUX_FB_WRITE_CHUNK),
+ 			 GFP_KERNEL);
+-	if (!bounce)
+-		return -ENOMEM;
++	if (!bounce) {
++		error = -ENOMEM;
++		goto out_unlock;
++	}
+ 	dst = (u8 __iomem *)info->screen_base + offset;
+ 
+ 	while (count) {
+@@ -795,60 +1038,119 @@ static ssize_t micronux_fb_write(struct fb_info *info,
+ 	}
+ 
+ 	kfree(bounce);
++	if (written)
++		micronux_mark_render_dirty_locked(dsi);
++out_unlock:
++	mutex_unlock(&dsi->render_lock);
+ 	return written ? written : error;
++no_device:
++	mutex_unlock(&dsi->render_lock);
++	return -ENODEV;
++}
++
++static void micronux_fb_fillrect(struct fb_info *info,
++				 const struct fb_fillrect *rect)
++{
++	struct micronux_dsi *dsi = info->par;
++
++	mutex_lock(&dsi->render_lock);
++	micronux_prepare_render_locked(dsi);
++	cfb_fillrect(info, rect);
++	micronux_mark_render_dirty_locked(dsi);
++	mutex_unlock(&dsi->render_lock);
++}
++
++static void micronux_fb_copyarea(struct fb_info *info,
++				 const struct fb_copyarea *area)
++{
++	struct micronux_dsi *dsi = info->par;
++
++	mutex_lock(&dsi->render_lock);
++	micronux_prepare_render_locked(dsi);
++	cfb_copyarea(info, area);
++	micronux_mark_render_dirty_locked(dsi);
++	mutex_unlock(&dsi->render_lock);
++}
++
++static void micronux_fb_imageblit(struct fb_info *info,
++				  const struct fb_image *image)
++{
++	struct micronux_dsi *dsi = info->par;
++
++	mutex_lock(&dsi->render_lock);
++	micronux_prepare_render_locked(dsi);
++	cfb_imageblit(info, image);
++	micronux_mark_render_dirty_locked(dsi);
++	mutex_unlock(&dsi->render_lock);
+ }
+ 
+ static int micronux_fb_blank(int blank, struct fb_info *info);
+ 
+ static const struct fb_ops micronux_fb_ops = {
+ 	.owner = THIS_MODULE,
+-	.fb_read = fb_io_read,
++	.fb_read = micronux_fb_read,
+ 	.fb_write = micronux_fb_write,
+-	.fb_fillrect = cfb_fillrect,
+-	.fb_copyarea = cfb_copyarea,
+-	.fb_imageblit = cfb_imageblit,
++	.fb_fillrect = micronux_fb_fillrect,
++	.fb_copyarea = micronux_fb_copyarea,
++	.fb_imageblit = micronux_fb_imageblit,
+ 	.fb_mmap = micronux_fb_mmap,
+ 	.fb_blank = micronux_fb_blank,
+ 	.fb_setcolreg = micronux_setcolreg,
+ };
+ 
+-static void micronux_dma_start_reload(struct micronux_dsi *dsi)
++static int micronux_dma_arm_frame(struct micronux_dsi *dsi, u8 index)
++{
++	u32 channel = BIT(dsi->handoff.dma_channel);
++	void __iomem *descriptor = dsi->descriptor[index];
++
++	WRITE_ONCE(dsi->rearm_attempts,
++		   READ_ONCE(dsi->rearm_attempts) + 1);
++	writel(MICRONUX_DMA_DESCRIPTOR_CTRL_HI | DMA_LLI_VALID,
++	       descriptor + DMA_LLI_CTRL_HI);
++	writel(MICRONUX_DMA_CHANNEL_CFG_LO,
++	       dsi->channel + DW_GDMA_CH_CFG_LO);
++	writel(MICRONUX_DMA_CHANNEL_CFG_HI,
++	       dsi->channel + DW_GDMA_CH_CFG_HI);
++	writel((dsi->handoff.dma_descriptor_address +
++	       index * MICRONUX_DMA_DESCRIPTOR_SIZE) |
++	       DW_GDMA_LLP_MEMORY_PORT,
++	       dsi->channel + DW_GDMA_CH_LLP);
++	writel(0, dsi->channel + DW_GDMA_CH_LLP + sizeof(u32));
++	/* Publish the descriptor and channel configuration before channel enable. */
++	wmb();
++	writel(channel | (channel << 8), dsi->gdma + DW_GDMA_CHEN);
++	if (!(readl(dsi->gdma + DW_GDMA_CHEN) & channel)) {
++		WRITE_ONCE(dsi->rearm_failures,
++			   READ_ONCE(dsi->rearm_failures) + 1);
++		return -EIO;
++	}
++	return 0;
++}
++
++static int micronux_dma_start_frame(struct micronux_dsi *dsi, u8 index)
+ {
+ 	u32 channel = BIT(dsi->handoff.dma_channel);
+ 	u32 abort_mask = channel | (channel << 8);
+-	u32 config, control, state;
++	u32 state;
+ 
+ 	writel(channel << 8, dsi->gdma + DW_GDMA_CHEN);
+ 	writel(abort_mask, dsi->gdma + DW_GDMA_CHABORT);
+ 	if (readl_poll_timeout_atomic(dsi->gdma + DW_GDMA_CHABORT, state,
+ 				      !(state & abort_mask), 1, 100)) {
+ 		WRITE_ONCE(dsi->last_dma_error, BIT(31));
+-		return;
++		return -ETIMEDOUT;
+ 	}
+-
+-	writel(readl(dsi->descriptor + DMA_LLI_SAR),
+-	       dsi->channel + DW_GDMA_CH_SAR);
+-	writel(readl(dsi->descriptor + DMA_LLI_DAR),
+-	       dsi->channel + DW_GDMA_CH_DAR);
+-	writel(readl(dsi->descriptor + DMA_LLI_BLOCK_TS),
+-	       dsi->channel + DW_GDMA_CH_BLOCK_TS);
+-	writel(readl(dsi->descriptor + DMA_LLI_CTRL_LO),
+-	       dsi->channel + DW_GDMA_CH_CTL_LO);
+-	control = readl(dsi->descriptor + DMA_LLI_CTRL_HI);
+-	control &= ~(DMA_LLI_VALID | DMA_LLI_LAST);
+-	control |= DMA_LLI_INTERRUPT;
+-	writel(control, dsi->channel + DW_GDMA_CH_CTL_HI);
+-	config = readl(dsi->channel + DW_GDMA_CH_CFG_LO);
+-	config &= ~DW_GDMA_CFG_MULTIBLOCK_MASK;
+-	config |= DW_GDMA_CFG_SRC_RELOAD | DW_GDMA_CFG_DST_RELOAD;
+-	writel(config, dsi->channel + DW_GDMA_CH_CFG_LO);
+-	wmb();
+-	writel(channel | (channel << 8), dsi->gdma + DW_GDMA_CHEN);
++	writel(~0U, dsi->channel + DW_GDMA_CH_INT_CLEAR);
++	return micronux_dma_arm_frame(dsi, index);
+ }
+ 
+ static irqreturn_t micronux_dma_irq(int irq, void *data)
+ {
+ 	struct micronux_dsi *dsi = data;
++	unsigned long flags;
++	u8 next_index;
++	bool faulted;
++	bool rearm_failed = false;
+ 	u32 status;
+ 
+ 	status = readl(dsi->channel + DW_GDMA_CH_INT_STATUS);
+@@ -860,13 +1162,40 @@ static irqreturn_t micronux_dma_irq(int irq, void *data)
+ 			   status & DW_GDMA_INT_ERROR_MASK);
+ 		micronux_latch_fault(dsi, MICRONUX_FAULT_DMA);
+ 	}
+-	if (status & DW_GDMA_INT_BLOCK_TFR_DONE) {
++	if (status & DW_GDMA_INT_DMA_TFR_DONE) {
+ 		writel(readl(dsi->bridge + DSI_BRG_RAW_NUM_CONFIG) |
+ 		       DSI_BRG_RAW_NUM_TOTAL_SET,
+ 		       dsi->bridge + DSI_BRG_RAW_NUM_CONFIG);
+ 		WRITE_ONCE(dsi->scanout_frames,
+ 			   READ_ONCE(dsi->scanout_frames) + 1);
+ 		WRITE_ONCE(dsi->last_frame_jiffies, jiffies);
++		spin_lock_irqsave(&dsi->state_lock, flags);
++		if (dsi->scanout_active &&
++		    !(status & DW_GDMA_INT_ERROR_MASK)) {
++			faulted = READ_ONCE(dsi->fault_bits);
++			next_index = !faulted && dsi->queued_index >= 0 ?
++				dsi->queued_index : dsi->front_index;
++			/*
++			 * Keep role publication atomic with the hardware decision:
++			 * a failed rearm leaves both the old front and queued frame
++			 * owned exactly as they were at transfer completion.
++			 */
++			if (micronux_dma_arm_frame(dsi, next_index)) {
++				rearm_failed = true;
++			} else {
++				if (!faulted && dsi->queued_index >= 0) {
++					dsi->front_index = dsi->queued_index;
++					dsi->queued_index = -1;
++					dsi->flip_completions++;
++				}
++				dsi->source_generation++;
++			}
++		}
++		spin_unlock_irqrestore(&dsi->state_lock, flags);
++		if (rearm_failed) {
++			WRITE_ONCE(dsi->last_dma_error, BIT(30));
++			micronux_latch_fault(dsi, MICRONUX_FAULT_DMA);
++		}
+ 	}
+ 	return IRQ_HANDLED;
+ }
+@@ -901,6 +1230,11 @@ static enum hrtimer_restart micronux_dma_poll(struct hrtimer *timer)
+ 		  READ_ONCE(dsi->scanout_active) &&
+ 		  !READ_ONCE(dsi->vpg_test_active) &&
+ 		  !READ_ONCE(dsi->fault_bits);
++	if (monitor && !micronux_pool_guards_valid(dsi, false)) {
++		WRITE_ONCE(dsi->pool_guard_errors,
++			   READ_ONCE(dsi->pool_guard_errors) + 1);
++		micronux_latch_fault(dsi, MICRONUX_FAULT_POOL_GUARD);
++	}
+ 	if (!monitor || frames != dsi->watchdog_frames ||
+ 	    sar != dsi->watchdog_sar) {
+ 		micronux_watchdog_seed_progress(dsi);
+@@ -1033,7 +1367,7 @@ static int micronux_restore_framebuffer_source(struct micronux_dsi *dsi,
+ 	return 0;
+ }
+ 
+-static int micronux_dma_stop_reload(struct micronux_dsi *dsi)
++static int micronux_dma_stop(struct micronux_dsi *dsi)
+ {
+ 	u32 channel = BIT(dsi->handoff.dma_channel);
+ 	u32 abort_mask = channel | (channel << 8);
+@@ -1055,6 +1389,29 @@ static int micronux_dma_stop_reload(struct micronux_dsi *dsi)
+ 	return 0;
+ }
+ 
++/* Caller holds mode_lock; render_lock prevents fbcon role changes. */
++static u8 micronux_select_initial_front(struct micronux_dsi *dsi)
++{
++	unsigned long flags;
++	u8 front;
++
++	mutex_lock(&dsi->render_lock);
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	front = dsi->queued_index >= 0 ? dsi->queued_index :
++		dsi->front_index;
++	dsi->front_index = front;
++	dsi->queued_index = -1;
++	if (dsi->render_index == front)
++		dsi->render_index = micronux_free_buffer_locked(dsi, front, -1);
++	dsi->render_needs_sync = true;
++	dsi->scanout_active = true;
++	dsi->source_generation++;
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++	micronux_set_render_mapping_locked(dsi);
++	mutex_unlock(&dsi->render_lock);
++	return front;
++}
++
+ static u32 micronux_read_soc_register(phys_addr_t address)
+ {
+ 	void __iomem *register_address;
+@@ -1121,6 +1478,7 @@ static int __micronux_fb_blank(int blank, struct fb_info *info)
+ 	u32 bridge_status, frame, initial_frame;
+ 	int ret;
+ 
++	micronux_flush_render(dsi);
+ 	if (!dsi->backlight)
+ 		return 0;
+ 	/* fbcon unblanks during registration, before the status page exists. */
+@@ -1136,9 +1494,9 @@ static int __micronux_fb_blank(int blank, struct fb_info *info)
+ 		/* Keep valid video present until the LEDs are physically dark. */
+ 		msleep(MICRONUX_BACKLIGHT_OFF_SETTLE_MS);
+ 		dev_dbg(dsi->dev, "backlight-off settled before scanout stop\n");
+-		ret = micronux_dma_stop_reload(dsi);
++		WRITE_ONCE(dsi->scanout_active, false);
++		ret = micronux_dma_stop(dsi);
+ 		/* The stop path has already disabled the bridge and DMA channel. */
+-		dsi->scanout_active = false;
+ 		return ret;
+ 	}
+ 	if (dsi->scanout_active)
+@@ -1153,7 +1511,12 @@ static int __micronux_fb_blank(int blank, struct fb_info *info)
+ 	       DSI_BRG_RAW_NUM_TOTAL_SET,
+ 	       dsi->bridge + DSI_BRG_RAW_NUM_CONFIG);
+ 	initial_frame = READ_ONCE(dsi->scanout_frames);
+-	micronux_dma_start_reload(dsi);
++	ret = micronux_dma_start_frame(dsi,
++				       micronux_select_initial_front(dsi));
++	if (ret) {
++		bridge_status = readl(dsi->bridge + DSI_BRG_INT_RAW);
++		goto start_failed;
++	}
+ 	micronux_select_framebuffer(dsi);
+ 	/* Ignore only the intentional dark stopped-to-framebuffer residue. */
+ 	micronux_discard_host_status(dsi);
+@@ -1165,14 +1528,15 @@ static int __micronux_fb_blank(int blank, struct fb_info *info)
+ 	bridge_status = readl(dsi->bridge + DSI_BRG_INT_RAW);
+ 	if (ret || READ_ONCE(dsi->last_dma_error) ||
+ 	    (bridge_status & DSI_BRG_INT_UNDERRUN)) {
++start_failed:
+ 		micronux_log_scanout_start_failure(dsi, initial_frame);
+ 		if (bridge_status & DSI_BRG_INT_UNDERRUN)
+ 			writel(DSI_BRG_INT_UNDERRUN,
+ 			       dsi->bridge + DSI_BRG_INT_CLR);
+-		(void)micronux_dma_stop_reload(dsi);
++		WRITE_ONCE(dsi->scanout_active, false);
++		(void)micronux_dma_stop(dsi);
+ 		return ret ? ret : -EIO;
+ 	}
+-	dsi->scanout_active = true;
+ 	micronux_watchdog_seed_progress(dsi);
+ 	hrtimer_start(&dsi->scanout_timer,
+ 		      ms_to_ktime(MICRONUX_HEALTH_POLL_MS),
+@@ -1244,7 +1608,7 @@ static ssize_t boot_ready_store(struct device *dev,
+ 		goto out;
+ 	}
+ 	dev_info(dsi->dev,
+-		 "MICRONUX:M7:DSI-SCANOUT state=ready handoff=blanked-restart stable-frames=%u scanout=hardware-reload-running backlight=restored reveal=userspace-ready frame-ack=disabled clock=forced-hs lp=disabled\n",
++		 "MICRONUX:M9.2:SCANOUT state=running handoff=blanked-restart stable-frames=%u buffers=3 dma=irq-rearm backlight=restored reveal=userspace-ready frame-ack=disabled clock=forced-hs lp=disabled\n",
+ 		 MICRONUX_SCANOUT_STABLE_FRAMES);
+ out:
+ 	mutex_unlock(&dsi->backlight->ops_lock);
+@@ -1473,7 +1837,8 @@ static ssize_t ownership_show(struct device *dev,
+ {
+ 	struct micronux_dsi *dsi = dev_get_drvdata(dev);
+ 
+-	return sysfs_emit(buf, "linux fb%d dma-channel=%u frame-irq=%d mmap=denied\n",
++	return sysfs_emit(buf,
++			  "linux abi=2 fb%d buffers=3 dma-channel=%u frame-irq=%d rearm=explicit mmap=denied\n",
+ 			  dsi->info->node, dsi->handoff.dma_channel,
+ 			  dsi->irq);
+ }
+@@ -1484,9 +1849,13 @@ static ssize_t scanout_show(struct device *dev,
+ {
+ 	struct micronux_dsi *dsi = dev_get_drvdata(dev);
+ 	bool clock_forced_hs, frame_ack_disabled, lp_disabled;
+-	unsigned long faults;
++	bool guards_valid;
++	unsigned long faults, flags;
+ 	u32 active, before, after, error, channel_enable, host, lpclk, underruns;
+ 	u32 host_error0, host_error1;
++	u32 rearm_attempts, rearm_failures, flip_requests, flip_completions;
++	u8 front, render;
++	s8 queued;
+ 
+ 	before = READ_ONCE(dsi->scanout_frames);
+ 	msleep(50);
+@@ -1501,6 +1870,16 @@ static ssize_t scanout_show(struct device *dev,
+ 	host_error0 = READ_ONCE(dsi->host_error0);
+ 	host_error1 = READ_ONCE(dsi->host_error1);
+ 	faults = READ_ONCE(dsi->fault_bits);
++	rearm_attempts = READ_ONCE(dsi->rearm_attempts);
++	rearm_failures = READ_ONCE(dsi->rearm_failures);
++	flip_requests = READ_ONCE(dsi->flip_requests);
++	flip_completions = READ_ONCE(dsi->flip_completions);
++	guards_valid = micronux_pool_guards_valid(dsi, false);
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	front = dsi->front_index;
++	render = dsi->render_index;
++	queued = dsi->queued_index;
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
+ 	frame_ack_disabled = !(host & DSI_HOST_FRAME_BTA_ACK_EN) &&
+ 			     !(active & DSI_HOST_FRAME_BTA_ACK_EN_ACT);
+ 	clock_forced_hs = (lpclk & (DSI_HOST_PHY_TXREQUESTCLKHS |
+@@ -1510,16 +1889,22 @@ static ssize_t scanout_show(struct device *dev,
+ 		      !(active & DSI_HOST_LP_VIDEO_EN_ACT_MASK);
+ 
+ 	return sysfs_emit(buf,
+-			  "%s frames=%u->%u error=%08x underruns=%u chen=%u faults=%lx host-errors=%08x:%08x frame-ack=%s clock=%s lp=%s\n",
++			  "%s frames=%u->%u error=%08x underruns=%u chen=%u faults=%lx host-errors=%08x:%08x frame-ack=%s clock=%s lp=%s buffers=3 front=%u queued=%d back=%u rearm=%u/%u flips=%u/%u generation=%u guards=%s guard-errors=%u\n",
+ 			  after != before && !error && !underruns && !faults &&
+ 			  !host_error0 && !host_error1 &&
++			  guards_valid &&
+ 			  frame_ack_disabled && clock_forced_hs && lp_disabled ?
+ 			  "running" : "stalled",
+ 			  before, after, error, underruns, !!channel_enable,
+ 			  faults, host_error0, host_error1,
+ 			  frame_ack_disabled ? "off" : "on",
+ 			  clock_forced_hs ? "forced-hs" : "auto",
+-			  lp_disabled ? "disabled" : "enabled");
++			  lp_disabled ? "disabled" : "enabled",
++			  front, queued, render, rearm_attempts,
++			  rearm_failures, flip_requests, flip_completions,
++			  READ_ONCE(dsi->source_generation),
++			  guards_valid ? "ok" : "bad",
++			  READ_ONCE(dsi->pool_guard_errors));
+ }
+ static DEVICE_ATTR_RO(scanout);
+ 
+@@ -1527,11 +1912,24 @@ static ssize_t diagnostics_show(struct device *dev,
+ 				struct device_attribute *attribute, char *buf)
+ {
+ 	struct micronux_dsi *dsi = dev_get_drvdata(dev);
+-	void __iomem *cached = (void __iomem *)(uintptr_t)
+-		dsi->handoff.framebuffer_address;
++	void __iomem *cached;
++	void __iomem *descriptor;
++	unsigned long flags;
+ 	u32 sar_before, sar_after, llp_before, llp_after;
+ 	u32 status_before, status_after;
+ 	u32 active, host, lpclk;
++	ssize_t length;
++	u8 front, render;
++	s8 queued;
++
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	front = dsi->front_index;
++	render = dsi->render_index;
++	queued = dsi->queued_index;
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++	cached = (void __iomem *)(uintptr_t)
++		dsi->handoff.framebuffer_address[front];
++	descriptor = dsi->descriptor[front];
+ 
+ 	sar_before = readl(dsi->channel + DW_GDMA_CH_SAR);
+ 	llp_before = readl(dsi->channel + DW_GDMA_CH_LLP);
+@@ -1544,8 +1942,8 @@ static ssize_t diagnostics_show(struct device *dev,
+ 	active = readl(dsi->host + DSI_HOST_VID_MODE_CFG_ACT);
+ 	lpclk = readl(dsi->host + DSI_HOST_LPCLK_CTRL);
+ 
+-	return sysfs_emit(buf,
+-		"chen=%08x sar=%08x->%08x dar=%08x block=%08x faults=%lx "
++	length = sysfs_emit(buf,
++			    "chen=%08x sar=%08x->%08x dar=%08x block=%08x faults=%lx "
+ 		"ctl=%08x:%08x cfg=%08x:%08x llp=%08x->%08x "
+ 		"status=%08x->%08x int=%08x int-ena=%08x "
+ 		"host=%08x active=%08x lpclk=%08x "
+@@ -1589,14 +1987,33 @@ static ssize_t diagnostics_show(struct device *dev,
+ 		readl(dsi->bridge + DSI_BRG_DPI_MISC_CONFIG),
+ 		readl(dsi->bridge + DSI_BRG_INT_RAW),
+ 		READ_ONCE(dsi->bridge_underruns),
+-		dsi->handoff.dma_descriptor_address,
+-		readl(dsi->descriptor + DMA_LLI_SAR),
+-		readl(dsi->descriptor + DMA_LLI_DAR),
+-		readl(dsi->descriptor + DMA_LLI_LLP),
+-		readl(dsi->descriptor + DMA_LLI_CTRL_HI), readl(cached),
++		dsi->handoff.dma_descriptor_address +
++			front * MICRONUX_DMA_DESCRIPTOR_SIZE,
++		readl(descriptor + DMA_LLI_SAR),
++		readl(descriptor + DMA_LLI_DAR),
++		readl(descriptor + DMA_LLI_LLP),
++		readl(descriptor + DMA_LLI_CTRL_HI), readl(cached),
+ 		readl(dsi->info->screen_base),
+ 		READ_ONCE(dsi->scanout_frames),
+ 		READ_ONCE(dsi->last_dma_error));
++	if (length <= 0)
++		return length;
++	/* Replace the first emission's newline so diagnostics stay one record. */
++	length--;
++	length += sysfs_emit_at(buf, length,
++		" abi=2 buffers=3 front=%u queued=%d back=%u bridge-fifo=%08x",
++		front, queued, render,
++		readl(dsi->bridge + DSI_BRG_FIFO_FLOW_STATUS));
++	length += sysfs_emit_at(buf, length,
++		" rearm=%u/%u flips=%u/%u generation=%u guards=%s guard-errors=%u\n",
++		READ_ONCE(dsi->rearm_attempts),
++		READ_ONCE(dsi->rearm_failures),
++		READ_ONCE(dsi->flip_requests),
++		READ_ONCE(dsi->flip_completions),
++		READ_ONCE(dsi->source_generation),
++		micronux_pool_guards_valid(dsi, true) ? "ok" : "bad",
++		READ_ONCE(dsi->pool_guard_errors));
++	return length;
+ }
+ static DEVICE_ATTR_RO(diagnostics);
+ 
+@@ -1629,17 +2046,18 @@ ATTRIBUTE_GROUPS(micronux_display);
+ 
+ static int micronux_validate_handoff(struct micronux_dsi *dsi, u32 address)
+ {
+-	struct micronux_display_handoff_v1 *handoff = &dsi->handoff;
++	struct micronux_display_handoff_v2 *handoff = &dsi->handoff;
++	void __iomem *channel;
+ 	void __iomem *source;
+ 	void __iomem *descriptor;
+-	u32 descriptor_control, descriptor_link, expected_link, i;
++	u32 descriptor_control, descriptor_link, i;
+ 	u32 expected_size, crc;
+ 	u64 end;
+ 
+ 	source = (void __iomem *)(uintptr_t)(address + dsi->uncached_offset);
+ 	memcpy_fromio(handoff, source, sizeof(*handoff));
+ 	crc = crc32_le(~0U, (u8 *)handoff,
+-		       offsetof(struct micronux_display_handoff_v1, crc32)) ^ ~0U;
++		       offsetof(struct micronux_display_handoff_v2, crc32)) ^ ~0U;
+ 	if (handoff->magic != MICRONUX_DISPLAY_MAGIC ||
+ 	    handoff->abi_version != MICRONUX_DISPLAY_ABI_VERSION ||
+ 	    handoff->struct_size != sizeof(*handoff) ||
+@@ -1648,29 +2066,70 @@ static int micronux_validate_handoff(struct micronux_dsi *dsi, u32 address)
+ 		MICRONUX_DISPLAY_REQUIRED_FLAGS)
+ 		return -EINVAL;
+ 
+-	if (!handoff->width || !handoff->height ||
+-	    handoff->width > U32_MAX / 2 ||
+-	    handoff->stride != handoff->width * 2)
++	if (handoff->width != 800 || handoff->height != 1280 ||
++	    handoff->stride != 1600 ||
++	    handoff->pixel_clock_hz != 80000000 ||
++	    handoff->lane_bit_rate_mbps != 1500 ||
++	    handoff->data_lanes != 2 ||
++	    handoff->buffer_count != MICRONUX_DISPLAY_BUFFER_COUNT ||
++	    handoff->ownership_state != MICRONUX_DISPLAY_OWNER_LINUX_PENDING ||
++	    handoff->hsync_pulse_width != MICRONUX_DISPLAY_HSYNC_PULSE ||
++	    handoff->hsync_back_porch != MICRONUX_DISPLAY_HSYNC_BACK_PORCH ||
++	    handoff->hsync_front_porch != MICRONUX_DISPLAY_HSYNC_FRONT_PORCH ||
++	    handoff->vsync_pulse_width != MICRONUX_DISPLAY_VSYNC_PULSE ||
++	    handoff->vsync_back_porch != MICRONUX_DISPLAY_VSYNC_BACK_PORCH ||
++	    handoff->vsync_front_porch != MICRONUX_DISPLAY_VSYNC_FRONT_PORCH)
++		return -EINVAL;
++	if (handoff->height > U32_MAX / handoff->stride)
+ 		return -EINVAL;
+ 	expected_size = handoff->stride * handoff->height;
+-	if (handoff->height > U32_MAX / handoff->stride ||
++	if (expected_size != 2048000 ||
+ 	    handoff->framebuffer_size != expected_size)
+ 		return -EINVAL;
+-	end = (u64)handoff->framebuffer_address + handoff->framebuffer_size;
+-	if (handoff->framebuffer_address < ESP32P4_LOADER_PSRAM_START ||
+-	    end > ESP32P4_LOADER_PSRAM_END)
++	end = (u64)handoff->framebuffer_address[0] +
++	      handoff->framebuffer_size;
++	if (handoff->framebuffer_address[0] < ESP32P4_LOADER_PSRAM_START ||
++	    end > ESP32P4_LOADER_PSRAM_END ||
++	    !IS_ALIGNED(handoff->framebuffer_address[0],
++			MICRONUX_FRAMEBUFFER_ALIGNMENT))
++		return -EINVAL;
++	if (handoff->framebuffer_address[1] !=
++		ESP32P4_DISPLAY_BACK_ADDRESS ||
++	    handoff->framebuffer_address[2] !=
++		ESP32P4_DISPLAY_SPARE_ADDRESS)
+ 		return -EINVAL;
++	for (i = 1; i < MICRONUX_DISPLAY_BUFFER_COUNT; i++) {
++		end = (u64)handoff->framebuffer_address[i] +
++		      handoff->framebuffer_size;
++		if (handoff->framebuffer_address[i] <
++			ESP32P4_DISPLAY_POOL_START ||
++		    !IS_ALIGNED(handoff->framebuffer_address[i],
++				MICRONUX_FRAMEBUFFER_ALIGNMENT) ||
++		    end > ESP32P4_DISPLAY_POOL_END ||
++		    end > handoff->framebuffer_address[i] + 0x200000U)
++			return -EINVAL;
++	}
+ 	end = (u64)handoff->dma_descriptor_address +
+ 	      handoff->dma_descriptor_size;
+ 	if (handoff->dma_descriptor_address < ESP32P4_INTERNAL_SRAM_START ||
+ 	    end > ESP32P4_INTERNAL_SRAM_END ||
+ 	    handoff->dma_descriptor_size != MICRONUX_DMA_DESCRIPTOR_SIZE *
+ 		MICRONUX_DMA_DESCRIPTOR_COUNT ||
++	    handoff->dma_descriptor_count !=
++		MICRONUX_DMA_DESCRIPTOR_COUNT ||
+ 	    !IS_ALIGNED(handoff->dma_descriptor_address, 64) ||
+ 	    handoff->dma_channel >= 4 || handoff->i2c_address != 0x45 ||
++	    handoff->dsi_fifo_address != ESP32P4_DSI_FIFO_ADDRESS ||
++	    handoff->display_control_register != 0x95 ||
+ 	    handoff->backlight_register != 0x96 ||
+ 	    handoff->backlight_brightness > 255)
+ 		return -EINVAL;
++	channel = dsi->gdma + DW_GDMA_CH_BASE(handoff->dma_channel);
++	if (readl(channel + DW_GDMA_CH_CFG_LO) !=
++		    MICRONUX_DMA_CHANNEL_CFG_LO ||
++	    readl(channel + DW_GDMA_CH_CFG_HI) !=
++		    MICRONUX_DMA_CHANNEL_CFG_HI)
++		return -EINVAL;
+ 
+ 	descriptor = (void __iomem *)(uintptr_t)
+ 		(handoff->dma_descriptor_address + dsi->uncached_offset);
+@@ -1680,20 +2139,49 @@ static int micronux_validate_handoff(struct micronux_dsi *dsi, u32 address)
+ 
+ 		descriptor_link = readl(item + DMA_LLI_LLP);
+ 		descriptor_control = readl(item + DMA_LLI_CTRL_HI);
+-		expected_link = handoff->dma_descriptor_address +
+-			((i + 1) % MICRONUX_DMA_DESCRIPTOR_COUNT) *
+-			MICRONUX_DMA_DESCRIPTOR_SIZE;
+-		if (readl(item + DMA_LLI_SAR) != handoff->framebuffer_address ||
+-		    readl(item + DMA_LLI_DAR) != ESP32P4_DSI_FIFO_ADDRESS ||
+-		    (descriptor_link & ~0x3fU) != expected_link ||
+-		    !(descriptor_control & DMA_LLI_VALID) ||
+-		    descriptor_control & (DMA_LLI_LAST | DMA_LLI_INTERRUPT))
++		if (readl(item + DMA_LLI_SAR) !=
++			handoff->framebuffer_address[0] ||
++		    readl(item + DMA_LLI_SAR_HI) ||
++		    readl(item + DMA_LLI_DAR) != handoff->dsi_fifo_address ||
++		    readl(item + DMA_LLI_DAR_HI) ||
++		    (descriptor_link & ~0x3fU) ||
++		    readl(item + DMA_LLI_LLP_HI) ||
++		    readl(item + DMA_LLI_BLOCK_TS) !=
++			    MICRONUX_DMA_BLOCK_TRANSFER_SIZE ||
++		    readl(item + DMA_LLI_CTRL_LO) !=
++			    MICRONUX_DMA_DESCRIPTOR_CTRL_LO ||
++		    descriptor_control != MICRONUX_DMA_DESCRIPTOR_CTRL_HI)
+ 			return -EINVAL;
+ 	}
+ 
+ 	return 0;
+ }
+ 
++static void micronux_initialize_descriptors(struct micronux_dsi *dsi)
++{
++	u8 index;
++
++	for (index = 0; index < MICRONUX_DISPLAY_BUFFER_COUNT; index++) {
++		writel(dsi->handoff.framebuffer_address[index],
++		       dsi->descriptor[index] + DMA_LLI_SAR);
++		writel(0, dsi->descriptor[index] + DMA_LLI_SAR_HI);
++		writel(dsi->handoff.dsi_fifo_address,
++		       dsi->descriptor[index] + DMA_LLI_DAR);
++		writel(0, dsi->descriptor[index] + DMA_LLI_DAR_HI);
++		writel(MICRONUX_DMA_BLOCK_TRANSFER_SIZE,
++		       dsi->descriptor[index] + DMA_LLI_BLOCK_TS);
++		writel(DW_GDMA_LLP_MEMORY_PORT,
++		       dsi->descriptor[index] + DMA_LLI_LLP);
++		writel(0, dsi->descriptor[index] + DMA_LLI_LLP_HI);
++		writel(MICRONUX_DMA_DESCRIPTOR_CTRL_LO,
++		       dsi->descriptor[index] + DMA_LLI_CTRL_LO);
++		writel(MICRONUX_DMA_DESCRIPTOR_CTRL_HI,
++		       dsi->descriptor[index] + DMA_LLI_CTRL_HI);
++	}
++	/* Publish every descriptor word before Linux can arm the DMA channel. */
++	wmb();
++}
++
+ static int micronux_register_backlight(struct micronux_dsi *dsi)
+ {
+ 	struct backlight_properties properties = {
+@@ -1722,7 +2210,8 @@ static int micronux_register_framebuffer(struct micronux_dsi *dsi)
+ 	struct fb_info *info = dsi->info;
+ 
+ 	strscpy(info->fix.id, "esp32p4-dsi", sizeof(info->fix.id));
+-	info->fix.smem_start = dsi->handoff.framebuffer_address;
++	info->fix.smem_start =
++		dsi->handoff.framebuffer_address[dsi->render_index];
+ 	info->fix.smem_len = dsi->handoff.framebuffer_size;
+ 	info->fix.type = FB_TYPE_PACKED_PIXELS;
+ 	info->fix.visual = FB_VISUAL_TRUECOLOR;
+@@ -1741,8 +2230,7 @@ static int micronux_register_framebuffer(struct micronux_dsi *dsi)
+ 	info->var.blue.length = 5;
+ 	info->var.activate = FB_ACTIVATE_NOW;
+ 	info->var.vmode = FB_VMODE_NONINTERLACED;
+-	info->screen_base = (char __iomem *)(uintptr_t)
+-		(dsi->handoff.framebuffer_address + dsi->uncached_offset);
++	info->screen_base = dsi->framebuffer[dsi->render_index];
+ 	info->screen_size = dsi->handoff.framebuffer_size;
+ 	info->fbops = &micronux_fb_ops;
+ 	info->pseudo_palette = dsi->palette;
+@@ -1750,12 +2238,33 @@ static int micronux_register_framebuffer(struct micronux_dsi *dsi)
+ 	return register_framebuffer(info);
+ }
+ 
++static int micronux_validate_display_pool(struct device_node *node)
++{
++	struct device_node *pool;
++	struct resource resource;
++	int ret;
++
++	pool = of_parse_phandle(node, "memory-region", 0);
++	if (!pool)
++		return -EINVAL;
++	ret = of_address_to_resource(pool, 0, &resource);
++	of_node_put(pool);
++	if (ret)
++		return ret;
++	if (resource.start != ESP32P4_DISPLAY_POOL_START ||
++	    resource_size(&resource) !=
++		ESP32P4_DISPLAY_POOL_END - ESP32P4_DISPLAY_POOL_START)
++		return -EINVAL;
++	return 0;
++}
++
+ static int micronux_dsi_probe(struct platform_device *pdev)
+ {
+ 	struct backlight_device *backlight;
+ 	struct micronux_dsi *dsi;
+ 	struct fb_info *info;
+ 	u32 handoff_address;
++	u8 index;
+ 	int ret;
+ 
+ 	info = framebuffer_alloc(sizeof(*dsi), &pdev->dev);
+@@ -1766,6 +2275,9 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 	dsi->info = info;
+ 	mutex_init(&dsi->lock);
+ 	mutex_init(&dsi->mode_lock);
++	mutex_init(&dsi->render_lock);
++	INIT_DELAYED_WORK(&dsi->render_work, micronux_render_work);
++	spin_lock_init(&dsi->state_lock);
+ 	spin_lock_init(&dsi->host_status_lock);
+ 	INIT_WORK(&dsi->fault_work, micronux_fault_work);
+ 
+@@ -1804,6 +2316,12 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 				   &dsi->uncached_offset);
+ 	if (ret)
+ 		goto release;
++	ret = micronux_validate_display_pool(pdev->dev.of_node);
++	if (ret) {
++		dev_err(&pdev->dev, "invalid display pool reservation: %d\n",
++			ret);
++		goto release;
++	}
+ 	ret = micronux_validate_handoff(dsi, handoff_address);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "invalid loader display handoff: %d\n", ret);
+@@ -1813,8 +2331,25 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 	micronux_discard_host_status(dsi);
+ 	dsi->channel = dsi->gdma +
+ 		DW_GDMA_CH_BASE(dsi->handoff.dma_channel);
+-	dsi->descriptor = (void __iomem *)(uintptr_t)
+-		(dsi->handoff.dma_descriptor_address + dsi->uncached_offset);
++	for (index = 0; index < MICRONUX_DISPLAY_BUFFER_COUNT; index++) {
++		dsi->descriptor[index] = (void __iomem *)(uintptr_t)
++			(dsi->handoff.dma_descriptor_address +
++			 index * MICRONUX_DMA_DESCRIPTOR_SIZE +
++			 dsi->uncached_offset);
++		dsi->framebuffer[index] = (void __iomem *)(uintptr_t)
++			(dsi->handoff.framebuffer_address[index] +
++			 dsi->uncached_offset);
++	}
++	dsi->front_index = 0;
++	dsi->render_index = 1;
++	dsi->queued_index = -1;
++	dsi->render_needs_sync = false;
++	dsi->render_dirty = false;
++	micronux_initialize_descriptors(dsi);
++	micronux_initialize_pool_guards(dsi);
++	/* Both Linux-owned buffers begin as deterministic copies of the splash. */
++	micronux_copy_frame(dsi, 1, 0);
++	micronux_copy_frame(dsi, 2, 0);
+ 
+ 	writel(0, dsi->bridge + DSI_BRG_INT_ENA);
+ 	writel(~0U, dsi->bridge + DSI_BRG_INT_CLR);
+@@ -1853,9 +2388,9 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 	dsi->scanout_timer.function = micronux_dma_poll;
+ 	WRITE_ONCE(dsi->scanout_ready, true);
+ 	dev_info(&pdev->dev,
+-		 "MICRONUX:M7:DSI-SCANOUT state=waiting trigger=userspace-boot-ready scanout=stopped backlight=off\n");
++		 "MICRONUX:M9.2:SCANOUT state=waiting trigger=userspace-boot-ready buffers=3 front=0 back=1 spare=2 scanout=stopped backlight=off\n");
+ 	dev_info(&pdev->dev,
+-		 "MICRONUX:M7:DSI-LINUX state=ready owner=linux fb=fb%d resolution=%ux%u format=rgb565 dma=ch%u:auto-reload event=block-done-irq irq=%d health_poll_ms=50 enable_delay_ms=0 underrun=monitored write_chunk=512 write_gap_us=2 backlight=linux mmap=denied\n",
++		 "MICRONUX:M9.2:CLAIM state=ready abi=2 owner=linux fb=fb%d resolution=%ux%u format=rgb565 timing=20/20/40:4/10/30 buffers=3 dma=ch%u:irq-rearm config=0000000f:0a020001 event=transfer-done-irq irq=%d health_poll_ms=50 commit_ms=20 underrun=monitored guards=pool-monitored write_chunk=512 write_gap_us=2 backlight=linux mmap=denied\n",
+ 		 info->node, dsi->handoff.width, dsi->handoff.height,
+ 		 dsi->handoff.dma_channel, dsi->irq);
+ 	return 0;
+@@ -1870,6 +2405,7 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 	}
+ 	unregister_framebuffer(info);
+ darken:
++	cancel_delayed_work_sync(&dsi->render_work);
+ 	backlight->props.power = FB_BLANK_POWERDOWN;
+ 	backlight_update_status(backlight);
+ 	devm_backlight_device_unregister(&pdev->dev, backlight);
+@@ -1881,13 +2417,43 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ static void micronux_dsi_remove(struct platform_device *pdev)
+ {
+ 	struct micronux_dsi *dsi = platform_get_drvdata(pdev);
++	bool dark = false;
++	int ret;
+ 
+ 	/* Removing the group waits for the bounded one-shot store to finish. */
+ 	sysfs_remove_groups(&pdev->dev.kobj, micronux_display_groups);
++	cancel_delayed_work_sync(&dsi->render_work);
+ 	mutex_lock(&dsi->mode_lock);
++	mutex_lock(&dsi->backlight->ops_lock);
+ 	WRITE_ONCE(dsi->scanout_ready, false);
+-	hrtimer_cancel(&dsi->scanout_timer);
++	WRITE_ONCE(dsi->boot_display_ready, false);
++	ret = micronux_backlight_set_power(dsi, FB_BLANK_POWERDOWN);
++	if (!ret) {
++		dark = true;
++	} else {
++		ret = micronux_i2c_write_reg8(dsi, dsi->handoff.i2c_address,
++					      dsi->handoff.display_control_register,
++					      0x13);
++		if (!ret) {
++			dark = true;
++			dev_warn(dsi->dev,
++				 "PWM blank failed during remove; disabled backlight gate\n");
++		}
++	}
++	if (dark) {
++		msleep(MICRONUX_BACKLIGHT_OFF_SETTLE_MS);
++		WRITE_ONCE(dsi->scanout_active, false);
++		ret = micronux_dma_stop(dsi);
++		if (ret)
++			dev_warn(dsi->dev,
++				 "DMA stop failed during remove: %d\n", ret);
++	} else {
++		hrtimer_cancel(&dsi->scanout_timer);
++		dev_err(dsi->dev,
++			"display remove could not confirm darkness; preserving source until IRQ teardown\n");
++	}
+ 	writel(0, dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA);
++	mutex_unlock(&dsi->backlight->ops_lock);
+ 	mutex_unlock(&dsi->mode_lock);
+ 	devm_free_irq(dsi->dev, dsi->irq, dsi);
+ 	cancel_work_sync(&dsi->fault_work);

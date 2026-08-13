@@ -1,0 +1,173 @@
+From b8b88d147b88d1be88bfe1c4df96300958dbd29a Mon Sep 17 00:00:00 2001
+From: MicroNUX contributors <micronux@users.noreply.github.com>
+Date: Sat, 8 Aug 2026 17:42:00 -0700
+Subject: [PATCH] host: build FG driver in-tree without Bluetooth
+
+Add a Kconfig/Kbuild interface for linking the ESP-Hosted-FG SDIO transport
+into a NOMMU kernel. Keep the serial control path required by FG, but use the
+driver's weak HCI stubs so the MicroNUX Wi-Fi-first image does not pull in the
+Bluetooth stack.
+
+Signed-off-by: MicroNUX contributors <micronux@users.noreply.github.com>
+---
+ .../linux/host_driver/esp32/Kconfig           | 13 +++
+ .../linux/host_driver/esp32/Makefile          | 92 +++----------------
+ .../linux/host_driver/esp32/esp.h             |  3 +-
+ 3 files changed, 28 insertions(+), 80 deletions(-)
+ create mode 100644 esp_hosted_fg/host/linux/host_driver/esp32/Kconfig
+
+diff --git a/esp_hosted_fg/host/linux/host_driver/esp32/Kconfig b/esp_hosted_fg/host/linux/host_driver/esp32/Kconfig
+new file mode 100644
+index 0000000..b4ece55
+--- /dev/null
++++ b/esp_hosted_fg/host/linux/host_driver/esp32/Kconfig
+@@ -0,0 +1,13 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++config ESP_HOSTED_FG
++	bool "Espressif ESP-Hosted-FG over SDIO"
++	depends on MMC
++	depends on NETDEVICES
++	help
++	  Link the ESP-Hosted-FG SDIO transport, Ethernet data interfaces,
++	  and serial control channel into the kernel. The coprocessor must run
++	  matching ESP-Hosted-FG firmware.
++
++	  Select built-in support on NOMMU systems which cannot allocate
++	  executable memory for loadable modules.
+diff --git a/esp_hosted_fg/host/linux/host_driver/esp32/Makefile b/esp_hosted_fg/host/linux/host_driver/esp32/Makefile
+index c80ff89..902a0f9 100644
+--- a/esp_hosted_fg/host/linux/host_driver/esp32/Makefile
++++ b/esp_hosted_fg/host/linux/host_driver/esp32/Makefile
+@@ -1,105 +1,10 @@
+-CONFIG_BT_ENABLED := y
+-CONFIG_TEST_RAW_TP := n
+-CONFIG_INFO_LOGS=y
+-CONFIG_DEBUG_LOGS=n
+-CONFIG_VERBOSE_LOGS=n
+-
+-# Choose one:
+-CONFIG_ESP_HOSTED_USE_WORKQUEUE=n    # For thread-based solution
+-# OR
+-# CONFIG_ESP_HOSTED_USE_WORKQUEUE=y  # For workqueue solution
+-
+-# In case of SDIO as transport, one of slave chipset used,
+-# CONFIG_TARGET_ESP32  OR
+-# CONFIG_TARGET_ESP32C6
+-# need to be added depending upon slave in use
+-# rpi_init.sh will add that flag using ESP_SLAVE
+-ESP_SLAVE := ""
+-
+-# Imx8mm
+-# CROSS_COMPILE := "/opt/fsl-imx-wayland/5.15-kirkstone/sysroots/x86_64-pokysdk-linux/usr/bin/aarch64-poky-linux/aarch64-poky-linux-"
+-# KERNEL := "/home/u64/imx8_dev_board/imx-yocto-bsp/build/tmp/work/imx8mm_lpddr4_evk-poky-linux/linux-imx/5.15.52+gitAUTOINC+36363d8623-r0/build"
+-
+-CROSS_COMPILE :=
+-KERNEL := /lib/modules/$(shell uname -r)/build
+-ARCH := arm64
+-
+-#Default interface is sdio
+-MODULE_NAME=esp32_sdio
+-
+-#Targets passed overrides default value
+-ifeq ($(target), sdio)
+-	MODULE_NAME=esp32_sdio
+-endif
+-
+-ifeq ($(target), spi)
+-	MODULE_NAME=esp32_spi
+-endif
+-
+-ifeq ($(CONFIG_TEST_RAW_TP), y)
+-	EXTRA_CFLAGS += -DCONFIG_TEST_RAW_TP
+-endif
+-
+-ifeq ($(CONFIG_DEBUG_STATS), y)
+-	EXTRA_CFLAGS += -DESP_DEBUG_STATS
+-endif
+-
+-ifeq ($(CONFIG_BT_ENABLED), y)
+-	EXTRA_CFLAGS += -DCONFIG_BT_ENABLED
+-	module_objects += esp_bt.o
+-endif
+-
+-EXTRA_CFLAGS += -I$(PWD)/../../../../common/include -I$(PWD)
+-
+-ifeq ($(MODULE_NAME), esp32_sdio)
+-	EXTRA_CFLAGS += -I$(PWD)/sdio
+-	module_objects += sdio/esp_sdio.o sdio/esp_sdio_api.o
+-endif
+-
+-ifeq ($(MODULE_NAME), esp32_spi)
+-	EXTRA_CFLAGS += -I$(PWD)/spi
+-	module_objects += spi/esp_spi.o
+-endif
+-
+-ifneq ($(ESP_SLAVE), "")
+-EXTRA_CFLAGS += -D$(ESP_SLAVE)
+-endif
+-
+-ifeq ($(CONFIG_INFO_LOGS), y)
+-	EXTRA_CFLAGS += -DCONFIG_INFO_LOGS
+-endif
+-
+-ifeq ($(CONFIG_DEBUG_LOGS), y)
+-	EXTRA_CFLAGS += -DCONFIG_INFO_LOGS
+-	EXTRA_CFLAGS += -DCONFIG_DEBUG_LOGS
+-endif
+-
+-ifeq ($(CONFIG_VERBOSE_LOGS), y)
+-	EXTRA_CFLAGS += -DCONFIG_INFO_LOGS
+-	EXTRA_CFLAGS += -DCONFIG_DEBUG_LOGS
+-	EXTRA_CFLAGS += -DCONFIG_VERBOSE_LOGS
+-endif
+-
+-$(info DEBUG: CONFIG_ESP_HOSTED_USE_WORKQUEUE='$(CONFIG_ESP_HOSTED_USE_WORKQUEUE)')
+-$(info DEBUG: EXTRA_CFLAGS before workqueue='$(EXTRA_CFLAGS)')
+-
+-ifeq ($(CONFIG_ESP_HOSTED_USE_WORKQUEUE), y)
+-	EXTRA_CFLAGS += -DCONFIG_ESP_HOSTED_USE_WORKQUEUE=1
+-else
+-	EXTRA_CFLAGS += -DCONFIG_ESP_HOSTED_USE_THREAD=1
+-endif
+-
+-PWD := $(shell pwd)
+-
+-obj-m := $(MODULE_NAME).o
+-$(MODULE_NAME)-y := main.o esp_stats.o $(module_objects)
+-$(MODULE_NAME)-y += esp_serial.o esp_rb.o esp_fw_verify.o
+-
+-all:
+-	make ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -C $(KERNEL) M=$(PWD) modules
+-
+-clean:
+-	rm -rf *.o sdio/*.o spi/*.o *.ko
+-	rm -rf .*.cmd .tmp_versions *.mod.c *.mod *.order *.symvers *.markers
+-	rm -rf sdio/.*.cmd spi/.*.cmd
+-	-@make ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -C $(KERNEL) M=$(PWD) clean 2>/dev/null || true
++# SPDX-License-Identifier: GPL-2.0-only
++
++ccflags-y += -I$(src) -I$(src)/include -I$(src)/sdio
++ccflags-y += -DCONFIG_INFO_LOGS -DCONFIG_ESP_HOSTED_USE_THREAD=1
++
++esp32_sdio-y := main.o esp_stats.o \
++	sdio/esp_sdio.o sdio/esp_sdio_api.o \
++	esp_serial.o esp_rb.o esp_fw_verify.o
++
++obj-$(CONFIG_ESP_HOSTED_FG) += esp32_sdio.o
+diff --git a/esp_hosted_fg/host/linux/host_driver/esp32/esp.h b/esp_hosted_fg/host/linux/host_driver/esp32/esp.h
+index d34ff44..1cd5340 100644
+--- a/esp_hosted_fg/host/linux/host_driver/esp32/esp.h
++++ b/esp_hosted_fg/host/linux/host_driver/esp32/esp.h
+@@ -9,8 +9,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/netdevice.h>
+ #include <linux/inetdevice.h>
+-#include <net/bluetooth/bluetooth.h>
+-#include <net/bluetooth/hci_core.h>
++struct hci_dev;
+ #include "esp_kernel_port.h"
+ #include "adapter.h"
+ 
+-- 
+2.43.0

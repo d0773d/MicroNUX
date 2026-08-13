@@ -1,0 +1,8 @@
+config BR2_PACKAGE_MICRONUX_DISPLAY_TEST
+	bool "micronux-display-test"
+	depends on !BR2_USE_MMU
+	help
+	  No-LVGL M9 acceptance client for the Linux-owned framebuffer and
+	  GT9271 input device. It validates the public interfaces, acquires
+	  graphics console ownership, performs positioned framebuffer writes,
+	  and runs the five-point Kit C touch gate.

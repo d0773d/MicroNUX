@@ -1,0 +1,42 @@
+From 9ca7e0b1dcaa8a327a31cc6bbbd021928b03a4a4 Mon Sep 17 00:00:00 2001
+From: MicroNUX contributors <micronux@users.noreply.github.com>
+Date: Sat, 8 Aug 2026 15:00:00 -0700
+Subject: [PATCH 09/46] wireless: wire in ESP-Hosted-FG source
+
+Allow the pinned ESP-Hosted-FG source package to be copied into the kernel
+tree before configuration and linked into the kernel.  MicroNUX needs the
+driver built in because its ESP32-P4 NOMMU port cannot allocate executable
+memory for loadable modules.
+
+Signed-off-by: MicroNUX contributors <micronux@users.noreply.github.com>
+---
+ drivers/net/wireless/Kconfig  | 1 +
+ drivers/net/wireless/Makefile | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/drivers/net/wireless/Kconfig b/drivers/net/wireless/Kconfig
+index 2b8f9b46d50e..48f1f8f1a31e 100644
+--- a/drivers/net/wireless/Kconfig
++++ b/drivers/net/wireless/Kconfig
+@@ -21,6 +21,7 @@ if WLAN
+ 
+ source "drivers/net/wireless/admtek/Kconfig"
+ source "drivers/net/wireless/ath/Kconfig"
++source "drivers/net/wireless/esp-hosted-fg/Kconfig"
+ source "drivers/net/wireless/atmel/Kconfig"
+ source "drivers/net/wireless/broadcom/Kconfig"
+ source "drivers/net/wireless/intel/Kconfig"
+diff --git a/drivers/net/wireless/Makefile b/drivers/net/wireless/Makefile
+index 94b2bec1a6a7..54ead9fbd32d 100644
+--- a/drivers/net/wireless/Makefile
++++ b/drivers/net/wireless/Makefile
+@@ -6,6 +6,7 @@
+ 
+ obj-$(CONFIG_WLAN_VENDOR_ADMTEK) += admtek/
+ obj-$(CONFIG_WLAN_VENDOR_ATH) += ath/
++obj-$(CONFIG_ESP_HOSTED_FG) += esp-hosted-fg/
+ obj-$(CONFIG_WLAN_VENDOR_ATMEL) += atmel/
+ obj-$(CONFIG_WLAN_VENDOR_BROADCOM) += broadcom/
+ obj-$(CONFIG_WLAN_VENDOR_INTEL) += intel/
+-- 
+2.43.0

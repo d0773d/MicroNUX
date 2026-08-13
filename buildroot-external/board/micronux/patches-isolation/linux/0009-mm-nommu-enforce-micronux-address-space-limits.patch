@@ -1,0 +1,49 @@
+From 5e8d02a0d3f98bfed924055a479f3ec6fc16f60d Mon Sep 17 00:00:00 2001
+From: MicroNUX Contributors <micronux@example.invalid>
+Date: Sun, 9 Aug 2026 15:30:00 -0700
+Subject: [PATCH 09/10] mm: nommu: enforce MicroNUX address-space limits
+
+The NOMMU mmap path does not call may_expand_vm() before allocating a new
+private region.  Consequently RLIMIT_AS does not constrain anonymous mmap
+allocations on MicroNUX, and an oversized job can consume the shared user
+pool before its process limit is considered.
+
+Apply the NOMMU equivalent of Linux's RLIMIT_AS check after deriving the
+VMA flags and before allocating any region metadata or pool pages.  Keep
+the change scoped to the MicroNUX isolation profile while its NOMMU
+behavior is validated independently.  Linux's may_expand_vm() helper is
+MMU-only, so perform its address-space calculation directly here.
+
+Signed-off-by: MicroNUX Contributors <micronux@example.invalid>
+---
+ mm/nommu.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/mm/nommu.c b/mm/nommu.c
+index b1e1eb9f9f80..d9c724665e33 100644
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -17,7 +17,8 @@
+ 
+ #include <linux/export.h>
+ #include <linux/mm.h>
+-#include <linux/sched/mm.h>
++#include <linux/sched/mm.h>
++#include <linux/sched/signal.h>
+ #include <linux/mman.h>
+ #include <linux/swap.h>
+ #include <linux/file.h>
+@@ -1076,5 +1077,10 @@ unsigned long do_mmap(struct file *file,
+ 	/* we've determined that we can make the mapping, now translate what we
+ 	 * now know into VMA flags */
+-	vm_flags |= determine_vm_flags(file, prot, flags, capabilities);
++	vm_flags |= determine_vm_flags(file, prot, flags, capabilities);
++#ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++	if (current->mm->total_vm + (len >> PAGE_SHIFT) >
++	    rlimit(RLIMIT_AS) >> PAGE_SHIFT)
++		return -ENOMEM;
++#endif
+ 
+ 
+-- 
+2.50.1

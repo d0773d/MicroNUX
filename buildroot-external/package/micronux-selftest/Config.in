@@ -1,0 +1,6 @@
+config BR2_PACKAGE_MICRONUX_SELFTEST
+	bool "micronux-selftest"
+	depends on !BR2_USE_MMU
+	help
+	  Native bFLT hardening test for the MicroNUX NOMMU process,
+	  signal, timer, memory, stack, and console contracts.

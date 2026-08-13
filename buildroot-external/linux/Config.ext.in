@@ -1,0 +1,6 @@
+config BR2_LINUX_KERNEL_EXT_ESP_HOSTED_FG
+	bool "ESP-Hosted-FG in-tree driver"
+	select BR2_PACKAGE_ESP_HOSTED_FG
+	help
+	  Copy the pinned ESP-Hosted-FG host driver into the Linux source tree
+	  before patching so it can be linked into a NOMMU kernel.

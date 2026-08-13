@@ -1,0 +1,524 @@
+From 9673e21cbb846620088f6c250a84a2bed173fe04 Mon Sep 17 00:00:00 2001
+From: MicroNUX_Project <micronux@example.invalid>
+Date: Sun, 9 Aug 2026 12:13:14 -0700
+Subject: [PATCH 06/10] riscv: add MicroNUX per-mm user arenas
+
+Replace the globally exposed reserved user pool with one contiguous arena
+owned by each NOMMU mm. Suballocate mappings inside the arena. Zero pages
+before publishing bounds. Release ownership only when the mm is destroyed.
+This lets the user-return PMP overlay and access_ok use per-process bounds.
+
+Signed-off-by: MicroNUX_Project <micronux@example.invalid>
+---
+ arch/riscv/include/asm/micronux_user_pool.h |  10 +-
+ arch/riscv/include/asm/mmu.h                |   3 +
+ arch/riscv/include/asm/mmu_context.h        |  16 +-
+ arch/riscv/kernel/micronux_user_pmp.c       |   2 +-
+ arch/riscv/mm/micronux_user_pool.c          | 246 +++++++++++++++++---
+ fs/binfmt_flat.c                            |  11 +
+ mm/nommu.c                                  |  17 +-
+ 7 files changed, 254 insertions(+), 51 deletions(-)
+
+diff --git a/arch/riscv/include/asm/micronux_user_pool.h b/arch/riscv/include/asm/micronux_user_pool.h
+index 269d663..7ffde3b 100644
+--- a/arch/riscv/include/asm/micronux_user_pool.h
++++ b/arch/riscv/include/asm/micronux_user_pool.h
+@@ -4,10 +4,14 @@
+ 
+ #include <linux/types.h>
+ 
+-#include <asm/micronux_user_isolation.h>
++struct mm_struct;
++struct micronux_user_arena;
+ 
+-void *micronux_user_pool_alloc(unsigned long nr_pages);
+-bool micronux_user_pool_free(unsigned long start, unsigned long end);
++int micronux_user_arena_prepare(struct mm_struct *mm, unsigned long bytes);
++void *micronux_user_arena_alloc(struct mm_struct *mm,
++				unsigned long nr_pages);
++bool micronux_user_arena_free(unsigned long start, unsigned long end);
++void micronux_user_arena_release(struct mm_struct *mm);
+ bool micronux_user_pool_contains(unsigned long start, unsigned long end);
+ bool micronux_user_pool_ready(void);
+ unsigned long micronux_user_pool_free_pages(void);
+diff --git a/arch/riscv/include/asm/mmu.h b/arch/riscv/include/asm/mmu.h
+index dcff4c4..ce4962f 100644
+--- a/arch/riscv/include/asm/mmu.h
++++ b/arch/riscv/include/asm/mmu.h
+@@ -9,10 +9,13 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
++struct micronux_user_arena;
++
+ typedef struct {
+ #ifndef CONFIG_MMU
+ 	unsigned long	end_brk;
+ #ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++	struct micronux_user_arena *user_arena;
+ 	unsigned long	user_lo;
+ 	unsigned long	user_hi;
+ 	bool		user_bounds_valid;
+diff --git a/arch/riscv/include/asm/mmu_context.h b/arch/riscv/include/asm/mmu_context.h
+index 9bea559..07b571e 100644
+--- a/arch/riscv/include/asm/mmu_context.h
++++ b/arch/riscv/include/asm/mmu_context.h
+@@ -36,20 +36,22 @@ static inline int init_new_context(struct task_struct *tsk,
+ 	atomic_long_set(&mm->context.id, 0);
+ #endif
+ #ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++	mm->context.user_arena = NULL;
+ 	mm->context.user_lo = 0;
+ 	mm->context.user_hi = 0;
+ 	mm->context.user_bounds_valid = false;
+-	if (micronux_user_pool_ready()) {
+-		micronux_user_pool_bounds(&mm->context.user_lo,
+-					  &mm->context.user_hi);
+-		mm->context.user_bounds_valid =
+-			mm->context.user_lo == MICRONUX_USER_POOL_START &&
+-			mm->context.user_hi == MICRONUX_USER_POOL_END;
+-	}
+ #endif
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++#define destroy_context destroy_context
++static inline void destroy_context(struct mm_struct *mm)
++{
++	micronux_user_arena_release(mm);
++}
++#endif
++
+ DECLARE_STATIC_KEY_FALSE(use_asid_allocator);
+ 
+ #include <asm-generic/mmu_context.h>
+diff --git a/arch/riscv/kernel/micronux_user_pmp.c b/arch/riscv/kernel/micronux_user_pmp.c
+index 466e1f5..e82c630 100644
+--- a/arch/riscv/kernel/micronux_user_pmp.c
++++ b/arch/riscv/kernel/micronux_user_pmp.c
+@@ -116,6 +116,6 @@ void micronux_user_pmp_prepare_return(void)
+ 	if (!micronux_user_pmp_program(lo, hi, true))
+ 		micronux_user_pmp_fail("csr-readback");
+ 
+-	pr_info_once("MICRONUX:M7:PMP cached=7-9 direct=12-13 mode=tor+napot state=ready range=[%08lx,%08lx) config=08,0f,08,08,18 lock=off\n",
++	pr_info_once("MICRONUX:M7:PMP cached=7-9 direct=12-13 mode=per-mm+tor+napot state=ready first=[%08lx,%08lx) config=08,0f,08,08,18 lock=off\n",
+ 		     lo, hi);
+ }
+diff --git a/arch/riscv/mm/micronux_user_pool.c b/arch/riscv/mm/micronux_user_pool.c
+index 92b5d7a..0302596 100644
+--- a/arch/riscv/mm/micronux_user_pool.c
++++ b/arch/riscv/mm/micronux_user_pool.c
+@@ -1,31 +1,46 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-/* Dedicated U-mode mapping pool for the MicroNUX ESP32-P4 NOMMU profile. */
++/* Per-mm U-mode arenas for the MicroNUX ESP32-P4 NOMMU profile. */
+ 
+ #include <linux/bitmap.h>
+ #include <linux/init.h>
+ #include <linux/kernel.h>
++#include <linux/mm.h>
+ #include <linux/of_reserved_mem.h>
+ #include <linux/overflow.h>
+ #include <linux/proc_fs.h>
+ #include <linux/sched.h>
+ #include <linux/seq_file.h>
++#include <linux/slab.h>
+ #include <linux/spinlock.h>
+ #include <linux/string.h>
+ 
+ #include <asm/page.h>
++#include <asm/micronux_user_isolation.h>
+ #include <asm/micronux_user_pool.h>
+ 
+ #define MICRONUX_USER_POOL_SIZE		(MICRONUX_USER_POOL_END - \
+ 					 MICRONUX_USER_POOL_START)
+ #define MICRONUX_USER_POOL_MAX_PAGES	(MICRONUX_USER_POOL_SIZE / PAGE_SIZE)
+ 
+-static DECLARE_BITMAP(micronux_user_bitmap,
++struct micronux_user_arena {
++	struct mm_struct *mm;
++	unsigned long first;
++	unsigned long reserved_pages;
++	unsigned long mapped_pages;
++	DECLARE_BITMAP(mapped, MICRONUX_USER_POOL_MAX_PAGES);
++};
++
++static DECLARE_BITMAP(micronux_user_reserved,
+ 			      MICRONUX_USER_POOL_MAX_PAGES);
++static struct micronux_user_arena
++	*micronux_user_owner[MICRONUX_USER_POOL_MAX_PAGES];
+ static DEFINE_SPINLOCK(micronux_user_pool_lock);
+ static unsigned long micronux_user_start;
+ static unsigned long micronux_user_end;
+ static unsigned long micronux_user_pages;
+-static unsigned long micronux_user_used_pages;
++static unsigned long micronux_user_reserved_pages;
++static unsigned long micronux_user_mapped_pages;
++static unsigned long micronux_user_arenas;
+ static bool micronux_pool_is_ready;
+ 
+ static int __init micronux_user_pool_init(struct reserved_mem *rmem)
+@@ -46,10 +61,11 @@ static int __init micronux_user_pool_init(struct reserved_mem *rmem)
+ 	micronux_user_start = (unsigned long)rmem->base;
+ 	micronux_user_end = (unsigned long)end;
+ 	micronux_user_pages = rmem->size >> PAGE_SHIFT;
+-	bitmap_zero(micronux_user_bitmap, MICRONUX_USER_POOL_MAX_PAGES);
++	bitmap_zero(micronux_user_reserved, MICRONUX_USER_POOL_MAX_PAGES);
++	memset(micronux_user_owner, 0, sizeof(micronux_user_owner));
+ 	micronux_pool_is_ready = true;
+ 
+-	pr_info("MICRONUX:M7:POOL state=ready range=[%08lx,%08lx) pages=%lu zero=on-allocate\n",
++	pr_info("MICRONUX:M7:POOL state=ready range=[%08lx,%08lx) pages=%lu zero=on-arena+allocate ownership=per-mm\n",
+ 		micronux_user_start, micronux_user_end,
+ 		micronux_user_pages);
+ 	return 0;
+@@ -102,76 +118,238 @@ unsigned long micronux_user_pool_free_pages(void)
+ 	unsigned long free_pages;
+ 
+ 	spin_lock_irqsave(&micronux_user_pool_lock, flags);
+-	free_pages = micronux_user_pages - micronux_user_used_pages;
++	free_pages = micronux_user_pages - micronux_user_reserved_pages;
+ 	spin_unlock_irqrestore(&micronux_user_pool_lock, flags);
+ 	return free_pages;
+ }
+ 
+-void *micronux_user_pool_alloc(unsigned long nr_pages)
++int micronux_user_arena_prepare(struct mm_struct *mm, unsigned long bytes)
+ {
++	struct micronux_user_arena *arena;
+ 	unsigned long flags;
++	unsigned long rounded;
++	unsigned long nr_pages;
+ 	unsigned long index;
+-	void *result;
++	unsigned long page;
++	unsigned long start;
+ 
+-	if (!micronux_user_pool_ready() || !nr_pages ||
+-	    nr_pages > micronux_user_pages)
+-		return NULL;
++	if (!mm || !micronux_user_pool_ready() || !bytes ||
++	    check_add_overflow(bytes, PAGE_SIZE - 1, &rounded))
++		return -EINVAL;
++	nr_pages = rounded >> PAGE_SHIFT;
++	if (!nr_pages || nr_pages > micronux_user_pages)
++		return -ENOMEM;
++
++	arena = kzalloc(sizeof(*arena), GFP_KERNEL);
++	if (!arena)
++		return -ENOMEM;
++	arena->mm = mm;
+ 
+ 	spin_lock_irqsave(&micronux_user_pool_lock, flags);
+-	index = bitmap_find_next_zero_area(micronux_user_bitmap,
+-					  micronux_user_pages, 0,
+-					  nr_pages, 0);
++	if (READ_ONCE(mm->context.user_arena) ||
++	    READ_ONCE(mm->context.user_bounds_valid)) {
++		spin_unlock_irqrestore(&micronux_user_pool_lock, flags);
++		kfree(arena);
++		return -EBUSY;
++	}
++	index = bitmap_find_next_zero_area(micronux_user_reserved,
++					   micronux_user_pages, 0,
++					   nr_pages, 0);
+ 	if (index >= micronux_user_pages ||
+ 	    nr_pages > micronux_user_pages - index) {
+ 		spin_unlock_irqrestore(&micronux_user_pool_lock, flags);
++		kfree(arena);
++		return -ENOMEM;
++	}
++
++	arena->first = index;
++	arena->reserved_pages = nr_pages;
++	bitmap_set(micronux_user_reserved, index, nr_pages);
++	for (page = index; page < index + nr_pages; ++page)
++		micronux_user_owner[page] = arena;
++	micronux_user_reserved_pages += nr_pages;
++	++micronux_user_arenas;
++	spin_unlock_irqrestore(&micronux_user_pool_lock, flags);
++
++	start = micronux_user_start + (index << PAGE_SHIFT);
++	memset((void *)start, 0, nr_pages << PAGE_SHIFT);
++	WRITE_ONCE(mm->context.user_arena, arena);
++	WRITE_ONCE(mm->context.user_lo, start);
++	WRITE_ONCE(mm->context.user_hi, start + (nr_pages << PAGE_SHIFT));
++	/* Publish valid bounds only after the arena has been fully zeroed. */
++	smp_wmb();
++	WRITE_ONCE(mm->context.user_bounds_valid, true);
++	return 0;
++}
++
++void *micronux_user_arena_alloc(struct mm_struct *mm,
++				unsigned long nr_pages)
++{
++	struct micronux_user_arena *arena;
++	unsigned long flags;
++	unsigned long index;
++	unsigned long page;
++	unsigned long start;
++	unsigned long old_reserved;
++	bool expanded = false;
++
++	if (!mm || !nr_pages || nr_pages > micronux_user_pages ||
++	    !READ_ONCE(mm->context.user_bounds_valid))
++		return NULL;
++	arena = READ_ONCE(mm->context.user_arena);
++	if (!arena || arena->mm != mm)
+ 		return NULL;
++
++	spin_lock_irqsave(&micronux_user_pool_lock, flags);
++	index = bitmap_find_next_zero_area(arena->mapped,
++					   arena->reserved_pages, 0,
++					   nr_pages, 0);
++	if (index >= arena->reserved_pages ||
++	    nr_pages > arena->reserved_pages - index) {
++		index = arena->reserved_pages;
++		old_reserved = arena->reserved_pages;
++		page = arena->first + old_reserved;
++		if (page > micronux_user_pages ||
++		    nr_pages > micronux_user_pages - page ||
++		    find_next_bit(micronux_user_reserved, page + nr_pages,
++				  page) < page + nr_pages) {
++			spin_unlock_irqrestore(&micronux_user_pool_lock, flags);
++			return NULL;
++		}
++		bitmap_set(micronux_user_reserved, page, nr_pages);
++		while (page < arena->first + old_reserved + nr_pages) {
++			micronux_user_owner[page] = arena;
++			++page;
++		}
++		arena->reserved_pages += nr_pages;
++		micronux_user_reserved_pages += nr_pages;
++		expanded = true;
+ 	}
+-	bitmap_set(micronux_user_bitmap, index, nr_pages);
+-	micronux_user_used_pages += nr_pages;
++	bitmap_set(arena->mapped, index, nr_pages);
++	arena->mapped_pages += nr_pages;
++	micronux_user_mapped_pages += nr_pages;
++	start = micronux_user_start +
++		((arena->first + index) << PAGE_SHIFT);
+ 	spin_unlock_irqrestore(&micronux_user_pool_lock, flags);
+ 
+-	result = (void *)(micronux_user_start + (index << PAGE_SHIFT));
+-	memset(result, 0, nr_pages << PAGE_SHIFT);
+-	return result;
++	memset((void *)start, 0, nr_pages << PAGE_SHIFT);
++	if (expanded) {
++		/* Do not expose newly reserved pages until zeroing is visible. */
++		smp_wmb();
++		WRITE_ONCE(mm->context.user_hi,
++			   micronux_user_start +
++			   ((arena->first + arena->reserved_pages) << PAGE_SHIFT));
++	}
++	return (void *)start;
+ }
+ 
+-bool micronux_user_pool_free(unsigned long start, unsigned long end)
++bool micronux_user_arena_free(unsigned long start, unsigned long end)
+ {
++	struct micronux_user_arena *arena;
+ 	unsigned long flags;
+ 	unsigned long first;
++	unsigned long relative;
+ 	unsigned long nr_pages;
+-	unsigned long clear;
++	unsigned long page;
+ 
+ 	if (!micronux_user_pool_contains(start, end) || start == end ||
+ 	    !IS_ALIGNED(start, PAGE_SIZE) || !IS_ALIGNED(end, PAGE_SIZE))
+ 		return false;
+-
+ 	first = (start - micronux_user_start) >> PAGE_SHIFT;
+ 	nr_pages = (end - start) >> PAGE_SHIFT;
+ 
+ 	spin_lock_irqsave(&micronux_user_pool_lock, flags);
+-	clear = find_next_zero_bit(micronux_user_bitmap,
+-				   first + nr_pages, first);
+-	if (clear < first + nr_pages ||
+-	    nr_pages > micronux_user_used_pages) {
+-		spin_unlock_irqrestore(&micronux_user_pool_lock, flags);
+-		return false;
++	arena = micronux_user_owner[first];
++	if (!arena || first < arena->first ||
++	    nr_pages > arena->reserved_pages - (first - arena->first))
++		goto invalid;
++	for (page = first; page < first + nr_pages; ++page) {
++		if (micronux_user_owner[page] != arena)
++			goto invalid;
+ 	}
+-	bitmap_clear(micronux_user_bitmap, first, nr_pages);
+-	micronux_user_used_pages -= nr_pages;
++	relative = first - arena->first;
++	if (find_next_zero_bit(arena->mapped, relative + nr_pages,
++			       relative) < relative + nr_pages ||
++	    nr_pages > arena->mapped_pages ||
++	    nr_pages > micronux_user_mapped_pages)
++		goto invalid;
++	bitmap_clear(arena->mapped, relative, nr_pages);
++	arena->mapped_pages -= nr_pages;
++	micronux_user_mapped_pages -= nr_pages;
+ 	spin_unlock_irqrestore(&micronux_user_pool_lock, flags);
+ 	return true;
++
++invalid:
++	spin_unlock_irqrestore(&micronux_user_pool_lock, flags);
++	return false;
++}
++
++void micronux_user_arena_release(struct mm_struct *mm)
++{
++	struct micronux_user_arena *arena;
++	unsigned long flags;
++	unsigned long page;
++
++	if (!mm)
++		return;
++	arena = READ_ONCE(mm->context.user_arena);
++	WRITE_ONCE(mm->context.user_bounds_valid, false);
++	/* Revoke U-mode access before clearing and releasing the arena. */
++	smp_wmb();
++	WRITE_ONCE(mm->context.user_lo, 0);
++	WRITE_ONCE(mm->context.user_hi, 0);
++	WRITE_ONCE(mm->context.user_arena, NULL);
++	if (!arena)
++		return;
++
++	spin_lock_irqsave(&micronux_user_pool_lock, flags);
++	if (WARN_ON_ONCE(arena->mm != mm || !arena->reserved_pages ||
++			 arena->first >= micronux_user_pages ||
++			 arena->reserved_pages >
++			 micronux_user_pages - arena->first ||
++			 arena->reserved_pages > micronux_user_reserved_pages ||
++			 arena->mapped_pages > micronux_user_mapped_pages ||
++			 !micronux_user_arenas)) {
++		spin_unlock_irqrestore(&micronux_user_pool_lock, flags);
++		return;
++	}
++	WARN_ON_ONCE(arena->mapped_pages != 0);
++	for (page = arena->first;
++	     page < arena->first + arena->reserved_pages; ++page) {
++		if (WARN_ON_ONCE(micronux_user_owner[page] != arena ||
++				 !test_bit(page, micronux_user_reserved))) {
++			spin_unlock_irqrestore(&micronux_user_pool_lock, flags);
++			return;
++		}
++	}
++	for (page = arena->first;
++	     page < arena->first + arena->reserved_pages; ++page)
++		micronux_user_owner[page] = NULL;
++	bitmap_clear(micronux_user_reserved, arena->first,
++		     arena->reserved_pages);
++	micronux_user_reserved_pages -= arena->reserved_pages;
++	micronux_user_mapped_pages -= arena->mapped_pages;
++	--micronux_user_arenas;
++	spin_unlock_irqrestore(&micronux_user_pool_lock, flags);
++	kfree(arena);
+ }
+ 
+ static int micronux_user_pool_proc_show(struct seq_file *file, void *unused)
+ {
+-	unsigned long free_pages;
++	unsigned long flags;
++	unsigned long reserved;
++	unsigned long mapped;
++	unsigned long arenas;
+ 
+-	free_pages = micronux_user_pool_free_pages();
++	spin_lock_irqsave(&micronux_user_pool_lock, flags);
++	reserved = micronux_user_reserved_pages;
++	mapped = micronux_user_mapped_pages;
++	arenas = micronux_user_arenas;
++	spin_unlock_irqrestore(&micronux_user_pool_lock, flags);
+ 	seq_printf(file,
+-		   "MICRONUX:M7:POOL range=[%08lx,%08lx) pages=%lu used=%lu free=%lu\n",
++		   "MICRONUX:M7:POOL range=[%08lx,%08lx) pages=%lu reserved=%lu mapped=%lu free=%lu arenas=%lu\n",
+ 		   micronux_user_start, micronux_user_end, micronux_user_pages,
+-		   micronux_user_pages - free_pages, free_pages);
++		   reserved, mapped, micronux_user_pages - reserved, arenas);
+ 	return 0;
+ }
+ 
+diff --git a/fs/binfmt_flat.c b/fs/binfmt_flat.c
+index a095cd6..4e69e91 100644
+--- a/fs/binfmt_flat.c
++++ b/fs/binfmt_flat.c
+@@ -41,6 +41,9 @@
+ #include <linux/sizes.h>
+ 
+ #include <asm/byteorder.h>
++#ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++#include <asm/micronux_user_pool.h>
++#endif
+ #include <linux/unaligned.h>
+ #include <asm/cacheflush.h>
+ #include <asm/page.h>
+@@ -573,6 +576,14 @@ static int load_flat_file(struct linux_binprm *bprm,
+ 		goto err;
+ 	}
+ 
++#ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++	ret = micronux_user_arena_prepare(bprm->mm, initial_mapping);
++	if (ret) {
++		pr_err("MicroNUX could not reserve a per-mm arena: %d\n", ret);
++		goto err;
++	}
++#endif
++
+ 	/* Flush all traces of the currently running executable */
+ 	ret = begin_new_exec(bprm);
+ 	if (ret)
+diff --git a/mm/nommu.c b/mm/nommu.c
+index f73daa3..f4f9d57 100644
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -493,7 +493,7 @@ static void free_page_series(unsigned long from, unsigned long to)
+ #ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
+ 	unsigned long nr_pages;
+ 
+-	if (WARN_ON_ONCE(!micronux_user_pool_free(from, to)))
++	if (WARN_ON_ONCE(!micronux_user_arena_free(from, to)))
+ 		return;
+ 
+ 	nr_pages = (to - from) >> PAGE_SHIFT;
+@@ -936,9 +936,13 @@ static int do_mmap_private(struct vm_area_struct *vma,
+ 			   unsigned long len,
+ 			   unsigned long capabilities)
+ {
+-	unsigned long total, point;
++	unsigned long total;
+ 	void *base;
+-	int ret, order;
++	int ret;
++#ifndef CONFIG_MICRONUX_ESP32P4_ISOLATION
++	unsigned long point;
++	int order;
++#endif
+ 
+ 	/*
+ 	 * Invoke the file's mapping function so that it can keep track of
+@@ -968,6 +972,10 @@ static int do_mmap_private(struct vm_area_struct *vma,
+ 	 * - note that this may not return a page-aligned address if the object
+ 	 *   we're allocating is smaller than a page
+ 	 */
++#ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
++	total = PAGE_ALIGN(len) >> PAGE_SHIFT;
++	base = micronux_user_arena_alloc(current->mm, total);
++#else
+ 	order = get_order(len);
+ 	total = 1 << order;
+ 	point = len >> PAGE_SHIFT;
+@@ -976,9 +984,6 @@ static int do_mmap_private(struct vm_area_struct *vma,
+ 	if (sysctl_nr_trim_pages && total - point >= sysctl_nr_trim_pages)
+ 		total = point;
+ 
+-#ifdef CONFIG_MICRONUX_ESP32P4_ISOLATION
+-	base = micronux_user_pool_alloc(total);
+-#else
+ 	base = alloc_pages_exact(total << PAGE_SHIFT, GFP_KERNEL);
+ #endif
+ 	if (!base)
+-- 
+2.43.0

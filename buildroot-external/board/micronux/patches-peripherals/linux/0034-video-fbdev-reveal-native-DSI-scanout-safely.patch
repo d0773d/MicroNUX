@@ -1,0 +1,1381 @@
+From 3286f665d4a4751f2073e702cd8d7cbf1590b7b3 Mon Sep 17 00:00:00 2001
+From: d0773d <dottedquad@gmail.com>
+Date: Wed, 12 Aug 2026 02:33:10 -0700
+Subject: [PATCH 34/46] video: fbdev: reveal native DSI scanout safely
+
+Expose the ABI-v3 boot_ready gate only after the qualified native
+framebuffer is live. Bind its one-shot request to a completed userspace
+commit and four additional clean same-front completions before
+reacquiring I2C.
+
+Keep the external adapter at PWM zero and control 0x13 throughout dark
+qualification, then issue the ACKed boot reveal as control 0x17 followed
+by PWM 63. Register the backlight at that boundary, publish truthful
+ABI-v3 runtime diagnostics, and defer touch registration until after
+reveal.
+
+Continue native health monitoring through reveal and runtime. On any
+scanout, host, bridge, GDMA, pool, I2C, or backlight-control fault,
+command PWM zero and control 0x13 before teardown; preserve the current
+source when darkness cannot be confirmed. Make remove off-first but
+always release kernel resources, and leave ABI-v2 behavior unchanged.
+
+Signed-off-by: d0773d <dottedquad@gmail.com>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 918 ++++++++++++++++++++++++++++--
+ 1 file changed, 881 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 81ed0de..8948d4a 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -32,6 +32,7 @@
+ #include <linux/spinlock.h>
+ #include <linux/uaccess.h>
+ #include <linux/unaligned.h>
++#include <linux/wait.h>
+ #include <linux/workqueue.h>
+ 
+ #define MICRONUX_DISPLAY_MAGIC		0x4d4e5844
+@@ -335,9 +336,11 @@
+ #define DW_GDMA_INT_COMMON_VALID_MASK	0x001fff8f
+ #define DW_GDMA_INT_COMMON_RO_MASK	0x001ffe80
+ #define DW_GDMA_INT_TOP_CHANNEL0	BIT(0)
++#define DW_GDMA_INT_TOP_INACTIVE	GENMASK(3, 1)
+ #define DW_GDMA_INT_TOP_COMMON		BIT(16)
+ #define DW_GDMA_INT_TOP_ALLOWED		(DW_GDMA_INT_TOP_CHANNEL0 | \
+ 					 DW_GDMA_INT_TOP_COMMON)
++#define DW_GDMA_CHANNEL_COUNT		4
+ #define DW_GDMA_LLP_MEMORY_PORT		BIT(0)
+ #define MICRONUX_DMA_BLOCK_TRANSFER_SIZE 0x0003e7ff
+ #define MICRONUX_DMA_DESCRIPTOR_CTRL_LO	0x001e1b41
+@@ -353,11 +356,16 @@
+ #define MICRONUX_SCANOUT_START_TIMEOUT_MS 500
+ #define MICRONUX_SCANOUT_STABLE_FRAMES	4
+ #define MICRONUX_NATIVE_QUALIFICATION_WINDOWS	2
++#define MICRONUX_NATIVE_REVEAL_TIMEOUT_MS	500
++#define MICRONUX_NATIVE_I2C_TRANSITION_MS	100
+ #define MICRONUX_FRAME_REVEAL_RECENT_MS	250
+ #define MICRONUX_BACKLIGHT_OFF_SETTLE_MS 100
+ #define MICRONUX_DISPLAY_BACKLIGHT_DISABLED 0x13
+ #define MICRONUX_DISPLAY_BACKLIGHT_ENABLED 0x17
+ #define MICRONUX_VPG_SOURCE_SETTLE_MS	250
++
++static const char native_no_completion[] =
++	"MICRONUX:M9.2:REVEAL source-rearm=UNVERIFIED no-completion darkness=unconfirmed\n";
+ #define MICRONUX_VPG_TEST_MIN_MS	250
+ #define MICRONUX_VPG_TEST_MAX_MS	10000
+ 
+@@ -435,6 +443,7 @@
+ #define MICRONUX_FAULT_STALE_FRAME	2
+ #define MICRONUX_FAULT_DSI_HOST		3
+ #define MICRONUX_FAULT_POOL_GUARD	4
++#define MICRONUX_FAULT_BACKLIGHT_CONTROL 5
+ #define MICRONUX_STALE_POLL_LIMIT	6
+ 
+ #define MICRONUX_TOUCH_ADDRESS_PRIMARY	0x5d
+@@ -637,12 +646,20 @@ enum micronux_display_state {
+ 	MICRONUX_DISPLAY_STATE_PANEL_PROGRAMMED_QUIESCENT,
+ 	MICRONUX_DISPLAY_STATE_SCANOUT_INITIALIZING,
+ 	MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT,
++	MICRONUX_DISPLAY_STATE_REVEALING,
++	MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED,
+ 	MICRONUX_DISPLAY_STATE_REMOVING,
+ 	MICRONUX_DISPLAY_STATE_FAILED_QUIESCENT,
+ 	MICRONUX_DISPLAY_STATE_FAILED_UNVERIFIED,
+ 	MICRONUX_DISPLAY_STATE_RUNTIME_READY,
+ };
+ 
++enum micronux_native_i2c_state {
++	MICRONUX_NATIVE_I2C_RELEASED,
++	MICRONUX_NATIVE_I2C_TRANSITION,
++	MICRONUX_NATIVE_I2C_ACTIVE_SERIALIZED,
++};
++
+ struct micronux_i2c_timing {
+ 	u32 clkm_div;
+ 	u32 scl_low;
+@@ -698,10 +715,12 @@ struct micronux_dsi {
+ 	/* Serializes fbdev writes and back-buffer preparation. */
+ 	struct mutex render_lock;
+ 	struct delayed_work render_work;
++	struct work_struct touch_register_work;
+ 	/* Protects front, queued, and render buffer roles from the DMA IRQ. */
+ 	spinlock_t state_lock;
+ 	/* Serializes the read-to-clear DSI host status registers. */
+ 	spinlock_t host_status_lock;
++	wait_queue_head_t frame_wait;
+ 	struct micronux_display_handoff_v2 handoff;
+ 	struct micronux_display_handoff_v3 cold_handoff;
+ 	enum micronux_display_state display_state;
+@@ -721,6 +740,11 @@ struct micronux_dsi {
+ 	u32 host_error0;
+ 	u32 host_error1;
+ 	u32 vpg_dpi_status1;
++	u64 next_commit_sequence;
++	u64 buffer_commit_sequence[MICRONUX_DISPLAY_BUFFER_COUNT];
++	u64 front_commit_sequence;
++	u64 presented_commit_sequence;
++	u64 dark_baseline_commit_sequence;
+ 	u32 watchdog_frames;
+ 	u32 watchdog_sar;
+ 	unsigned long fault_bits;
+@@ -729,6 +753,7 @@ struct micronux_dsi {
+ 	u8 applied_brightness;
+ 	bool backlight_gate_enabled;
+ 	u8 front_index;
++	u8 presented_index;
+ 	u8 render_index;
+ 	s8 queued_index;
+ 	bool render_needs_sync;
+@@ -756,6 +781,17 @@ struct micronux_dsi {
+ 	bool cold_timer_initialized;
+ 	bool cold_runtime_unverified;
+ 	bool render_enabled;
++	bool boot_ready_consumed;
++	bool boot_ready_file_created;
++	bool native_runtime_group_created;
++	bool native_backlight_registered;
++	bool touch_registration_complete;
++	bool native_preserve_source;
++	bool native_dark_confirmed;
++	bool native_reveal_may_be_lit;
++	bool native_source_rearm_unverified;
++	enum micronux_native_i2c_state native_i2c_state;
++	unsigned long native_i2c_transition_deadline;
+ 	struct hrtimer scanout_timer;
+ 	struct work_struct fault_work;
+ };
+@@ -991,6 +1027,16 @@ static bool micronux_pool_guards_valid(struct micronux_dsi *dsi, bool full)
+ 
+ static bool micronux_source_policy_valid(struct micronux_dsi *dsi,
+ 					 bool vpg);
++static bool micronux_native_runtime_policy_valid(struct micronux_dsi *dsi);
++
++static bool micronux_native_scanout_live_state(struct micronux_dsi *dsi)
++{
++	enum micronux_display_state state = READ_ONCE(dsi->display_state);
++
++	return state == MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT ||
++	       state == MICRONUX_DISPLAY_STATE_REVEALING ||
++	       state == MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED;
++}
+ 
+ static bool micronux_visible_source_valid(struct micronux_dsi *dsi)
+ {
+@@ -999,6 +1045,28 @@ static bool micronux_visible_source_valid(struct micronux_dsi *dsi)
+ 
+ 	if (!READ_ONCE(dsi->scanout_ready))
+ 		return false;
++	if (dsi->required_handoff_abi ==
++	    MICRONUX_DISPLAY_ABI_VERSION_V3) {
++		if (micronux_sample_host_status(dsi, 0))
++			micronux_latch_fault(dsi, MICRONUX_FAULT_DSI_HOST);
++		if (READ_ONCE(dsi->display_state) !=
++			MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED ||
++		    !READ_ONCE(dsi->boot_display_ready) ||
++		    !READ_ONCE(dsi->scanout_active) ||
++		    READ_ONCE(dsi->fault_bits) ||
++		    !micronux_pool_guards_valid(dsi, false) ||
++		    !micronux_host_status_clean(dsi) ||
++		    READ_ONCE(dsi->last_dma_error) ||
++		    (readl(dsi->bridge + DSI_BRG_INT_RAW) &
++		     DSI_BRG_INT_UNDERRUN) ||
++		    !micronux_native_runtime_policy_valid(dsi))
++			return false;
++		last_frame = READ_ONCE(dsi->last_frame_jiffies);
++		return last_frame &&
++		       !time_after(jiffies,
++				   last_frame +
++				   msecs_to_jiffies(MICRONUX_FRAME_REVEAL_RECENT_MS));
++	}
+ 	vpg = READ_ONCE(dsi->vpg_test_active);
+ 	if (!vpg)
+ 		(void)micronux_sample_host_status(dsi, 0);
+@@ -1044,6 +1112,118 @@ static int micronux_backlight_disable(struct micronux_dsi *dsi)
+ 	return 0;
+ }
+ 
++static int micronux_native_write_pwm(struct micronux_dsi *dsi, u8 brightness)
++{
++	u8 address = dsi->cold_handoff.i2c_address;
++	u8 reg = dsi->cold_handoff.backlight_register;
++
++	return micronux_i2c_write_reg8(dsi, address, reg, brightness);
++}
++
++static int micronux_native_write_control(struct micronux_dsi *dsi, u8 command)
++{
++	u8 address = dsi->cold_handoff.i2c_address;
++	u8 reg = dsi->cold_handoff.display_control_register;
++
++	return micronux_i2c_write_reg8(dsi, address, reg, command);
++}
++
++static void micronux_native_latch_backlight_fault(struct micronux_dsi *dsi,
++						  int error)
++{
++	if (!error)
++		return;
++	set_bit(MICRONUX_FAULT_BACKLIGHT_CONTROL, &dsi->fault_bits);
++	/* The worker waits for any active backlight ops_lock owner. */
++	schedule_work(&dsi->fault_work);
++}
++
++static int micronux_native_backlight_disable(struct micronux_dsi *dsi)
++{
++	u8 command = dsi->cold_handoff.display_control_reset_prepare_command;
++	int control_ret, pwm_ret;
++
++	pwm_ret = micronux_native_write_pwm(dsi, 0);
++	if (!pwm_ret)
++		WRITE_ONCE(dsi->applied_brightness, 0);
++	control_ret = micronux_native_write_control(dsi, command);
++	if (!control_ret)
++		WRITE_ONCE(dsi->backlight_gate_enabled, false);
++	micronux_native_latch_backlight_fault(dsi, pwm_ret ? pwm_ret : control_ret);
++	return pwm_ret ? pwm_ret : control_ret;
++}
++
++static int
++micronux_native_backlight_update(struct backlight_device *backlight)
++{
++	struct micronux_dsi *dsi = bl_get_data(backlight);
++	u8 brightness = backlight_get_brightness(backlight);
++	u8 reveal_command = dsi->cold_handoff.display_control_reveal_command;
++	int control_ret = 0, off_ret, pwm_ret;
++
++	if (READ_ONCE(dsi->display_state) !=
++	    MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED)
++		return -EAGAIN;
++	if (backlight_is_blank(backlight))
++		brightness = 0;
++	if (!brightness)
++		return micronux_native_backlight_disable(dsi);
++	if (!micronux_visible_source_valid(dsi)) {
++		off_ret = micronux_native_backlight_disable(dsi);
++		backlight->props.brightness = 0;
++		backlight->props.power = FB_BLANK_POWERDOWN;
++		return off_ret ? off_ret : -EHOSTDOWN;
++	}
++
++	if (!READ_ONCE(dsi->backlight_gate_enabled)) {
++		pwm_ret = micronux_native_write_pwm(dsi, 0);
++		if (pwm_ret) {
++			micronux_native_latch_backlight_fault(dsi, pwm_ret);
++			goto rollback;
++		}
++		WRITE_ONCE(dsi->applied_brightness, 0);
++		control_ret = micronux_native_write_control(dsi, reveal_command);
++		if (control_ret) {
++			micronux_native_latch_backlight_fault(dsi, control_ret);
++			goto rollback;
++		}
++		WRITE_ONCE(dsi->backlight_gate_enabled, true);
++		pwm_ret = micronux_native_write_pwm(dsi, brightness);
++		if (pwm_ret) {
++			micronux_native_latch_backlight_fault(dsi, pwm_ret);
++			goto rollback;
++		}
++		WRITE_ONCE(dsi->applied_brightness, brightness);
++		if (!micronux_visible_source_valid(dsi)) {
++			pwm_ret = -EHOSTDOWN;
++			goto rollback;
++		}
++		return 0;
++	}
++	pwm_ret = micronux_native_write_pwm(dsi, brightness);
++	if (pwm_ret)
++		micronux_native_latch_backlight_fault(dsi, pwm_ret);
++	if (!pwm_ret) {
++		WRITE_ONCE(dsi->applied_brightness, brightness);
++		if (!micronux_visible_source_valid(dsi)) {
++			pwm_ret = -EHOSTDOWN;
++			goto rollback;
++		}
++		return 0;
++	}
++
++rollback:
++	off_ret = micronux_native_backlight_disable(dsi);
++	/* Do not leave a failed positive request armed for a later unblank. */
++	backlight->props.brightness = 0;
++	backlight->props.power = FB_BLANK_POWERDOWN;
++	if (off_ret)
++		dev_err(dsi->dev,
++			"native backlight rollback was not fully ACKed: %d\n",
++			off_ret);
++	return control_ret ? control_ret : pwm_ret;
++}
++
+ static int micronux_backlight_update(struct backlight_device *backlight)
+ {
+ 	struct micronux_dsi *dsi = bl_get_data(backlight);
+@@ -1052,6 +1232,10 @@ static int micronux_backlight_update(struct backlight_device *backlight)
+ 	bool policy_valid, vpg;
+ 	int disable_ret, gate_ret, pwm_ret;
+ 
++	if (dsi->required_handoff_abi ==
++	    MICRONUX_DISPLAY_ABI_VERSION_V3)
++		return micronux_native_backlight_update(backlight);
++
+ 	if (backlight_is_blank(backlight))
+ 		brightness = 0;
+ 	if (!brightness)
+@@ -1127,6 +1311,17 @@ static int micronux_backlight_set_power(struct micronux_dsi *dsi, int power)
+ 
+ static void micronux_cold_runtime_fail_quiescent(struct micronux_dsi *dsi,
+ 						 const char *stage, int error);
++static void micronux_native_fail_reveal_locked(struct micronux_dsi *dsi,
++					       const char *stage, int error,
++					       bool force_teardown);
++static void micronux_commit_render_locked(struct micronux_dsi *dsi);
++static int micronux_cold_i2c_initialize(struct micronux_dsi *dsi);
++static int micronux_register_native_backlight(struct micronux_dsi *dsi);
++static int
++micronux_native_requalify_front(struct micronux_dsi *dsi, u64 target);
++static bool micronux_native_final_status_clean(struct micronux_dsi *dsi);
++static const struct attribute_group micronux_native_runtime_group;
++static void micronux_native_unregister_runtime_objects(struct micronux_dsi *dsi);
+ 
+ static void micronux_fault_work(struct work_struct *work)
+ {
+@@ -1139,10 +1334,16 @@ static void micronux_fault_work(struct work_struct *work)
+ 	faults = READ_ONCE(dsi->fault_bits);
+ 	if (dsi->required_handoff_abi ==
+ 	    MICRONUX_DISPLAY_ABI_VERSION_V3) {
+-		if (faults &&
+-		    READ_ONCE(dsi->display_state) ==
+-			MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT)
+-			micronux_cold_runtime_fail_quiescent(dsi, "runtime-fault", -EIO);
++		enum micronux_display_state state =
++			READ_ONCE(dsi->display_state);
++
++		if (faults && state ==
++		    MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT)
++			micronux_cold_runtime_fail_quiescent(dsi, "runtime-fault-dark", -EIO);
++		else if (faults &&
++			 (state == MICRONUX_DISPLAY_STATE_REVEALING ||
++			  state == MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED))
++			micronux_native_fail_reveal_locked(dsi, "runtime-fault", -EIO, false);
+ 		mutex_unlock(&dsi->mode_lock);
+ 		return;
+ 	}
+@@ -1169,6 +1370,156 @@ out:
+ 	mutex_unlock(&dsi->mode_lock);
+ }
+ 
++static ssize_t micronux_native_boot_ready_store(struct micronux_dsi *dsi,
++						const char *buf, size_t count)
++{
++	struct micronux_display_handoff_v3 *handoff = &dsi->cold_handoff;
++	unsigned long flags;
++	u64 target_commit;
++	u8 reveal_command = handoff->display_control_reveal_command;
++	bool backlight_locked = false, ready;
++	int ret;
++
++	ret = kstrtobool(buf, &ready);
++	if (ret)
++		return ret;
++	if (!ready)
++		return -EINVAL;
++
++	mutex_lock(&dsi->mode_lock);
++	if (READ_ONCE(dsi->boot_ready_consumed)) {
++		ret = -EALREADY;
++		goto unlock_mode;
++	}
++	if (READ_ONCE(dsi->display_state) !=
++	    MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT) {
++		ret = -EAGAIN;
++		goto unlock_mode;
++	}
++	WRITE_ONCE(dsi->boot_ready_consumed, true);
++	WRITE_ONCE(dsi->native_dark_confirmed, false);
++	WRITE_ONCE(dsi->native_preserve_source, true);
++	/* A published lit-capable state always has preserve-until-dark armed. */
++	smp_wmb();
++	WRITE_ONCE(dsi->display_state, MICRONUX_DISPLAY_STATE_REVEALING);
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:REVEAL state=REVEALING trigger=boot_ready source=framebuffer backlight=unregistered touch=unregistered i2c=released physical-panel-state=unobserved\n");
++
++	/* Do not hold render_lock while synchronously canceling its delayed user. */
++	cancel_delayed_work_sync(&dsi->render_work);
++	mutex_lock(&dsi->render_lock);
++	micronux_commit_render_locked(dsi);
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	target_commit = dsi->queued_index >= 0 ?
++		dsi->buffer_commit_sequence[dsi->queued_index] :
++		dsi->front_commit_sequence;
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++	if (target_commit <= dsi->dark_baseline_commit_sequence) {
++		ret = -ENODATA;
++		goto fail_render;
++	}
++	ret = micronux_native_requalify_front(dsi, target_commit);
++	if (ret)
++		goto fail_render;
++
++	WRITE_ONCE(dsi->native_i2c_transition_deadline,
++		   jiffies +
++		   msecs_to_jiffies(MICRONUX_NATIVE_I2C_TRANSITION_MS));
++	/* Publish the deadline before the timer can observe TRANSITION. */
++	smp_wmb();
++	WRITE_ONCE(dsi->native_i2c_state,
++		   MICRONUX_NATIVE_I2C_TRANSITION);
++	ret = micronux_cold_i2c_initialize(dsi);
++	if (ret)
++		goto fail_render;
++	WRITE_ONCE(dsi->native_i2c_state,
++		   MICRONUX_NATIVE_I2C_ACTIVE_SERIALIZED);
++	if (!micronux_native_runtime_policy_valid(dsi)) {
++		ret = -EIO;
++		goto fail_render;
++	}
++	ret = micronux_register_native_backlight(dsi);
++	if (ret)
++		goto fail_render;
++	mutex_lock(&dsi->backlight->ops_lock);
++	backlight_locked = true;
++	/* Reject core blank/suspend state, then erase rejected cached writes. */
++	if (dsi->backlight->props.state) {
++		ret = -EBUSY;
++		goto fail_render;
++	}
++	dsi->backlight->props.brightness = handoff->backlight_brightness;
++	dsi->backlight->props.power = FB_BLANK_POWERDOWN;
++	if (!micronux_native_final_status_clean(dsi)) {
++		ret = -EIO;
++		goto fail_render;
++	}
++
++	/* PWM is still the ACKed zero from Stage B; reveal control comes first. */
++	WRITE_ONCE(dsi->native_reveal_may_be_lit, true);
++	/* Publish possible illumination before the external gate write. */
++	smp_wmb();
++	ret = micronux_native_write_control(dsi, reveal_command);
++	if (ret)
++		goto fail_render;
++	WRITE_ONCE(dsi->backlight_gate_enabled, true);
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:REVEAL stage=control state=ACKED command=0x17 pwm=0 physical-panel-state=unobserved\n");
++	if (!micronux_native_final_status_clean(dsi)) {
++		ret = -EIO;
++		goto fail_render;
++	}
++	ret = micronux_native_write_pwm(dsi, handoff->backlight_brightness);
++	if (ret)
++		goto fail_render;
++	WRITE_ONCE(dsi->applied_brightness,
++		   handoff->backlight_brightness);
++	dsi->backlight->props.brightness = handoff->backlight_brightness;
++	dsi->backlight->props.power = FB_BLANK_UNBLANK;
++	if (!micronux_native_final_status_clean(dsi)) {
++		ret = -EIO;
++		goto fail_render;
++	}
++	ret = sysfs_create_group(&dsi->dev->kobj,
++				 &micronux_native_runtime_group);
++	if (ret)
++		goto fail_render;
++	dsi->native_runtime_group_created = true;
++	if (!micronux_native_final_status_clean(dsi)) {
++		ret = -EIO;
++		goto fail_render;
++	}
++	WRITE_ONCE(dsi->boot_display_ready, true);
++	WRITE_ONCE(dsi->render_enabled, true);
++	/* Publish ready/render gates before the terminal runtime state. */
++	smp_wmb();
++	WRITE_ONCE(dsi->display_state,
++		   MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED);
++	mutex_unlock(&dsi->backlight->ops_lock);
++	backlight_locked = false;
++	mutex_unlock(&dsi->render_lock);
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:REVEAL state=RUNTIME_REVEALED boot-ready=1 source=userspace-status commit=%llu frames=4 same-front=yes control-command=0x17-acked pwm-command=63-acked brightness=63 backlight=registered i2c=active-serialized touch=registering health=monitored physical-panel-state=unobserved\n",
++		 (unsigned long long)target_commit);
++	schedule_work(&dsi->touch_register_work);
++	mutex_unlock(&dsi->mode_lock);
++	return count;
++
++fail_render:
++	if (backlight_locked)
++		mutex_unlock(&dsi->backlight->ops_lock);
++	mutex_unlock(&dsi->render_lock);
++	if (READ_ONCE(dsi->native_reveal_may_be_lit)) {
++		micronux_native_fail_reveal_locked(dsi, "boot-ready", ret, false);
++	} else {
++		micronux_native_unregister_runtime_objects(dsi);
++		micronux_cold_runtime_fail_quiescent(dsi, "boot-ready-dark", ret);
++	}
++unlock_mode:
++	mutex_unlock(&dsi->mode_lock);
++	return ret;
++}
++
+ static const struct backlight_ops micronux_backlight_ops = {
+ 	.options = BL_CORE_SUSPENDRESUME,
+ 	.update_status = micronux_backlight_update,
+@@ -1322,10 +1673,18 @@ static int micronux_register_touch(struct micronux_dsi *dsi)
+ 		goto free_input;
+ 
+ 	dsi->touch = input;
+-	dev_info(dsi->dev,
+-		 "MICRONUX:M9:TOUCH state=ready product=%s address=0x%02x mode=poll interval_ms=%u resolution=%ux%u input=event\n",
+-		 dsi->touch_product, dsi->touch_address, dsi->touch_poll_ms,
+-		 dsi->handoff.width, dsi->handoff.height);
++	if (dsi->required_handoff_abi == MICRONUX_DISPLAY_ABI_VERSION_V3)
++		dev_info(dsi->dev,
++			 "MICRONUX:M9.2:TOUCH state=ready product=%s address=0x%02x mode=poll interval_ms=%u resolution=%ux%u input=event display-state=RUNTIME_REVEALED\n",
++			 dsi->touch_product, dsi->touch_address,
++			 dsi->touch_poll_ms, dsi->handoff.width,
++			 dsi->handoff.height);
++	else
++		dev_info(dsi->dev,
++			 "MICRONUX:M9:TOUCH state=ready product=%s address=0x%02x mode=poll interval_ms=%u resolution=%ux%u input=event\n",
++			 dsi->touch_product, dsi->touch_address,
++			 dsi->touch_poll_ms, dsi->handoff.width,
++			 dsi->handoff.height);
+ 	return 0;
+ 
+ free_input:
+@@ -1333,6 +1692,28 @@ free_input:
+ 	return ret;
+ }
+ 
++static void micronux_native_register_touch_work(struct work_struct *work)
++{
++	struct micronux_dsi *dsi = container_of(work, struct micronux_dsi,
++					       touch_register_work);
++	int ret;
++
++	mutex_lock(&dsi->mode_lock);
++	if (READ_ONCE(dsi->display_state) !=
++	    MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED ||
++	    READ_ONCE(dsi->native_i2c_state) !=
++		MICRONUX_NATIVE_I2C_ACTIVE_SERIALIZED)
++		goto out;
++	ret = micronux_register_touch(dsi);
++	if (ret)
++		dev_warn(dsi->dev,
++			 "MICRONUX:M9.2:TOUCH state=unavailable error=%d mode=poll display-state=RUNTIME_REVEALED\n",
++			 ret);
++	WRITE_ONCE(dsi->touch_registration_complete, true);
++out:
++	mutex_unlock(&dsi->mode_lock);
++}
++
+ static int micronux_setcolreg(unsigned int regno, unsigned int red,
+ 			     unsigned int green, unsigned int blue,
+ 			     unsigned int transp, struct fb_info *info)
+@@ -1417,6 +1798,7 @@ static u8 micronux_free_buffer_locked(struct micronux_dsi *dsi,
+ static void micronux_queue_render_locked(struct micronux_dsi *dsi)
+ {
+ 	unsigned long flags;
++	u64 commit_sequence;
+ 	u8 rendered = dsi->render_index;
+ 	u8 front;
+ 	s8 queued;
+@@ -1426,6 +1808,8 @@ static void micronux_queue_render_locked(struct micronux_dsi *dsi)
+ 		spin_unlock_irqrestore(&dsi->state_lock, flags);
+ 		return;
+ 	}
++	commit_sequence = ++dsi->next_commit_sequence;
++	dsi->buffer_commit_sequence[rendered] = commit_sequence;
+ 	if (!dsi->scanout_active) {
+ 		if (dsi->queued_index != rendered)
+ 			dsi->flip_requests++;
+@@ -1479,11 +1863,14 @@ static void micronux_flush_render(struct micronux_dsi *dsi)
+ 
+ static bool micronux_render_allowed(struct micronux_dsi *dsi)
+ {
++	enum micronux_display_state state;
++
+ 	if (dsi->required_handoff_abi != MICRONUX_DISPLAY_ABI_VERSION_V3)
+ 		return true;
++	state = READ_ONCE(dsi->display_state);
+ 	return READ_ONCE(dsi->render_enabled) &&
+-	       READ_ONCE(dsi->display_state) ==
+-		MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT;
++	       (state == MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT ||
++		state == MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED);
+ }
+ 
+ static ssize_t micronux_fb_read(struct fb_info *info, char __user *buf,
+@@ -1737,12 +2124,40 @@ static int micronux_native_dma_arm_frame(struct micronux_dsi *dsi, u8 index)
+ 	return 0;
+ }
+ 
++static bool
++micronux_native_contain_inactive_irqs(struct micronux_dsi *dsi, u32 top)
++{
++	bool contained = !(top & ~(DW_GDMA_INT_TOP_ALLOWED |
++					 DW_GDMA_INT_TOP_INACTIVE));
++	u8 index;
++
++	for (index = 1; index < DW_GDMA_CHANNEL_COUNT; index++) {
++		void __iomem *channel;
++		u32 status0, status1;
++
++		if (!(top & BIT(index)))
++			continue;
++		channel = dsi->gdma + DW_GDMA_CH_BASE(index);
++		/* Keep channel zero signaling live while containing only the source. */
++		writel(0, channel + DW_GDMA_CH_INT_SIGNAL_ENA);
++		status0 = readl(channel + DW_GDMA_CH_INT_STATUS);
++		status1 = readl(channel + DW_GDMA_CH_INT_STATUS1);
++		writel(status0, channel + DW_GDMA_CH_INT_CLEAR);
++		writel(status1, channel + DW_GDMA_CH_INT_CLEAR1);
++		readl(channel + DW_GDMA_CH_INT_STATUS1);
++		if (readl(dsi->gdma + DW_GDMA_INT_STATUS) & BIT(index))
++			contained = false;
++	}
++	return contained;
++}
++
+ static irqreturn_t micronux_native_dma_irq(struct micronux_dsi *dsi)
+ {
+ 	unsigned long flags;
+ 	u32 common, status0, status1, top;
+ 	u8 next_index;
+-	bool faulted, rearm_failed = false;
++	bool dma_error, faulted, inactive_contained = true, preserve;
++	bool rearm_failed = false, wake_frame = false;
+ 
+ 	top = readl(dsi->gdma + DW_GDMA_INT_STATUS);
+ 	status0 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS);
+@@ -1755,49 +2170,90 @@ static irqreturn_t micronux_native_dma_irq(struct micronux_dsi *dsi)
+ 	writel(status0, dsi->channel + DW_GDMA_CH_INT_CLEAR);
+ 	writel(status1, dsi->channel + DW_GDMA_CH_INT_CLEAR1);
+ 	writel(common, dsi->gdma + DW_GDMA_INT_CLEAR);
+-	if (top & ~DW_GDMA_INT_TOP_ALLOWED) {
++	preserve = READ_ONCE(dsi->native_preserve_source) &&
++		   !READ_ONCE(dsi->native_dark_confirmed);
++	if ((top & ~DW_GDMA_INT_TOP_ALLOWED) && preserve)
++		inactive_contained =
++			micronux_native_contain_inactive_irqs(dsi, top);
++	if (!inactive_contained) {
++		WRITE_ONCE(dsi->cold_runtime_unverified, true);
++		dev_err_ratelimited(dsi->dev,
++				    "MICRONUX:M9.2:REVEAL inactive-channel-irq=UNCONTAINED source=preserved channel0=live\n");
++	}
++	if ((top & ~DW_GDMA_INT_TOP_ALLOWED) && !preserve) {
+ 		/* Stop an immutable inactive-channel level source from retriggering. */
+ 		writel(1, dsi->gdma + DW_GDMA_CFG);
+ 		readl(dsi->gdma + DW_GDMA_CFG);
+ 	}
+-	if ((top & ~DW_GDMA_INT_TOP_ALLOWED) ||
+-	    (status0 & DW_GDMA_INT_ERROR_MASK) ||
+-	    (status1 & DW_GDMA_INT_ECC_ERROR_MASK) ||
+-	    (common & DW_GDMA_INT_COMMON_VALID_MASK)) {
++	dma_error = (top & ~DW_GDMA_INT_TOP_ALLOWED) ||
++		    (status0 & DW_GDMA_INT_ERROR_MASK) ||
++		    (status1 & DW_GDMA_INT_ECC_ERROR_MASK) ||
++		    (common & DW_GDMA_INT_COMMON_VALID_MASK);
++	if (dma_error) {
+ 		WRITE_ONCE(dsi->last_dma_error,
+ 			   (status0 & DW_GDMA_INT_ERROR_MASK) |
+ 			   ((status1 || common ||
+ 			     (top & ~DW_GDMA_INT_TOP_ALLOWED)) ? BIT(31) : 0));
+-		micronux_latch_fault(dsi, MICRONUX_FAULT_DMA);
+-		return IRQ_HANDLED;
++		set_bit(MICRONUX_FAULT_DMA, &dsi->fault_bits);
+ 	}
+ 
+-	if (!(status0 & DW_GDMA_INT_DMA_TFR_DONE))
++	if (!(status0 & DW_GDMA_INT_DMA_TFR_DONE)) {
++		if (dma_error) {
++			if (preserve) {
++				WRITE_ONCE(dsi->native_source_rearm_unverified,
++					   true);
++				dev_err_ratelimited(dsi->dev, "%s",
++						    native_no_completion);
++			}
++			schedule_work(&dsi->fault_work);
++		}
+ 		return IRQ_HANDLED;
++	}
+ 	WRITE_ONCE(dsi->scanout_frames,
+ 		   READ_ONCE(dsi->scanout_frames) + 1);
+ 	WRITE_ONCE(dsi->last_frame_jiffies, jiffies);
+ 	spin_lock_irqsave(&dsi->state_lock, flags);
+ 	if (dsi->scanout_active) {
+ 		faulted = READ_ONCE(dsi->fault_bits);
+-		next_index = !faulted && dsi->queued_index >= 0 ?
++		next_index = !faulted && !dma_error &&
++			dsi->queued_index >= 0 ?
+ 			dsi->queued_index : dsi->front_index;
+-		if (faulted || micronux_native_dma_arm_frame(dsi, next_index)) {
+-			rearm_failed = !faulted;
++		if ((faulted || dma_error) && !preserve) {
++			rearm_failed = false;
++		} else if (micronux_native_dma_arm_frame(dsi, next_index)) {
++			rearm_failed = true;
+ 		} else {
+-			if (dsi->queued_index >= 0) {
+-				dsi->front_index = dsi->queued_index;
+-				dsi->queued_index = -1;
+-				dsi->flip_completions++;
++			if (!dma_error) {
++				dsi->presented_index = dsi->front_index;
++				dsi->presented_commit_sequence =
++					dsi->front_commit_sequence;
++				if (!faulted && dsi->queued_index >= 0) {
++					dsi->front_index = dsi->queued_index;
++					dsi->front_commit_sequence =
++						dsi->buffer_commit_sequence[next_index];
++					dsi->queued_index = -1;
++					dsi->flip_completions++;
++				}
++				dsi->source_generation++;
++				wake_frame = true;
+ 			}
+-			dsi->source_generation++;
+ 		}
+ 	}
+ 	spin_unlock_irqrestore(&dsi->state_lock, flags);
+ 	if (rearm_failed) {
+ 		WRITE_ONCE(dsi->last_dma_error, BIT(30));
+-		micronux_latch_fault(dsi, MICRONUX_FAULT_DMA);
++		WRITE_ONCE(dsi->cold_runtime_unverified, true);
++		if (preserve) {
++			WRITE_ONCE(dsi->native_source_rearm_unverified, true);
++			dev_err_ratelimited(dsi->dev,
++					    "MICRONUX:M9.2:REVEAL source-preserving-rearm=FAILED darkness=not-confirmed source=unverified\n");
++		}
++		set_bit(MICRONUX_FAULT_DMA, &dsi->fault_bits);
+ 	}
++	if (dma_error || rearm_failed)
++		schedule_work(&dsi->fault_work);
++	if (wake_frame)
++		wake_up_all(&dsi->frame_wait);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -1894,8 +2350,7 @@ static enum hrtimer_restart micronux_dma_poll(struct hrtimer *timer)
+ 		  READ_ONCE(dsi->scanout_active) &&
+ 		  !READ_ONCE(dsi->vpg_test_active) &&
+ 		  !READ_ONCE(dsi->fault_bits) &&
+-		  (native ? READ_ONCE(dsi->display_state) ==
+-			MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT :
++		  (native ? micronux_native_scanout_live_state(dsi) :
+ 			READ_ONCE(dsi->boot_display_ready));
+ 	if (monitor && native && !micronux_native_runtime_policy_valid(dsi))
+ 		micronux_latch_fault(dsi, MICRONUX_FAULT_DMA);
+@@ -2214,12 +2669,34 @@ start_failed:
+ 
+ static int micronux_fb_blank(int blank, struct fb_info *info)
+ {
++	struct backlight_device *backlight;
+ 	struct micronux_dsi *dsi = info->par;
+ 	int ret;
+ 
+ 	/* register_framebuffer() can call us while cold_init owns mode_lock. */
+-	if (dsi->required_handoff_abi == MICRONUX_DISPLAY_ABI_VERSION_V3)
+-		return 0;
++	if (dsi->required_handoff_abi == MICRONUX_DISPLAY_ABI_VERSION_V3) {
++		if (READ_ONCE(dsi->display_state) !=
++		    MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED)
++			return 0;
++		if (!dsi->backlight)
++			return -ENODEV;
++		mutex_lock(&dsi->mode_lock);
++		backlight = dsi->backlight;
++		if (READ_ONCE(dsi->display_state) !=
++		    MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED || !backlight) {
++			ret = -EAGAIN;
++			goto unlock_mode;
++		}
++		mutex_lock(&backlight->ops_lock);
++		if (blank == FB_BLANK_UNBLANK)
++			ret = micronux_backlight_set_power(dsi, FB_BLANK_UNBLANK);
++		else
++			ret = micronux_backlight_set_power(dsi, FB_BLANK_POWERDOWN);
++		mutex_unlock(&backlight->ops_lock);
++unlock_mode:
++		mutex_unlock(&dsi->mode_lock);
++		return ret;
++	}
+ 	mutex_lock(&dsi->mode_lock);
+ 	mutex_lock(&dsi->backlight->ops_lock);
+ 	ret = __micronux_fb_blank(blank, info);
+@@ -2245,6 +2722,10 @@ static ssize_t boot_ready_store(struct device *dev,
+ 	bool ready;
+ 	int ret;
+ 
++	if (dsi->required_handoff_abi ==
++	    MICRONUX_DISPLAY_ABI_VERSION_V3)
++		return micronux_native_boot_ready_store(dsi, buf, count);
++
+ 	ret = kstrtobool(buf, &ready);
+ 	if (ret)
+ 		return ret;
+@@ -2309,6 +2790,10 @@ static ssize_t vpg_test_ms_store(struct device *dev,
+ 	int entry_ret = 0;
+ 	int ret, restore_ret;
+ 
++	if (dsi->required_handoff_abi ==
++	    MICRONUX_DISPLAY_ABI_VERSION_V3)
++		return -EOPNOTSUPP;
++
+ 	ret = kstrtou32(buf, 10, &duration_ms);
+ 	if (ret)
+ 		return ret;
+@@ -2503,6 +2988,12 @@ static ssize_t ownership_show(struct device *dev,
+ {
+ 	struct micronux_dsi *dsi = dev_get_drvdata(dev);
+ 
++	if (dsi->required_handoff_abi ==
++	    MICRONUX_DISPLAY_ABI_VERSION_V3)
++		return sysfs_emit(buf,
++			"linux abi=3 mode=native-cold-init fb%d buffers=3 dma-channel=0 frame-irq=%d rearm=explicit mmap=denied i2c=active-serialized\n",
++			dsi->info->node, dsi->irq);
++
+ 	return sysfs_emit(buf,
+ 			  "linux abi=2 fb%d buffers=3 dma-channel=%u frame-irq=%d rearm=explicit mmap=denied\n",
+ 			  dsi->info->node, dsi->handoff.dma_channel,
+@@ -2520,6 +3011,7 @@ static ssize_t scanout_show(struct device *dev,
+ 	u32 active, before, after, error, channel_enable, host, lpclk, underruns;
+ 	u32 host_error0, host_error1;
+ 	u32 rearm_attempts, rearm_failures, flip_requests, flip_completions;
++	u64 front_commit;
+ 	u8 front, render;
+ 	s8 queued;
+ 
+@@ -2545,7 +3037,28 @@ static ssize_t scanout_show(struct device *dev,
+ 	front = dsi->front_index;
+ 	render = dsi->render_index;
+ 	queued = dsi->queued_index;
++	front_commit = dsi->front_commit_sequence;
+ 	spin_unlock_irqrestore(&dsi->state_lock, flags);
++	if (dsi->required_handoff_abi ==
++	    MICRONUX_DISPLAY_ABI_VERSION_V3)
++		return sysfs_emit(buf,
++			"%s abi=3 state=%s frames=%u->%u error=%08x underruns=%u chen=%u faults=%lx host-errors=%08x:%08x frame-ack=on clock=auto lp=enabled backlight-gate=%s buffers=3 front=%u queued=%d back=%u rearm=%u/%u flips=%u/%u generation=%u commit=%llu guards=%s guard-errors=%u i2c=active-serialized\n",
++			after != before && !error && !underruns && !faults &&
++			!host_error0 && !host_error1 && guards_valid &&
++			micronux_native_runtime_policy_valid(dsi) ?
++			"running" : "stalled",
++			READ_ONCE(dsi->display_state) ==
++				MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED ?
++			"RUNTIME_REVEALED" : "not-revealed",
++			before, after, error, underruns, !!channel_enable,
++			faults, host_error0, host_error1,
++			READ_ONCE(dsi->backlight_gate_enabled) ? "on" : "off",
++			front, queued, render, rearm_attempts, rearm_failures,
++			flip_requests, flip_completions,
++			READ_ONCE(dsi->source_generation),
++			(unsigned long long)front_commit,
++			guards_valid ? "ok" : "bad",
++			READ_ONCE(dsi->pool_guard_errors));
+ 	frame_ack_disabled = !(host & DSI_HOST_FRAME_BTA_ACK_EN) &&
+ 			     !(active & DSI_HOST_FRAME_BTA_ACK_EN_ACT);
+ 	clock_auto = (lpclk & DSI_HOST_CLOCK_LANE_AUTO) ==
+@@ -2586,6 +3099,7 @@ static ssize_t diagnostics_show(struct device *dev,
+ 	u32 status_before, status_after;
+ 	u32 active, host, lpclk;
+ 	ssize_t length;
++	u64 front_commit;
+ 	u8 front, render;
+ 	s8 queued;
+ 
+@@ -2593,7 +3107,31 @@ static ssize_t diagnostics_show(struct device *dev,
+ 	front = dsi->front_index;
+ 	render = dsi->render_index;
+ 	queued = dsi->queued_index;
++	front_commit = dsi->front_commit_sequence;
+ 	spin_unlock_irqrestore(&dsi->state_lock, flags);
++	if (dsi->required_handoff_abi ==
++	    MICRONUX_DISPLAY_ABI_VERSION_V3)
++		return sysfs_emit(buf,
++			"abi=3 state=%s frames=%u faults=%lx error=%08x host-errors=%08x:%08x underruns=%u buffers=3 front=%u queued=%d back=%u rearm=%u/%u flips=%u/%u generation=%u commit=%llu guards=%s guard-errors=%u policy=%s i2c=active-serialized physical-panel-state=unobserved\n",
++			READ_ONCE(dsi->display_state) ==
++				MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED ?
++			"RUNTIME_REVEALED" : "not-revealed",
++			READ_ONCE(dsi->scanout_frames),
++			READ_ONCE(dsi->fault_bits),
++			READ_ONCE(dsi->last_dma_error),
++			READ_ONCE(dsi->host_error0),
++			READ_ONCE(dsi->host_error1),
++			READ_ONCE(dsi->bridge_underruns), front, queued, render,
++			READ_ONCE(dsi->rearm_attempts),
++			READ_ONCE(dsi->rearm_failures),
++			READ_ONCE(dsi->flip_requests),
++			READ_ONCE(dsi->flip_completions),
++			READ_ONCE(dsi->source_generation),
++			(unsigned long long)front_commit,
++			micronux_pool_guards_valid(dsi, true) ? "ok" : "bad",
++			READ_ONCE(dsi->pool_guard_errors),
++			micronux_native_runtime_policy_valid(dsi) ?
++			"ok" : "bad");
+ 	cached = (void __iomem *)(uintptr_t)
+ 		dsi->handoff.framebuffer_address[front];
+ 	descriptor = dsi->descriptor[front];
+@@ -2689,6 +3227,10 @@ static ssize_t touch_show(struct device *dev,
+ {
+ 	struct micronux_dsi *dsi = dev_get_drvdata(dev);
+ 
++	if (dsi->required_handoff_abi ==
++	    MICRONUX_DISPLAY_ABI_VERSION_V3 &&
++	    !READ_ONCE(dsi->touch_registration_complete))
++		return sysfs_emit(buf, "registering\n");
+ 	if (!dsi->touch)
+ 		return sysfs_emit(buf, "unavailable\n");
+ 	return sysfs_emit(buf,
+@@ -2711,6 +3253,19 @@ static struct attribute *micronux_display_attrs[] = {
+ };
+ ATTRIBUTE_GROUPS(micronux_display);
+ 
++static struct attribute *micronux_native_runtime_attrs[] = {
++	&dev_attr_pattern.attr,
++	&dev_attr_ownership.attr,
++	&dev_attr_scanout.attr,
++	&dev_attr_diagnostics.attr,
++	&dev_attr_touch.attr,
++	NULL,
++};
++
++static const struct attribute_group micronux_native_runtime_group = {
++	.attrs = micronux_native_runtime_attrs,
++};
++
+ static int micronux_cold_i2c_calculate_timing(struct micronux_i2c_timing *timing)
+ {
+ 	u32 half_cycle, source_clock, source_per_us;
+@@ -3016,6 +3571,10 @@ static bool micronux_cold_i2c_gate(struct micronux_dsi *dsi)
+ 	if (dsi->cold_i2c_active)
+ 		micronux_cold_i2c_release_pins(dsi);
+ 	dsi->cold_i2c_active = false;
++	if (dsi->required_handoff_abi ==
++	    MICRONUX_DISPLAY_ABI_VERSION_V3)
++		WRITE_ONCE(dsi->native_i2c_state,
++			   MICRONUX_NATIVE_I2C_RELEASED);
+ 	return true;
+ }
+ 
+@@ -3779,8 +4338,7 @@ micronux_cold_quiesce_external(struct micronux_dsi *dsi, int *pwm_ret,
+ 		if (ret)
+ 			return micronux_cold_i2c_gate(dsi);
+ 	}
+-	*pwm_ret = micronux_i2c_write_reg8(dsi, handoff->i2c_address,
+-					   handoff->backlight_register, 0);
++	*pwm_ret = micronux_native_write_pwm(dsi, 0);
+ 	*prepare_ret = micronux_i2c_write_reg8(dsi, handoff->i2c_address,
+ 					       handoff->display_control_register,
+ 					       handoff->display_control_reset_prepare_command);
+@@ -3941,6 +4499,10 @@ static ssize_t native_state_show(struct device *dev,
+ 		return sysfs_emit(buf, "SCANOUT_INITIALIZING\n");
+ 	if (state == MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT)
+ 		return sysfs_emit(buf, "SCANOUT_QUALIFIED_QUIESCENT\n");
++	if (state == MICRONUX_DISPLAY_STATE_REVEALING)
++		return sysfs_emit(buf, "REVEALING\n");
++	if (state == MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED)
++		return sysfs_emit(buf, "RUNTIME_REVEALED\n");
+ 	if (state == MICRONUX_DISPLAY_STATE_REMOVING)
+ 		return sysfs_emit(buf, "REMOVING\n");
+ 	if (state == MICRONUX_DISPLAY_STATE_FAILED_QUIESCENT)
+@@ -4455,6 +5017,31 @@ static int micronux_register_backlight(struct micronux_dsi *dsi)
+ 	return ret;
+ }
+ 
++static int micronux_register_native_backlight(struct micronux_dsi *dsi)
++{
++	struct backlight_properties properties = {
++		.type = BACKLIGHT_RAW,
++		.max_brightness = 255,
++		.brightness = MICRONUX_DISPLAY_COLD_BRIGHTNESS,
++		.power = FB_BLANK_POWERDOWN,
++	};
++	const struct backlight_ops *ops = &micronux_backlight_ops;
++	struct backlight_properties *props = &properties;
++	struct device *dev = dsi->dev;
++	const char *name = "micronux-backlight";
++
++	dsi->backlight = devm_backlight_device_register(dev, name, dev, dsi, ops, props);
++	if (IS_ERR(dsi->backlight)) {
++		int ret = PTR_ERR(dsi->backlight);
++
++		dsi->backlight = NULL;
++		return ret;
++	}
++	/* The controller is already ACKed at PWM zero; do not call update. */
++	dsi->native_backlight_registered = true;
++	return 0;
++}
++
+ static int micronux_register_framebuffer(struct micronux_dsi *dsi)
+ {
+ 	struct fb_info *info = dsi->info;
+@@ -4623,8 +5210,12 @@ static int micronux_native_initialize_memory(struct micronux_dsi *dsi)
+ 			return -EIO;
+ 
+ 	dsi->front_index = 0;
++	dsi->presented_index = 0;
+ 	dsi->render_index = 1;
+ 	dsi->queued_index = -1;
++	dsi->front_commit_sequence = 0;
++	dsi->presented_commit_sequence = 0;
++	dsi->dark_baseline_commit_sequence = 0;
+ 	dsi->render_needs_sync = false;
+ 	dsi->render_dirty = false;
+ 	micronux_initialize_pool_guards(dsi);
+@@ -4862,6 +5453,36 @@ static bool micronux_native_pms_route_valid(struct micronux_dsi *dsi)
+ 		(DMA_PMS_REGION3_MASK | DMA_PMS_REGION4_MASK);
+ }
+ 
++static bool micronux_native_i2c_policy_valid(struct micronux_dsi *dsi)
++{
++	struct micronux_i2c_timing timing = { };
++	enum micronux_display_state display_state =
++		READ_ONCE(dsi->display_state);
++	enum micronux_native_i2c_state i2c_state =
++		READ_ONCE(dsi->native_i2c_state);
++
++	if (display_state ==
++	    MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT)
++		return i2c_state == MICRONUX_NATIVE_I2C_RELEASED &&
++		       micronux_cold_i2c_released(dsi);
++	if (display_state == MICRONUX_DISPLAY_STATE_REVEALING &&
++	    i2c_state == MICRONUX_NATIVE_I2C_RELEASED)
++		return micronux_cold_i2c_released(dsi);
++	if (display_state == MICRONUX_DISPLAY_STATE_REVEALING &&
++	    i2c_state == MICRONUX_NATIVE_I2C_TRANSITION)
++		return time_before_eq(jiffies,
++			READ_ONCE(dsi->native_i2c_transition_deadline));
++	if ((display_state == MICRONUX_DISPLAY_STATE_REVEALING ||
++	     display_state == MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED) &&
++	    i2c_state == MICRONUX_NATIVE_I2C_ACTIVE_SERIALIZED) {
++		if (micronux_cold_i2c_calculate_timing(&timing))
++			return false;
++		return dsi->cold_i2c_active &&
++		       micronux_i2c_matches(dsi, &timing);
++	}
++	return false;
++}
++
+ static bool micronux_native_runtime_policy_valid(struct micronux_dsi *dsi)
+ {
+ 	u32 clocks0, clocks1, index, peri03, reset, sar;
+@@ -4893,7 +5514,7 @@ static bool micronux_native_runtime_policy_valid(struct micronux_dsi *dsi)
+ 			  HP_CLKRST_DSI_DPI_CLK_DIV)) ==
+ 		HP_CLKRST_DSI_DPI_CLOCK_VALUE &&
+ 	       micronux_cold_ldo_matches(dsi) &&
+-	       micronux_cold_i2c_released(dsi) &&
++	       micronux_native_i2c_policy_valid(dsi) &&
+ 	       micronux_native_pms_route_valid(dsi) &&
+ 	       !(readl(dsi->host + DSI_HOST_MODE_CFG) & BIT(0)) &&
+ 	       readl(dsi->host + DSI_HOST_VID_MODE_CFG) ==
+@@ -5037,18 +5658,86 @@ static bool micronux_native_final_status_clean(struct micronux_dsi *dsi)
+ 		 DW_GDMA_INT_ECC_ERROR_MASK) &&
+ 	       !(readl(dsi->gdma + DW_GDMA_INT_COMMON_STATUS) &
+ 		 DW_GDMA_INT_COMMON_VALID_MASK) &&
++	       !(readl(dsi->gdma + DW_GDMA_INT_STATUS) &
++		 ~DW_GDMA_INT_TOP_ALLOWED) &&
+ 	       !READ_ONCE(dsi->last_dma_error) &&
+ 	       !READ_ONCE(dsi->fault_bits) &&
+ 	       micronux_pool_guards_valid(dsi, true) &&
+ 	       micronux_native_runtime_policy_valid(dsi);
+ }
+ 
++static bool native_target_ready(struct micronux_dsi *dsi, u64 commit_sequence)
++{
++	unsigned long flags;
++	bool ready;
++
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	ready = dsi->presented_commit_sequence >= commit_sequence;
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++	return ready || READ_ONCE(dsi->fault_bits);
++}
++
++static bool native_window_ready(struct micronux_dsi *dsi, u32 generation)
++{
++	return READ_ONCE(dsi->source_generation) - generation >=
++		MICRONUX_SCANOUT_STABLE_FRAMES || READ_ONCE(dsi->fault_bits);
++}
++
++static int
++micronux_native_requalify_front(struct micronux_dsi *dsi, u64 target)
++{
++	unsigned long flags;
++	u64 presented_commit;
++	u32 base, generation;
++	unsigned long timeout;
++	u8 presented;
++	long waited;
++
++	timeout = msecs_to_jiffies(MICRONUX_NATIVE_REVEAL_TIMEOUT_MS);
++	waited = wait_event_timeout(dsi->frame_wait, native_target_ready(dsi, target), timeout);
++	if (!waited || READ_ONCE(dsi->fault_bits))
++		return waited ? -EIO : -ETIMEDOUT;
++
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	presented = dsi->presented_index;
++	presented_commit = dsi->presented_commit_sequence;
++	base = dsi->source_generation;
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++	if (presented_commit < target ||
++	    target <= dsi->dark_baseline_commit_sequence)
++		return -ESTALE;
++
++	waited = wait_event_timeout(dsi->frame_wait, native_window_ready(dsi, base), timeout);
++	if (!waited || READ_ONCE(dsi->fault_bits))
++		return waited ? -EIO : -ETIMEDOUT;
++
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	generation = dsi->source_generation;
++	if (dsi->presented_index != presented ||
++	    dsi->presented_commit_sequence != presented_commit ||
++	    dsi->front_index != presented ||
++	    dsi->front_commit_sequence != presented_commit ||
++	    dsi->queued_index >= 0) {
++		spin_unlock_irqrestore(&dsi->state_lock, flags);
++		return -ESTALE;
++	}
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++	if (generation - base < MICRONUX_SCANOUT_STABLE_FRAMES ||
++	    !micronux_native_final_status_clean(dsi))
++		return -EIO;
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:REVEAL state=QUALIFIED source=userspace-status commit=%llu front=%u frames=4 same-front=yes host-errors=0 gdma-errors=0 ecc-errors=0 common-errors=0 bridge-underruns=0 guards=verified external-command-history=pwm0-control13-acked physical-panel-state=unobserved\n",
++		 (unsigned long long)presented_commit, presented);
++	return 0;
++}
++
+ static bool micronux_cold_runtime_teardown(struct micronux_dsi *dsi)
+ {
+ 	u32 abort_mask, channel, peri03, reset, state, value;
+ 	bool registers_contained = true, stopped = true;
+ 
+ 	WRITE_ONCE(dsi->render_enabled, false);
++	WRITE_ONCE(dsi->native_preserve_source, false);
+ 	/* Close the render gate before revoking published scanout readiness. */
+ 	smp_wmb();
+ 	WRITE_ONCE(dsi->scanout_ready, false);
+@@ -5184,6 +5873,119 @@ static bool micronux_cold_runtime_teardown(struct micronux_dsi *dsi)
+ 		 HP_CLKRST_DSI_DPI_CLK_EN);
+ }
+ 
++static bool
++micronux_native_off_first(struct micronux_dsi *dsi, int *pwm_ret,
++			  int *control_ret)
++{
++	struct micronux_display_handoff_v3 *handoff = &dsi->cold_handoff;
++	struct backlight_device *backlight = dsi->backlight;
++	u8 command = handoff->display_control_reset_prepare_command;
++	bool locked = false;
++
++	*pwm_ret = -ENODEV;
++	*control_ret = -ENODEV;
++	if (READ_ONCE(dsi->native_i2c_state) !=
++	    MICRONUX_NATIVE_I2C_ACTIVE_SERIALIZED || !dsi->cold_i2c_active)
++		return false;
++	if (backlight) {
++		mutex_lock(&backlight->ops_lock);
++		locked = true;
++	}
++	*pwm_ret = micronux_i2c_write_reg8(dsi, handoff->i2c_address,
++					   handoff->backlight_register, 0);
++	if (!*pwm_ret)
++		WRITE_ONCE(dsi->applied_brightness, 0);
++	*control_ret = micronux_native_write_control(dsi, command);
++	if (!*control_ret)
++		WRITE_ONCE(dsi->backlight_gate_enabled, false);
++	if (backlight) {
++		backlight->props.brightness = 0;
++		backlight->props.power = FB_BLANK_POWERDOWN;
++	}
++	if (*pwm_ret || *control_ret) {
++		if (locked)
++			mutex_unlock(&backlight->ops_lock);
++		return false;
++	}
++	msleep(handoff->pwm_zero_settle_ms);
++	WRITE_ONCE(dsi->native_dark_confirmed, true);
++	/* The source may stop only after both external off writes and settle. */
++	smp_wmb();
++	WRITE_ONCE(dsi->native_preserve_source, false);
++	if (locked)
++		mutex_unlock(&backlight->ops_lock);
++	return true;
++}
++
++static void micronux_native_unregister_runtime_objects(struct micronux_dsi *dsi)
++{
++	if (dsi->native_runtime_group_created) {
++		sysfs_remove_group(&dsi->dev->kobj,
++				   &micronux_native_runtime_group);
++		dsi->native_runtime_group_created = false;
++	}
++	if (dsi->touch) {
++		input_unregister_device(dsi->touch);
++		dsi->touch = NULL;
++	}
++	if (dsi->native_backlight_registered && dsi->backlight) {
++		devm_backlight_device_unregister(dsi->dev, dsi->backlight);
++		dsi->backlight = NULL;
++		dsi->native_backlight_registered = false;
++	}
++}
++
++static void micronux_native_fail_reveal_locked(struct micronux_dsi *dsi,
++					       const char *stage, int error,
++					       bool force_teardown)
++{
++	bool contained = false, dark, dsi_off, i2c_released, ldo_off;
++	bool runtime_off;
++	int control_ret, pwm_ret;
++
++	WRITE_ONCE(dsi->render_enabled, false);
++	WRITE_ONCE(dsi->boot_display_ready, false);
++	/* Revoke runtime callbacks before serializing the external off sequence. */
++	smp_wmb();
++	WRITE_ONCE(dsi->display_state, MICRONUX_DISPLAY_STATE_REVEALING);
++	dark = micronux_native_off_first(dsi, &pwm_ret, &control_ret);
++	if (!dark && !force_teardown) {
++		micronux_native_unregister_runtime_objects(dsi);
++		WRITE_ONCE(dsi->cold_runtime_unverified, true);
++		WRITE_ONCE(dsi->display_state,
++			   MICRONUX_DISPLAY_STATE_FAILED_UNVERIFIED);
++		dev_err(dsi->dev,
++			"MICRONUX:M9.2:REVEAL state=FAILED_UNVERIFIED stage=%s error=%d pwm-zero-command=%s reset-prepare-command=%s source=preserved scanout=%s darkness=not-confirmed physical-panel-state=unobserved retry=reboot-only\n",
++			stage, error, pwm_ret ? "failed" : "acked",
++			control_ret ? "failed" : "acked",
++			READ_ONCE(dsi->native_source_rearm_unverified) ?
++			"rearm-unverified" : "advancing");
++		return;
++	}
++
++	micronux_native_unregister_runtime_objects(dsi);
++	runtime_off = micronux_cold_runtime_teardown(dsi);
++	i2c_released = micronux_cold_i2c_gate(dsi) &&
++		       micronux_cold_i2c_released(dsi);
++	dsi_off = micronux_cold_dsi_disable(dsi);
++	ldo_off = micronux_cold_ldo_disable(dsi);
++	contained = dark && runtime_off && i2c_released && dsi_off && ldo_off;
++	WRITE_ONCE(dsi->cold_runtime_unverified, !contained);
++	WRITE_ONCE(dsi->display_state,
++		   contained ? MICRONUX_DISPLAY_STATE_FAILED_QUIESCENT :
++		   MICRONUX_DISPLAY_STATE_FAILED_UNVERIFIED);
++	dev_err(dsi->dev,
++		"MICRONUX:M9.2:REVEAL state=%s stage=%s error=%d pwm-zero-command=%s reset-prepare-command=%s source=stopped dsi-gdma=%s i2c0=%s ldo3-xpd=%s darkness=%s physical-panel-state=unobserved retry=reboot-only\n",
++		contained ? "FAILED_QUIESCENT" : "FAILED_UNVERIFIED",
++		stage, error, pwm_ret ? "failed" : "acked",
++		control_ret ? "failed" : "acked",
++		runtime_off && dsi_off ? "resets-asserted-clocks-off" :
++		"state-error",
++		i2c_released ? "released-gated" : "state-error",
++		ldo_off ? "clear" : "error",
++		dark ? "commanded-not-observed" : "not-confirmed");
++}
++
+ static void micronux_cold_runtime_fail_quiescent(struct micronux_dsi *dsi,
+ 						 const char *stage, int error)
+ {
+@@ -5238,6 +6040,10 @@ static int micronux_cold_initialize_scanout_stage(struct micronux_dsi *dsi)
+ 		ret = -EIO;
+ 		goto fail_publication;
+ 	}
++	ret = device_create_file(dsi->dev, &dev_attr_boot_ready);
++	if (ret)
++		goto fail_publication;
++	dsi->boot_ready_file_created = true;
+ 	micronux_watchdog_seed_progress(dsi);
+ 	WRITE_ONCE(dsi->scanout_ready, true);
+ 	WRITE_ONCE(dsi->render_enabled, true);
+@@ -5258,6 +6064,10 @@ static int micronux_cold_initialize_scanout_stage(struct micronux_dsi *dsi)
+ 	return 0;
+ 
+ fail_publication:
++	if (dsi->boot_ready_file_created) {
++		device_remove_file(dsi->dev, &dev_attr_boot_ready);
++		dsi->boot_ready_file_created = false;
++	}
+ 	micronux_cold_runtime_fail_quiescent(dsi, "publication-check", ret);
+ 	return ret;
+ fail_framebuffer:
+@@ -5324,9 +6134,13 @@ static int micronux_dsi_probe(struct platform_device *pdev)
+ 	mutex_init(&dsi->mode_lock);
+ 	mutex_init(&dsi->render_lock);
+ 	INIT_DELAYED_WORK(&dsi->render_work, micronux_render_work);
++	INIT_WORK(&dsi->touch_register_work,
++		  micronux_native_register_touch_work);
+ 	spin_lock_init(&dsi->state_lock);
+ 	spin_lock_init(&dsi->host_status_lock);
++	init_waitqueue_head(&dsi->frame_wait);
+ 	INIT_WORK(&dsi->fault_work, micronux_fault_work);
++	dsi->native_i2c_state = MICRONUX_NATIVE_I2C_RELEASED;
+ 
+ 	ret = of_property_read_u32(pdev->dev.of_node,
+ 				   "espressif,required-handoff-abi",
+@@ -5535,6 +6349,8 @@ static void micronux_dsi_remove(struct platform_device *pdev)
+ 	const char *cold_remove_state, *prepare_status, *pwm_status;
+ 	const char *reset_status;
+ 	bool cold_contained;
++	bool native_dark = false;
++	bool native_off_attempted = false;
+ 	bool cold_dsi_off, cold_i2c_off, cold_i2c_released, cold_ldo_off;
+ 	bool cold_runtime_off = true;
+ 	bool dark = false;
+@@ -5543,6 +6359,11 @@ static void micronux_dsi_remove(struct platform_device *pdev)
+ 	if (dsi->required_handoff_abi == MICRONUX_DISPLAY_ABI_VERSION_V3) {
+ 		device_remove_file(&pdev->dev, &dev_attr_cold_init);
+ 		device_remove_file(&pdev->dev, &dev_attr_native_state);
++		if (dsi->boot_ready_file_created) {
++			device_remove_file(&pdev->dev, &dev_attr_boot_ready);
++			dsi->boot_ready_file_created = false;
++		}
++		cancel_work_sync(&dsi->touch_register_work);
+ 		mutex_lock(&dsi->mode_lock);
+ 		state = READ_ONCE(dsi->display_state);
+ 		WRITE_ONCE(dsi->display_state,
+@@ -5554,12 +6375,34 @@ static void micronux_dsi_remove(struct platform_device *pdev)
+ 			framebuffer_release(dsi->info);
+ 			return;
+ 		}
++		if (state == MICRONUX_DISPLAY_STATE_REVEALING ||
++		    state == MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED ||
++		    (state == MICRONUX_DISPLAY_STATE_FAILED_UNVERIFIED &&
++		     READ_ONCE(dsi->native_preserve_source))) {
++			native_off_attempted = true;
++			native_dark = micronux_native_off_first(dsi, &pwm_ret, &prepare_ret);
++			pwm_status = pwm_ret ? "not-confirmed" : "acked";
++			prepare_status = prepare_ret ? "not-confirmed" : "acked";
++			reset_ret = -EOPNOTSUPP;
++			reset_status = "not-issued";
++		}
++		micronux_native_unregister_runtime_objects(dsi);
+ 		if (dsi->cold_dpi_enabled || dsi->cold_bridge_active ||
+ 		    dsi->cold_gdma_hp_mutated || dsi->cold_gdma_active ||
+ 		    dsi->cold_irq_registered ||
+ 		    dsi->cold_fb_registered || dsi->cold_timer_initialized)
+ 			cold_runtime_off = micronux_cold_runtime_teardown(dsi);
+-		if (state == MICRONUX_DISPLAY_STATE_FAILED_QUIESCENT) {
++		if (native_off_attempted) {
++			cold_i2c_off = micronux_cold_i2c_gate(dsi);
++			if (native_dark) {
++				reset_ret = 0;
++				reset_status =
++					"not-required-after-off-settle";
++			} else {
++				reset_ret = -EIO;
++				reset_status = "not-issued";
++			}
++		} else if (state == MICRONUX_DISPLAY_STATE_FAILED_QUIESCENT) {
+ 			pwm_ret = 0;
+ 			prepare_ret = 0;
+ 			reset_ret = 0;
+@@ -5583,7 +6426,8 @@ static void micronux_dsi_remove(struct platform_device *pdev)
+ 		cold_contained = !pwm_ret && !prepare_ret && !reset_ret &&
+ 				 cold_i2c_released && cold_runtime_off &&
+ 				 cold_dsi_off && cold_ldo_off;
+-		cold_remove_state = cold_contained ? "QUIESCENT" : "UNVERIFIED";
++		cold_remove_state = cold_contained ? "REMOVE_QUIESCENT" :
++					       "REMOVE_UNVERIFIED";
+ 		mutex_unlock(&dsi->mode_lock);
+ 		dev_info(dsi->dev,
+ 			 "MICRONUX:M9.2:COLD-REMOVE state=%s pwm-zero-command=%s reset-prepare-command=%s reset-assert-command=%s ldo3-xpd=%s i2c0=%s dsi-gdma=%s physical-panel-state=unobserved\n",
+-- 
+2.54.0.windows.1

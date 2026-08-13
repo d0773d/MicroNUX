@@ -1,0 +1,7 @@
+config BR2_PACKAGE_MICRONUX_ISOLATION_TEST
+	bool "micronux-isolation-test"
+	depends on !BR2_USE_MMU
+	help
+	  Hardware-only bFLT probes for the MicroNUX reserved user pool,
+	  per-mm arena ownership and reuse, U-visible VMA ownership contract,
+	  PMP fault boundary, and syscall pointer validation.

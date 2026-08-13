@@ -1,0 +1,1382 @@
+# M9 Optional LVGL Window and Session Manager Plan
+
+Status: **IMPLEMENTING**
+
+Current section: **M9.2 - Native Linux display ownership (IMPLEMENTING / TESTING)**
+
+Last status update: **2026-08-12**
+
+## Live implementation status
+
+This document is the authoritative M9 implementation ledger. A feature moves
+through `PLANNED`, `IMPLEMENTING`, `VALIDATING`, `TESTING`, and `COMPLETED`.
+`COMPLETED` means the implementation exists, its required validation and tests
+passed, and the evidence is recorded here. A work-package section is completed
+only after every required feature and its exit criterion are completed.
+
+| Work package | Section status | Current evidence |
+| --- | --- | --- |
+| M9.0 Contract freeze | **COMPLETED** | Plan approved for implementation on 2026-08-10; architecture commit `b3d011f` |
+| M9.1 Linux input and presentation | **TESTING - SUPERSEDED** | Its loader-initialized scanout and VPG results are historical. ABI-v2 adopt-live candidates through patch 29 were physically rejected; M9.2 now owns the corrective path |
+| M9.2 Native Linux display ownership | **IMPLEMENTING / TESTING** | ABI-v2 adopt-live is physically rejected. Patch 41 reached Linux-owned runtime but was physically rejected after the panel went black with its backlight enabled. Patches 42-43 improve visible-epoch/fault evidence; Patch 44 derates ABI v3 to 60-MHz/1000-Mbps. Its 1126-case model, clean M7/M9 builds, no-flash verifier, and artifact audits pass; it is unflashed and runtime/visual validation remains |
+| M9.3 Optional LVGL service | **PLANNED** | Starts only after the M9.2 native-display gate passes |
+| M9.4 UI-v1 and native C SDK | **PLANNED** | Starts only after the M9.3 service gate passes |
+| M9.5 Window and session manager | **PLANNED** | Starts only after the M9.4 ABI gate passes |
+| M9.6 Ignite target separation | **PLANNED** | Starts only after the M9.5 lifecycle gate passes |
+| M9.7 Language and shell surfaces | **PLANNED** | Starts only after the M9.6 dependency gate passes |
+| M9.8 Packaging and physical acceptance | **PLANNED** | Final integration and physical gate |
+
+This document is the implementation contract for the optional MicroNUX GUI.
+It separates LVGL from applications, keeps Linux as the sole device owner,
+and preserves a complete terminal-only MicroNUX build.
+
+## Purpose
+
+M9 adds an optional embedded GUI without turning MicroNUX into a desktop Linux
+distribution. The GUI is a trusted Linux userspace service built around LVGL.
+It presents one foreground, full-screen application at a time and provides
+system overlays, input routing, lifecycle management, resource limits, and
+fault recovery.
+
+Applications do not own LVGL, the framebuffer, the touchscreen, DMA, or MIPI
+DSI. Native C, Ignite for MicroNUX, shell tools, and future language runtimes
+all use the same versioned local UI service.
+
+The current M9.2 pre-flash identity is Patch-44 SHA-256
+`bcf953f4706e57944aae4d6a5423f5d3b38a0ab4b3354818d00c457022138307`,
+postsource
+`927530e5c4d2e9162af12b0f57b01b11ce1d7948626a8f2ddac3e8afa2d6cbb6`,
+series manifest
+`9571ba5f78edc65675ca066652df583a9b0842b41a3baa209820e9696123805d`,
+and M9 source contract
+`db0a3f95a19333c2ed6eaa4c31a8e372defdb68adbdbd87c01a894b221fd6d5b`.
+The exact flash/readback and ordered 600-second physical gate must pass before
+M9.3 or any LVGL work begins.
+
+## Locked architecture decisions
+
+1. Linux remains the sole post-handoff owner of the display, touchscreen,
+   backlight, input routing, and all other persistent peripherals.
+2. LVGL is optional. A terminal-only MicroNUX image contains no LVGL library,
+   daemon, fonts, themes, or GUI draw buffers.
+3. A GUI-enabled MicroNUX image contains LVGL only inside the trusted
+   `micronux-guid` process.
+4. Ordinary applications never receive `lv_obj_t *`, `lv_display_t *`, LVGL
+   callbacks, framebuffer mappings, input device descriptors, MMIO, or DMA
+   objects.
+5. Applications use a versioned, language-neutral local protocol at
+   `/run/micronux/ui-v1.sock`.
+6. UI-v1 is versioned independently from LVGL. An internal LVGL upgrade must
+   not require application recompilation when UI-v1 remains compatible.
+7. Ignite has two deployment flavors that share one language, compiler,
+   bytecode, VM core, garbage collector, and package format:
+
+   - standalone Ignite firmware embeds its own LVGL backend; and
+   - Ignite for MicroNUX has no LVGL, ESP-LVGL, or ESP-IDF dependency and uses
+     UI-v1 when the optional GUI service is available.
+
+8. The first manager supports one foreground, full-screen application plus
+   trusted system overlays. Overlapping, draggable desktop windows are not an
+   M9 requirement.
+9. The first implementation uses LVGL 9.5.0. The MicroNUX UI-v1 boundary must
+   still permit a future internal LVGL upgrade.
+10. GUI failure must fail back to a working USB serial terminal and, where the
+    kernel console interface permits it, the framebuffer console.
+
+## Supported operating modes
+
+| Mode | LVGL location | Display behavior |
+| --- | --- | --- |
+| Standalone Ignite firmware | Embedded in the ESP-IDF firmware | Firmware owns display and touch; Linux is absent |
+| Terminal-only MicroNUX | Not installed | Linux framebuffer console and USB shell |
+| GUI-enabled MicroNUX | Only inside `micronux-guid` | `micronux-guid` owns the GUI session through Linux drivers |
+| Ignite for MicroNUX | Not linked | Uses UI-v1 if `micronux-guid` is installed and enabled |
+| Native MicroNUX C application | Not linked | Uses `libmicronux-ui` and UI-v1 |
+| Other MicroNUX language | Not linked | Uses a C binding or UI-v1 directly |
+
+The two LVGL deployments are independent. Standalone Ignite firmware and
+`micronux-guid` may begin on the same LVGL version, but neither links to nor
+loads code from the other.
+
+## Accepted baseline
+
+M9 builds on the accepted M7 and M8 contracts while M9.2 replaces the
+historical M7 scanout engine:
+
+- the historical accepted M7 image validated the loader handoff, owned
+  `/dev/fb0`, ran circular DW-GDMA scanout, monitored underruns, and owned the
+  backlight;
+- the current M9.2 loader instead publishes ABI v3 with DSI, GDMA, and LDO
+  quiescent and no panel, splash, or scanout initialization;
+- Linux cold-initializes the 10.1-inch JD9365 as 800x1280 RGB565 over two
+  1500-Mbps DSI lanes, owns front/back/spare buffers, selects complete frames
+  only at transfer completion, and rearms one marked-last descriptor per frame;
+- the framebuffer is exactly 2,048,000 bytes with a 1,600-byte stride;
+- application framebuffer `mmap()` is denied;
+- Linux paces ordinary framebuffer writes to protect PSRAM scanout bandwidth;
+- the framebuffer console is 100x80 characters and USB `ttyGS0` remains the
+  recovery shell; and
+- M8 establishes the local `SOCK_SEQPACKET`, `SO_PEERCRED`, versioning,
+  nonblocking wait, bounded-client, and supervised-service patterns that M9
+  must repeat.
+
+The ABI-v3 runtime handshake is
+`PROBED_QUIESCENT` -> `cold_init` ->
+`SCANOUT_QUALIFIED_QUIESCENT` -> tty status render -> `boot_ready` ->
+`RUNTIME_REVEALED`. Backlight reveal follows a newly presented status commit
+plus four clean same-front completions. Touch registration occurs afterward.
+The native runtime intentionally omits VPG, and every internal diagnostic keeps
+`physical-panel-state=unobserved`. The patch-36 diagnostic artifacts passed
+exact flash/readback, but their boot failed closed at the GDMA enable-register
+readback and continued headless. Patch 37 corrected that comparison and passed
+exact flash/readback under `build/m9-readback/20260812T120632185Z-2993c451`.
+Its sealed passive snapshot
+`out/m9/hardware-runs/20260812T120919Z-snapshot-b5890811aa40-0611024a.log`
+(SHA-256
+`52ebc5ed26487e68419411f73cd263566e3fb8a47920e1b67f33f150d21d94b6`)
+reached GDMA `CONFIGURED`, then exposed the deterministic released-I2C policy
+bug during `SCANOUT_INITIALIZING`, reached `FAILED_QUIESCENT`, and continued
+headless. It records `optical-state=unobserved`. Patch 38 corrects only that
+policy defect and adds decision-point diagnostics. It passed exact
+flash/readback under `build/m9-readback/20260812T125425532Z-95d60702`;
+`readback.json` has SHA-256
+`702ba99d9ca84bf25593301c300575a9706294dcae62f8db2ef982336e337a46`.
+Its sealed passive snapshot
+`out/m9/hardware-runs/20260812T125714Z-snapshot-b5890811aa40-3670b4ef.log`
+has SHA-256
+`1c43ac04f307de252342fdc4cdc49d3aa6f18520be5cca254d4e7df294b677ac`.
+It reached GDMA `CONFIGURED`, then failed closed at
+`arm-readback/descriptor-channel-readback` with `cfg=3 chen=1
+cfglo=0000000f cfghi=0a020001 llp=1 sar=48031500 ctrlhi=c0108840` and no
+captured fault status. The one-shot engine had fetched the head
+(`SAR=front+0x500`) and advanced live LLP to the terminal descriptor's
+`0 | memory-port` value `1`; the post-enable head-LLP comparison was a false
+rejection. Containment reached `FAILED_QUIESCENT`, retained the headless shell,
+and again recorded `optical-state=unobserved`. None of these implementation
+facts, byte checks, or software containment markers is physical display
+evidence.
+
+The current Linux tree is ordered as 7 platform, 40 peripheral, and 10
+isolation patches (7/40/10), 57 total, with manifest SHA-256
+`f9318e1a6e7480f1105ec5a435ad71d2754bb6d91a79bcc471747249128ed983`.
+Peripheral patches 30-40 are the ABI-v3 display sequence. Patch 39 validates
+the descriptor, channel configuration, head LLP/high half, disabled CHEN, and
+clean status before enable, then checks only channel-active and error/status
+safety after enable. Its exact patch SHA-256, commit, post-source SHA-256, and
+W=1 warnings-as-errors object SHA-256 are
+`d8c774f42019dddeba6020ec019b4fd61474dec3c2913c33b5c2ad191deabe94`,
+`99fcff145f84b22c8996e7cab8ce9a77abe472e7`,
+`68378f2ca532ec36020a3a99a57c2b8a909b694cb11d613764427acd76c7de0c`,
+and `b86cbf98fe2e2d2b894928049d9110cafedb290fbd1b2257285e06143997331a`.
+Strict checkpatch is 0/0/0, fuzz-zero application passes, W=1 `-Werror`
+passes, and the independent audit reports
+`PATCH39 INDEPENDENT SEMANTIC AUDIT: CLEAR — no blocker.` The shared model
+passes 920 cases. The clean M7 ABI-v2 regression passes source contract
+`112e8a0afef2f14151a8fcc9e5f8c054e671370d47b8ae042d87a15e52b00ca4`
+and the 14-file bFLT W^X gate; its retained log
+`out/build-logs/m7-patch39-final-rerun-20260812T063011.stdout.log` has SHA-256
+`4ccc716b3ca1d9c9de013eb59e852fd0d876d58cd4f222792fce89610242d382`.
+The fresh M9 full build passes source contract
+`e9c1e789fe87a5a7735c62785ff0113bca61c9d924e964c0a39ce30d69ab5fba`;
+retained stdout
+`build/patch39-m9-build/m9-full-final-20260812T062855.stdout.log` has SHA-256
+`66767316f4a0d528ca1ac036a2066b9ce0569ff597c542b035b91e2538ee6678`.
+The no-flash verifier passes with loader SHA-256
+`e314b558d923e8fa0175f9d4eb692ce5728eac3175053ca47c53775a0dbf9104`,
+reports `Nothing was flashed`, and retained stdout
+`build/patch39-m9-build/m9-noflash-final-20260812T063226.stdout.log` has SHA-256
+`773a31cdc8ae7223f3bea628a1cbd7f23e1d9e1be0dea62037e2dd6138010586`.
+The seven-artifact audit passed. Patch 39 subsequently passed exact
+flash/readback under `build/m9-readback/20260812T134841478Z-1a4e56fe`;
+`readback.json` has SHA-256
+`691fd9ac949de313a74c5591870bd3a95769baeae7f8c7be7d22dd429be61c09`.
+Its sealed snapshot
+`out/m9/hardware-runs/20260812T135132Z-snapshot-b5890811aa40-2b712727.log`
+has SHA-256
+`9f4cb506b955c9e0b2fbfbbaf3927271de3eef40df7b0e1b0a67a3991d3228ac`.
+Linux completed four frames (`generation=4 frames=4 rearm=5/0 guards=1`) with
+no host, bridge, GDMA, DMA, or software faults. Exact programmed
+`VID_MODE_CFG=0000ff02` passed; only the disabled optional shadow bank remained
+`active=00000000`. That equality made policy false and containment published
+`FAILED_QUIESCENT`; the log records `optical-state=unobserved`.
+
+Patch 40 removes exactly the three-line `DSI_HOST_NATIVE_VIDEO_POLICY_ACT`
+composite and two-line runtime equality (zero additions, five deletions). It
+retains active-register and component diagnostics, exact
+`VID_MODE_CFG=0000ff02`, and the other 40 policy predicates, with no write,
+teardown, reveal, or ABI-v2 behavior change. Its
+patch/commit/post-source/object SHA-256 evidence is
+`04df043b79760379cc8f4d0d74847d892e3895bc1b55eba3b90af23695647ed1`,
+`0fac40ee31c1af165ea94a82a7b0d905d8da4861`,
+`13088b8fefe6cf8ca415615e2cf8e9e62a6f3d972d2f010c49965139924a5164`,
+and `845e536b031622f29cc8d1e157c1e284e453f8fde8d053a2dba20182368dcdd1`.
+The independent audit is clear, and the current series/model evidence is the
+57-patch manifest above plus 963 passing cases. The clean isolated Patch-40 M7
+ABI-v2 regression passes source contract
+`6b1d5d730c7370f364fed80c507f8ba8454c52b9ee247a22cde96a54233d8206`.
+Retained stdout
+`out/m7/build-logs/20260812T072708Z-patch40-clean.stdout.log` has SHA-256
+`9bddb74e3734cd977bd3b98a28cab29e75a626e6483219ccf88cca418fc47c05`.
+Its driver source/object gates match the Patch-40 hashes above, and its 14-file,
+128-byte-granule bFLT W^X audit passes. Exact Image, DTB, metadata, and rootfs
+SHA-256 values are
+`ca34bd104c670427bc7567991056eb9f423cd875290bd238050b384c71454f27`,
+`42e3ac2fadcbeda59a13ee3cfd4afb490607e13185b7db48b2c3ee1fd00a4fe6`,
+`a1f0c6047b453846831eca90ab6d6675a3933e369fa479d138c4331b97741728`,
+and `1721822da26deba72d2952af1d5bade5c9d8b7eeb8d6d6c4616a83c2ff8ba3ae`.
+Metadata CRC32 is `901bf054`, and the payload ends at `0x48a0cd08`. This was
+build-only: no COM access, reset, or flash occurred, and it is not new physical
+acceptance. The fresh M9 build passes source contract
+`4f21d0c9e47cc0c003ccbfe9db8c558e18fcf1cf82cceb1e50319661d6ce2686`;
+full-build and no-flash stdout SHA-256 values are
+`0c15ef3f2c0e40f531b77a12cdf1ec5731272005b2488d96789348bd2319cb6e`
+and `4b64a06e8d65391d5fab3182cdf864fb815a455fe06e6be91c0cf9724f7f3e6e`.
+The verifier reports `Nothing was flashed`, and the seven-artifact audit
+passes. Patch 40 remains unflashed; runtime and user-observed visual validation
+are pending. Exact patch, postimage, hardware-run, and artifact hashes live in
+the authoritative
+[M9.2 native-display ledger](m9-2-native-linux-display-ownership-plan.md).
+
+The Kit C display uses a GT9271 touch controller according to the Waveshare
+hardware documentation. Its polled Linux path is implemented, but ABI-v3
+registration is deliberately deferred until after `RUNTIME_REVEALED`; the
+exact candidate still requires the physical five-point gate.
+
+## System architecture
+
+```text
+10.1-inch display, GT9271 touch, backlight
+                    |
+             Linux kernel drivers
+       fbdev / input / I2C / backlight / DSI
+                    |
+             micronux-guid
+       +-----------------------------+
+       | LVGL 9.5 renderer           |
+       | application session manager |
+       | input and focus router      |
+       | system overlay              |
+       | policy and resource limits  |
+       +-----------------------------+
+                    |
+        /run/micronux/ui-v1.sock
+           |          |          |
+    libmicronux-ui  Ignite    future bindings
+           |       for Linux         |
+       native C                 other languages
+```
+
+LVGL supplies widgets, styles, layouts, rendering, animations, input event
+processing, and invalidated-area tracking. `micronux-guid` supplies the
+operating-system policy that LVGL does not: sessions, foreground ownership,
+focus, application lifecycle, authorization, quotas, cleanup, and recovery.
+
+## Process and ownership boundaries
+
+### Kernel
+
+The kernel owns all physical interfaces. M9 may add or configure Linux drivers
+for the GT9271, board I2C wiring, input events, and safe display presentation.
+It must not add a general-purpose userspace MMIO, DMA, or framebuffer-mapping
+escape hatch.
+
+### `micronux-guid`
+
+`micronux-guid` is the only process that:
+
+- initializes the MicroNUX LVGL instance;
+- opens the GUI display and touch interfaces;
+- creates LVGL objects;
+- runs LVGL timers and rendering;
+- receives raw Linux input events;
+- assigns foreground focus; and
+- renders trusted system overlays.
+
+The daemon uses one serialized event loop for client sockets, input readiness,
+LVGL timers, and display completion. No client callback is executed inside the
+daemon. Untrusted code cannot be dynamically loaded into it.
+
+### Ordinary applications
+
+Each application is a separate Linux userspace process with its existing
+MicroNUX NOMMU arena and execution policy. It owns only a UI-v1 connection and
+opaque handles scoped to that connection. Disconnecting destroys the session
+and every object and resource associated with it.
+
+Applications cannot:
+
+- open the GUI-owned framebuffer or raw input device;
+- address another application's objects;
+- render above the trusted system overlay;
+- claim focus or system capabilities in a request;
+- install an LVGL event callback; or
+- retain UI ownership after exit.
+
+### Trusted GUI extensions
+
+A specialized widget that cannot be represented by UI-v1 may be implemented
+as a reviewed, build-time C module inside `micronux-guid`. Such a module may
+use raw LVGL 9.5 APIs. M9 does not provide arbitrary runtime plugins or
+`dlopen()` support for application-supplied LVGL code.
+
+## Display and rendering design
+
+`micronux-guid` creates one LVGL display at 800x1280 RGB565. Its flush callback
+writes only invalidated rectangles through the accepted Linux framebuffer
+path and calls LVGL's flush-completion function only after the destination
+buffer is safe for reuse.
+
+The initial prototype will benchmark two partial draw buffers at 16, 32, and
+64 scanlines. For example, two 800x32 RGB565 buffers require 102,400 bytes,
+compared with 2,048,000 bytes for one additional full-screen buffer. The final
+buffer height is selected from measured frame time, scheduler responsiveness,
+memory use, and DSI underrun evidence.
+
+M9 will not allocate a full-screen surface per application. The session
+manager keeps application LVGL object trees and activates the foreground
+screen. Bounded image and canvas resources are owned by the daemon and charged
+to the creating session.
+
+The implementation must preserve the current denial of application
+framebuffer `mmap()`. If positioned framebuffer writes cannot meet the
+acceptance gate, the fix belongs in a narrow Linux presentation interface or
+driver operation, not in direct application mappings.
+
+## Input design
+
+M9.1 will probe and bind the Kit C GT9271 through Linux. The preferred path is
+the applicable upstream Goodix input driver plus an ESP32-P4 device-tree node.
+If the accepted kernel lacks a required compatible or ESP32-P4 I2C behavior, a
+minimal reviewable patch will be added rather than moving touch into the
+loader or GUI application.
+
+The Linux input layer reports contacts to `micronux-guid`. The daemon maps the
+accepted portrait orientation into LVGL coordinates and routes semantic events
+only to the foreground session. The first public UI contract requires one
+primary pointer. The kernel may retain multitouch data for a later UI revision.
+No display rotation is required in M9.
+
+## Window and session behavior
+
+The word "window" means an isolated application scene, not an overlapping PC
+window. One application scene is active at a time.
+
+`micronux-guid` maintains:
+
+- one trusted system layer;
+- zero or one active foreground application screen;
+- bounded inactive application sessions;
+- one focus owner;
+- one virtual keyboard owned by the system layer; and
+- one bounded event queue per application.
+
+### Start
+
+When enabled, the daemon acquires the display session, prevents framebuffer
+console output from racing GUI rendering, initializes LVGL, creates the system
+layer, opens UI-v1, and shows a minimal launcher or status scene.
+
+### Launch
+
+A launcher or shell request starts an application through the existing
+MicroNUX job policy. The application opens UI-v1, negotiates an ABI version,
+creates its scene, commits it, and requests presentation. Policy—not a client
+claim—decides whether that session may become foreground.
+
+### Switch
+
+To switch applications, the manager:
+
+1. sends a bounded suspend lifecycle event to the current foreground client;
+2. stops routing input to it;
+3. hides its LVGL screen;
+4. activates the next screen;
+5. assigns focus; and
+6. sends a resume lifecycle event.
+
+A client that fails to acknowledge a lifecycle event cannot stall the manager.
+
+### Exit or fault
+
+On clean exit, socket loss, protocol violation, resource-limit violation, or
+process fault, the manager removes the session's objects, events, images,
+timers, and focus. It then activates the launcher, previous valid application,
+or recovery scene.
+
+### Stop or disable
+
+The daemon closes application sessions, releases input and display ownership,
+restores the framebuffer console where supported, and leaves USB `ttyGS0`
+available. Repeated daemon crashes enter a terminal-first safe mode instead of
+an endless GUI restart loop.
+
+## UI-v1 application contract
+
+The public endpoint is an `AF_UNIX` `SOCK_SEQPACKET` socket:
+
+```text
+/run/micronux/ui-v1.sock
+```
+
+The protocol uses fixed-width little-endian headers, an ABI major/minor pair,
+a request identifier, bounded payload lengths, and stable status values. Major
+version mismatch fails closed. The daemon derives identity and granted
+capabilities from `SO_PEERCRED`; it never trusts a capability mask supplied by
+the client.
+
+### Initial operation groups
+
+| Group | Representative operations |
+| --- | --- |
+| Session | `HELLO`, `INFO`, `OPEN`, `CLOSE`, `REQUEST_FOREGROUND` |
+| Transaction | `BEGIN`, `COMMIT`, `ABORT` |
+| Object | `CREATE`, `DELETE`, `SET_PROPERTY`, `GET_PROPERTY` |
+| Event | `SUBSCRIBE`, `UNSUBSCRIBE`, `NEXT_EVENT` |
+| Resource | `CREATE_IMAGE`, `CREATE_FONT_REF`, `RELEASE_RESOURCE` |
+| Lifecycle | `ACK_SUSPEND`, `ACK_RESUME`, `REQUEST_CLOSE` |
+| System-only | notification, overlay, launcher, and administration operations |
+
+The exact numeric wire values and structures are frozen during M9.4 before
+client code is merged.
+
+### Initial object set
+
+UI-v1 will cover the existing declarative Ignite UI set where practical:
+
+- screen and container;
+- label and button;
+- slider, switch, checkbox, bar, and spinner;
+- dropdown, list, table, tabs, and modal;
+- text field and text area;
+- image; and
+- a bounded canvas/drawing-command object.
+
+An unsupported object or property returns a stable `UNSUPPORTED` result. It
+must not silently fall back to a different widget.
+
+### Handles and transactions
+
+Objects and resources use opaque fixed-width handles. A handle is meaningful
+only within its owning connection and includes generation protection against
+stale reuse.
+
+Clients may group creates and property changes inside a transaction. `COMMIT`
+applies the validated batch and invalidates the necessary LVGL regions. A
+rejected transaction leaves the previous visible scene intact.
+
+### Events
+
+Initial events include:
+
+- clicked, pressed, released, and value changed;
+- text changed and submitted;
+- focus gained and lost;
+- foreground, suspend, resume, and close requested;
+- resource pressure; and
+- service shutdown or GUI unavailable.
+
+Events carry handles and bounded values, not pointers. Event queues have fixed
+depths and explicit coalescing rules for high-frequency value changes. A slow
+client cannot exhaust daemon memory or block rendering.
+
+### Capabilities and quotas
+
+The initial capability classes are application presentation/events, trusted
+system overlay, and GUI administration. The public names and bit assignments
+are frozen with the wire contract.
+
+Each session has limits for:
+
+- objects and nesting depth;
+- text bytes;
+- image and canvas bytes;
+- transactions and message size;
+- queued events;
+- animations and timers; and
+- inactive-session residency.
+
+Cross-session handles, malformed messages, unauthorized system operations,
+and over-limit requests fail without changing visible state.
+
+## Native C and other language access
+
+Native C applications link the static `libmicronux-ui.a` and include
+`<micronux/ui.h>`. The library performs version negotiation, wire validation,
+request serialization, status-to-`errno` mapping, and `poll()`-compatible event
+waiting. It does not link LVGL.
+
+C++, Rust, Zig, or another compiled language may call this C ABI. A bounded VM
+or interpreter may implement a host binding against the same C ABI or the
+documented UI-v1 messages. A language runtime must still fit the MicroNUX
+NOMMU executable, memory, syscall, and W^X policies.
+
+Shell commands are administration and orchestration clients. Intended uses
+include status, enable/disable, launch, close, notification, and occasional
+property updates. Shell scripts are not a per-frame rendering API.
+
+## Ignite deployment boundary
+
+Ignite remains one language pipeline:
+
+```text
+.ignite source -> direct Ignite compiler -> Ignite bytecode -> C VM
+```
+
+Its deployment targets are:
+
+| Target | UI backend | Forbidden dependency |
+| --- | --- | --- |
+| Standalone Ignite firmware | Local embedded LVGL 9.5 backend | None; this target intentionally contains LVGL |
+| Ignite for MicroNUX | UI-v1 host adapter | LVGL, `esp_lvgl_port`, ESP-IDF display/touch code |
+
+`.igniteui` remains a backend-neutral declarative manifest aligned with named
+handlers in `.ignite`. Standalone firmware converts it to local LVGL objects.
+Ignite for MicroNUX converts it to UI-v1 transactions and stores opaque UI-v1
+handles. Existing tap and value-change events are translated into the same VM
+event behavior.
+
+The MicroNUX Ignite runner must continue to execute non-GUI packages when the
+GUI is absent. A GUI operation with no service returns a typed, recoverable
+`GUI_UNAVAILABLE` result. It is not a VM fault and does not cause Ignite to
+load LVGL.
+
+Build validation must reject any direct or transitive LVGL, ESP-LVGL, or
+ESP-IDF GUI dependency in the MicroNUX Ignite artifact.
+
+## Packaging and lifecycle
+
+### Stage 1: reproducible build profiles
+
+The first implementation adds a Buildroot `micronux-gui` package and a
+GUI-enabled defconfig. The accepted terminal-only profile remains buildable
+and unchanged in behavior. The GUI package contains the daemon, LVGL, its
+configuration, bounded fonts/themes, supervisor, CLI, C library, and headers.
+
+Proposed administration commands are:
+
+```sh
+micronux-gui status
+micronux-gui enable
+micronux-gui disable
+micronux-gui restart
+micronux-gui launch APP
+micronux-gui close APP
+micronux-gui notify TEXT
+```
+
+### Stage 2: installable signed package
+
+The current fixed initramfs cannot provide a truthful runtime install/remove
+experience by itself. After MicroNUX gains a persistent signed package layer,
+the same GUI payload may be installed from microSD without rebuilding the
+kernel image. Package removal must restore the terminal-first configuration.
+
+Stage 2 is not allowed to delay the Stage 1 GUI architecture and hardware
+gate, but M9 documentation and layouts must not prevent it.
+
+## Work packages
+
+### M9.0 - Contract freeze
+
+Section status: **COMPLETED**
+
+Deliverables:
+
+- [x] **COMPLETED** - this approved plan;
+- [x] **COMPLETED** - the explicit three-mode LVGL ownership matrix;
+- [x] **COMPLETED** - the two-flavor Ignite dependency boundary;
+- [x] **COMPLETED** - an initial memory and image-size baseline; and
+- [x] **COMPLETED** - a testable list of non-goals and completion gates.
+
+Exit criterion: the plan is committed and approved before implementation
+begins.
+
+### M9.1 - Linux input and presentation foundation
+
+Section status: **TESTING**
+
+Deliverables:
+
+- [x] **COMPLETED** - GT9271 Linux probe and input events;
+- [x] **COMPLETED** - accepted reset, interrupt, and coordinate-transform
+  device-tree contract;
+- [ ] **TESTING** - safe foreground graphics ownership and clean fbcon/status
+  restoration through the dark-settle path;
+- [ ] **TESTING** - positioned, paced partial-rectangle presentation with clean
+  normal-exit and signal restoration; and
+- [ ] **TESTING** - a no-LVGL C diagnostic that proves display and primary
+  touch input.
+
+Validation evidence recorded 2026-08-10:
+
+- `scripts/check-linux-patch-series.py` passed the ordered 33-patch contract
+  with manifest SHA-256
+  `8b81443dd04ba72ced44bbced7e0641b707d089948ab86c89977d7f4b9af0ba4`;
+- a clean `scripts/m9-build.sh` integration build passed with Linux 6.12.27,
+  `CONFIG_INPUT_EVDEV=y`, the M7 isolation contract retained, bFLT W^X
+  validation passing, and no LVGL artifact in the M9.1 image;
+- the generated DTB contains the polling-only Kit C touch contract at address
+  `0x5d`, 10 ms polling, and unrotated 800x1280 coordinates. The Waveshare Kit
+  C wiring has no connected GT9271 reset or interrupt GPIO, so their deliberate
+  absence and Linux polling are part of the accepted contract;
+- `micronux-display-test` cross-compiled with `-Werror` as a 90,160-byte bFLT
+  executable and exposes check, draw, terminal restoration, and five-point
+  touch acceptance markers; and
+- the complete Linux image is 6,090,608 bytes, below the 6 MiB partition limit
+  by 200,848 bytes.
+
+Remaining physical testing required before any open item or this section may
+be marked `COMPLETED`:
+
+- [x] **COMPLETED (machine)** - flash and read-back verified the exact matching
+  loader and Linux candidate;
+- [ ] **TESTING (visual)** - observe clean loader-to-status, normal
+  graphics-to-status, signal-driven graphics-to-status, and bounded
+  VPG-to-status transitions without cyan or flicker;
+- [x] **COMPLETED (machine)** - a fresh, same-boot 600-second
+  USB-disconnected status-screen soak completed on a boot where VPG had not
+  been invoked;
+- [x] **COMPLETED (machine)** - display faults, host errors, DSI underruns, and
+  DMA errors remained zero while scanout advanced; and
+- [ ] **TESTING (physical input)** - repeat the touch regression while the USB
+  shell and unrelated tasks remain responsive.
+
+Physical test evidence recorded 2026-08-10, iteration 1:
+
+- GT9271 probe, `/dev/input/event0`, product ID, 800x1280 ranges, and zero touch
+  transport errors passed;
+- the USB shell remained responsive during a three-second full-frame draw and
+  the diagnostic restored the framebuffer console;
+- DSI diagnostics changed from `underruns=0` to `underruns=4`, so the physical
+  presentation gate failed and the affected features returned to
+  `IMPLEMENTING`; and
+- no completion box was checked. The next iteration adds bounded userspace
+  write chunks and an explicit inter-chunk gap before rebuilding and repeating
+  the same measurement.
+
+Physical test evidence recorded 2026-08-10, iteration 2:
+
+- the rebuilt 6,090,608-byte image passed the 33-patch manifest, bFLT W^X,
+  partition-size, and no-LVGL gates, then flash read-back verification passed;
+- GT9271 readiness, `/dev/input/event0`, zero touch errors, the framebuffer
+  interface contract, foreground draw, concurrent USB-shell responsiveness,
+  and framebuffer-console restoration all passed again;
+- the 256-byte/100-microsecond paced writer completed without the NOMMU timer
+  stall seen in the first pacing attempt, but DSI diagnostics changed from
+  `underruns=0` to `underruns=5`; and
+- the presentation features remain `IMPLEMENTING`. Iteration 3 reduces the
+  instantaneous framebuffer write burst to 64 bytes while retaining the
+  100-microsecond inter-burst gap, then repeats the same zero-underrun gate.
+
+Physical test evidence recorded 2026-08-10, iteration 3:
+
+- the 64-byte/100-microsecond writer passed cross-compilation, the complete M9
+  build gates, flash read-back verification, and the physical interface checks;
+- an added mid-presentation diagnostic proved `underruns=0` before and after
+  the full-frame paced write while the foreground pattern remained visible;
+- the counter changed from `underruns=0` to `underruns=6` only after
+  `KDSETMODE(KD_TEXT)` caused fbcon to redraw through its kernel drawing path;
+  and
+- the root cause is therefore the ownership transition rather than the paced
+  presentation path. Iteration 4 brackets fbcon restoration with the standard
+  fbdev blank API, and the Linux driver stops scanout while blanked, accepts the
+  console redraw, then cleanly restarts scanout before restoring the backlight.
+
+Physical test evidence recorded 2026-08-10, iteration 4:
+
+- the complete clean Linux 6.12.27 build passed with all 33 patches, manifest
+  SHA-256
+  `77a4abb56b34519e5cb8e1e7329363fe4e2a4a6660202aa06242db94ca286002`,
+  bFLT W^X enforcement, no LVGL artifact, and a 6,090,608-byte image;
+- image, DTB, and metadata flash read-back verification passed on ESP32-P4
+  revision 1.3;
+- GT9271 readiness, `/dev/input/event0`, product 9271, 800x1280 coordinates,
+  zero transport errors, and the framebuffer interface contract passed;
+- the foreground diagnostic completed its 64-byte/100-microsecond paced draw,
+  the USB shell remained responsive, and fbcon restoration completed through
+  the kernel-owned blank/redraw/restart transition; and
+- DSI diagnostics remained `underruns=0` before presentation, during the
+  visible pattern, and after console restoration. The automated preflight
+  emitted `MICRONUX:M9:PREFLIGHT:PASS`; the section advances to `TESTING` for
+  its remaining five-point touch and visual-confirmation gates.
+
+Physical test evidence recorded 2026-08-10, iteration 5:
+
+- the interactive diagnostic accepted all five targets in the required order:
+  top-left `79,81`, top-right `720,95`, bottom-right `718,1207`, bottom-left
+  `91,1198`, and center `393,641`;
+- every press was within the 96-pixel acceptance radius, each release was
+  observed before advancing, the diagnostic emitted
+  `MICRONUX:M9:DISPLAY-TEST:PASS mode=touch points=5`, and fbcon returned;
+- post-touch DSI diagnostics reported `underruns=0`, no DMA error, and active
+  scanout, producing `MICRONUX:M9:TOUCH-GATE:PASS`; and
+- the GT9271 input/event feature and the polling-only unrotated 800x1280
+  device-tree contract are now `COMPLETED`. The ownership, presentation, and
+  diagnostic features remain `TESTING` until signal-recovery and final visual
+  confirmation pass.
+
+Physical test evidence recorded 2026-08-10, iteration 6:
+
+- the recovery test launched a 30-second foreground diagnostic, delivered
+  SIGTERM after the pattern became visible, and observed the expected exit code
+  143 from the installed signal handler;
+- the framebuffer console and USB shell returned, scanout remained active with
+  no DMA error, and DSI diagnostics stayed `underruns=0` before and after the
+  forced exit;
+- the complete preflight emitted `MICRONUX:M9:PREFLIGHT:PASS` with
+  `console=restored`, `signal=restored`, and `underruns=0`; and
+- safe foreground ownership and recovery are now `COMPLETED`. Positioned
+  presentation and the no-LVGL diagnostic remain `TESTING` only for the final
+  human visual-confirmation gate.
+
+Physical test evidence recorded 2026-08-10, iteration 7:
+
+- the user confirmed that touch worked as expected and that all five visual
+  targets could be followed successfully;
+- the full-screen color pattern visibly painted from top to bottom. This is
+  expected for the current deliberately paced single-buffer row writer and is
+  not itself a failure;
+- after loader progress reached 100%, the panel flickered rapidly between light
+  blue and black before the framebuffer terminal appeared; after remaining at
+  the terminal for approximately two minutes, the panel changed to solid light
+  blue; and
+- the delayed visual state is not accepted as stable presentation. M9.1 and
+  positioned presentation return to `IMPLEMENTING`; the completed touch,
+  device-tree, and ownership-transition results remain completed. A timed
+  serial-attached soak now samples DSI underruns, DMA errors, scanout progress,
+  touch health, and shell responsiveness while the visual failure is reproduced.
+- the first soak invocation captured one healthy sample, then stopped because
+  this minimal BusyBox `hush` does not support the runner's arithmetic loop.
+  The test harness is being changed to emit pre-expanded sample commands; this
+  harness failure is not counted as a MicroNUX runtime result.
+
+Physical test evidence recorded 2026-08-10, iteration 8:
+
+- the corrected 240-second soak completed all 17 samples from 0 through 240
+  seconds while scanout advanced from frame 533 to frame 17,204;
+- every sample reported active GDMA scanout, `underruns=0`, DMA
+  `errors=00000000`, ready GT9271 touch with zero transport errors, and a
+  responsive USB shell;
+- the panel changed to the loader's solid light-blue framebuffer exactly when
+  the host test completed and closed COM14, ruling out a spontaneous display
+  or DMA timeout during the observed interval; and
+- inspection found that PID 1 exited after the USB interactive shell received
+  a terminal hangup. That caused Linux to reboot whenever the host terminal
+  disconnected. The init shell is now being supervised and respawned, and a
+  disconnect/reconnect hardware gate is being added before visual stability is
+  accepted.
+
+Physical test evidence recorded 2026-08-10, iteration 9:
+
+- a deliberate host-close test captured reset reason `CHIP_USB_UART_RESET`,
+  proving that native USB Serial/JTAG CDC close reset the entire ESP32-P4 and
+  exposed the loader's light-blue framebuffer; the DSI controller did not fail;
+- Linux now sets the ESP32-P4 USB-UART chip-reset-disable bit during machine
+  restart initialization and exposes the root-writable policy at
+  `/sys/kernel/micronux/usb_reset`; normal runtime state is `disabled`, while
+  the flash workflow explicitly writes `enable` immediately before esptool;
+- the complete 34-patch Linux series passed with manifest SHA-256
+  `2b1d82b01553d9ae65beebcf8b3a5c41300774d3c1b4abb18afa743e0858aee9`, and a
+  clean M9 build passed with Linux 6.12.27, the bFLT W^X audit, LVGL absent,
+  and a 6,090,608-byte image;
+- that exact image was written and hash-verified on the connected ESP32-P4;
+  boot reported `USB serial reset-on-disconnect disabled`, and sysfs confirmed
+  `disabled`; and
+- the automated gate closed COM14 for 15 seconds, then reconnected without a
+  Linux or loader boot marker. The same boot's scanout advanced from frame 487
+  to frame 1,537, the shell returned, and both DSI underruns and DMA errors
+  remained zero. Machine validation passed; human confirmation that the panel
+  stayed on the MicroNUX terminal/status screen is the remaining visual gate.
+
+Implementation and pre-hardware validation recorded 2026-08-10, iteration 10:
+
+- the user's latest observation is that the currently flashed forced-HS,
+  LP-disabled, frame-ACK-disabled Linux control may not have reproduced the
+  delayed solid-cyan state. That evidence remains visual and provisional; the
+  brief cyan flash between loader, diagnostic, and status screens is a separate
+  reproducible transition defect;
+- source-history and vendor-code review localized that flash to an ordering
+  race: the backlight-off I2C write was immediately followed by removal of the
+  only valid scanout source. The new loader and Linux blank paths keep the old
+  valid frame scanning for the Waveshare driver's 100-millisecond backlight-off
+  settling interval before stopping GDMA or the bridge;
+- Linux now provides a root-only, blocking `vpg_test_ms` discriminator for 250
+  through 10,000 milliseconds. It follows ESP-IDF v6.0.1's source-switch order,
+  leaves the framebuffer GDMA producer running, changes only the bridge/VPG
+  source bits, and requires four new framebuffer frames after restoration. A
+  visible VPG result proves downstream capability after the toggle; the toggle
+  can itself resynchronize a marginal link, so it does not prove pre-toggle
+  downstream state;
+- the exact 38-patch series passed with manifest SHA-256
+  `9b6dffa397080b1a897b07b8bc88a0d41320fcb4d89bd3e8e8b2056014bba295`.
+  The bounded-VPG patch passed strict checkpatch with zero findings, its
+  RISC-V driver object compiled, and the complete Buildroot image passed at
+  6,090,672 bytes with SHA-256
+  `4c8313856dd6b95324f358a60c5c8e3262841590b756ec32041f76378058b095`;
+- the exact ESP-IDF v6.0.1 Kit C/JD9365 loader also passed at 281,344 bytes
+  with SHA-256
+  `5f9697a8d8c0d04780132e4690f5378e72e7b58795dd11ccecea7ad3b475e949`;
+  and
+- this candidate has deliberately not been flashed while the user is away.
+  M9.1 remains `TESTING` until a clean boot/status transition, visible
+  vertical-bars-to-status VPG cycle, and at least 600 seconds of disconnected
+  human visual observation all pass with zero DMA errors and DSI underruns.
+
+Implementation and pre-hardware validation recorded 2026-08-10, iteration 11:
+
+- failure-path review found that an ambiguous backlight I2C completion or DMA
+  stop timeout could remove the last valid video source while the panel might
+  be illuminated. Linux now preserves a valid producer on reveal errors,
+  marks every destructive stop attempt inactive, and refuses every backlight
+  reveal unless framebuffer or VPG scanout is verified healthy;
+- DMA errors and DSI bridge underruns are now latched from interrupt-safe
+  paths. A process-context worker requests backlight-off while preserving the
+  current source and logs `MICRONUX:M9:DISPLAY-FAULT`; recovery requires reboot
+  because Linux does not yet own a proven JD9365 panel reinitialization path;
+- the watchdog now also detects stale framebuffer production and the fatal DSI
+  host payload-write and payload-underflow conditions. Clear-on-read host status
+  is serialized, accumulated for diagnostics, and deliberately baselined only
+  while the backlight is confirmed dark during a source transition;
+- the M9 flash workflow now builds, validates, and flashes the matching
+  ESP-IDF v6.0.1 Kit C loader before writing Linux. The hardware runner also
+  compares Linux boot IDs across USB-disconnected tests and provides a passive
+  `snapshot` mode that does not reset or discard buffered serial evidence;
+- the exact 39-patch series passed with manifest SHA-256
+  `0b66d3e13a3ce6503e7c792b4f7d8ede77d1e478aef4f20f7860dbd86d168d55`.
+  Patch `0022-video-fbdev-contain-esp32p4-display-faults-safely.patch`
+  passed strict checkpatch with 0 errors, 0 warnings, and 0 checks, and its exact
+  postimage cross-compiled as a RISC-V driver object;
+- the frozen source contract is
+  `622404321f01b19087f99a05ac20afb3ff97dede5246bfc2bfdf077912eb83bb`.
+  The complete Buildroot image passed at 6,090,672 bytes with SHA-256
+  `67935cf443c59307d62483183a30a64054ec96ea887eb326db1d590b0c87826f`;
+  the seven-entry artifact checksum manifest, bFLT W^X audit, partition limit,
+  exact built-driver comparison, status init, and no-LVGL gates all passed;
+- the matching loader passed at 281,360 bytes with SHA-256
+  `9023cddf934db6086131d5e9118f35bfdbf0231fc01cd3fa864b232a3ced320c`;
+  and
+- this revised candidate remains deliberately unflashed while the user is away.
+  Host/static validation is complete; all physical visual gates remain pending.
+
+Hardware validation and corrective implementation recorded 2026-08-10,
+iteration 12:
+
+- the iteration-11 loader and Linux artifacts were flashed and read-back
+  verified on the ESP32-P4 rev1.3 Kit C. Linux reached the status console with
+  the forced-HS, LP-disabled, frame-ACK-disabled policy and initially reported
+  zero display faults, host errors, DSI underruns, and DMA errors;
+- the first 600-second USB-disconnected run retained the same Linux boot and
+  continued framebuffer production. At USB endpoint reactivation, however,
+  the driver logged `MICRONUX:M9:DISPLAY-FAULT` at 608.649813 seconds and
+  latched stale-frame fault bit 2 even though the frame count and live GDMA
+  source address immediately continued advancing with every hardware error
+  source still zero. This was a watchdog false positive, not evidence that the
+  display producer stopped during the disconnected interval;
+- the old watchdog compared one aged DMA-interrupt timestamp. This HZ=100,
+  non-high-resolution-timer kernel can service the health callback before a
+  delayed GDMA completion interrupt during USB reconnect. The corrected
+  watchdog samples every 50 milliseconds and requires six executed samples
+  with both the completed-frame count and live GDMA source address unchanged.
+  Moving either signal resets the count, and missed timer intervals never
+  replay as multiple stale observations. The interrupt timestamp remains only
+  as a process-context pre-reveal freshness guard;
+- the disconnected-test harness now creates a detached on-device boundary
+  snapshot after the complete closed-USB interval but before the host reopens
+  COM. It passively preserves queued serial evidence, recovers the shell with
+  short writes, and distinguishes an idle `disconnect-failure` from a later
+  `reconnect-driver-fault` without depending on a blocking kernel-log reader;
+- the corrected 39-patch series passed with manifest SHA-256
+  `e3d9c796bbbb0ca845e5eea95aed881da93f225fcfce40b7757f788300b55edf`.
+  Patch 0022 passed strict checkpatch with 0 errors, 0 warnings, and 0 checks;
+  its exact postimage hash is `88a4770e4f03069bfd3efeb15fcac63e84cdd6ca`,
+  and the RISC-V driver object compiled with SHA-256
+  `65bf6927ba1ef029385ca252cb3dd720863db9d7a101d8a16d5083ce6a6a2673`;
+- the new frozen source contract is
+  `7186cf9d209d9cde8085b1eb7324271142854b08a465beeeabf3692bcffa5fec`.
+  The complete Buildroot image again passed at 6,090,672 bytes with SHA-256
+  `a37b80f43d46e1338a964c0c56c462f3b5bec5d6aa7690dc5169661eb945880e`;
+  all seven artifact checksums, the partition limit, bFLT W^X, exact driver,
+  status-init, and no-LVGL gates passed; and
+- M9.1 remains `TESTING`. The corrected image requires a fresh flash and a
+  new pre-VPG 600-second disconnected run. Machine telemetry can validate the
+  Linux producer and fault policy while the user is away, but only later human
+  observation can close the no-cyan/no-flicker visual gate.
+
+Hardware verification and VPG correction recorded 2026-08-11, iteration 13:
+
+- the iteration-12 Linux image and clean-commit loader were flashed and
+  read-back verified on the ESP32-P4 rev1.3 Kit C. The Linux image SHA-256 was
+  `a37b80f43d46e1338a964c0c56c462f3b5bec5d6aa7690dc5169661eb945880e`;
+  the loader reported version `7c31311` and SHA-256
+  `1589b72e2bea8619b27c4a5fdca056ae8be38ba7088511103796f1004b5c645d`;
+- a full automated 600-second USB-disconnected run passed on one Linux boot,
+  `7a8eaa49-ec7a-4139-9c22-435ed7986b53`. The framebuffer completion count
+  advanced from 60 before disconnect to 17,864 at the detached boundary and
+  19,018 after reconnect. The boundary and reconnect snapshots both reported
+  framebuffer source, `boot_ready=1`, positive brightness, `faults=0`, zero
+  DMA errors, zero bridge underruns, and zero global DSI host errors;
+- the subsequent fresh-reset preflight passed both normal and signal-driven
+  graphics-to-status restoration with advancing scanout and all machine fault
+  sources zero. These are machine passes; no camera was available, so photons
+  and absence of cyan/flicker remain visually unverified;
+- the first real bounded VPG invocation selected host VPG
+  (`host=00010002`, `bridge=00003200`) while keeping GDMA enabled. Its explicit
+  post-prime sampler then read DSI host ST1 `00080080`, latched host-fault bit 3,
+  and correctly kept the backlight off. The two bits are the external DPI
+  payload-write and payload-underflow conditions produced while the supported
+  ESP-IDF VPG sequence deliberately disconnects that input path; they are not
+  evidence that the internal VPG stopped;
+- the corrected driver records only those two bits in a separate bounded-VPG
+  `vpg-dpi-int` latch. They remain fatal during normal Linux framebuffer
+  operation and are again sampled strictly after framebuffer restoration.
+  Every other ST0/ST1 bit remains actionable during VPG. Source masking is
+  permitted only after VPG and a dark backlight are verified; source-boundary
+  reads suppress no other status, bridge underruns are checked after the VPG
+  prime and active interval, and every safely-dark post-switch failure routes
+  through framebuffer restoration;
+- framebuffer restoration now establishes its completion baseline only after
+  the source-select writes and readback, then requires four new frames, zero
+  global host status, valid source policy, and zero DMA/bridge faults before
+  restarting the watchdog and revealing status. A failed reveal clears
+  `boot_ready`, while preserving the qualified producer and watchdog;
+- the corrected 39-patch series passed with manifest SHA-256
+  `6a642a4f30c80cfb7d2773be4c294698c2683a8aea018481fdcd8b4a370fedac`.
+  Patch 0022 passed strict checkpatch with 0 errors, 0 warnings, and 0 checks;
+  its exact postimage hash is `c854256a7522440c4a591a37eae4df7d09abf00d`,
+  and the full-build RISC-V driver object SHA-256 is
+  `1505833a0bbb10c5da154ce7307b984ddcc9de8227fd31dbda5161aebe8ff835`;
+- the frozen source contract is
+  `39414bc96f93c3a3376dc6419dbc6731a4a889e79218dc6ec482e14c768a1fc3`.
+  The complete image passed at 6,090,672 bytes with SHA-256
+  `f494323bd698b39730bc435c6470c36bd23dc8daa9ab308218d029207c794129`;
+  all seven artifact checksums, the partition limit, bFLT W^X, exact built
+  source, status-init, and no-LVGL gates passed; and
+- M9.1 remains `TESTING`. This exact correction is not yet flashed. It must
+  repeat the fresh pre-VPG 600-second disconnected gate, preflight, bounded
+  VPG, and touch checks. Human observation is still mandatory before the
+  no-cyan/no-flicker requirements can be completed.
+
+Exact two-window restore verification recorded 2026-08-11, iteration 14:
+
+- the iteration-13 candidate was first flashed and passed a fresh 600-second
+  disconnected run and fresh-reset preflight. Its VPG entry succeeded, but its
+  first strict framebuffer sample saw delayed ST1 bit 19 after four restore
+  frames. The driver correctly restored the framebuffer producer, kept the
+  backlight off, cleared `boot_ready`, and retained Linux and the USB shell;
+- hardware evidence localized that bit to the asynchronous bridge-DPI refill
+  interval: source policy, GDMA progress, bridge enable, DMA errors, and
+  underruns were all healthy. The final correction therefore keeps the panel
+  dark, waits four framebuffer refill frames, permits one read-clear grace
+  sample for bit 19 only, then requires four additional frames and a strict
+  zero-mask host-status sample before reveal. Bit 7, every other host bit, and
+  a bit-19 reassertion in the second window remain fatal and fail-dark;
+- the final 39-patch series passed with manifest SHA-256
+  `7cc298d28ea4473a2d80e864aa513b712241789a6f993a8092c1519f9cfb97b6`.
+  Patch 0022 passed strict checkpatch with 0 errors, 0 warnings, and 0 checks;
+  its postimage Git hash is
+  `95d06da579e9fcd746500bbdfeb7ea795ea3f49f`, source SHA-256 is
+  `97a035b7c11355d3d607f934be4bd22562aaf7f0a0d09be4e71d7d0e6c263850`,
+  and the full-build driver object SHA-256 is
+  `c2e25549ea701cdcce3b644fb447a99c8b5f0c513a6975c0a88b8980c4808016`;
+- the source contract is
+  `608aa4fbc3d7e09807660e8e960a29b4a1f2611ca6866f62128c62a36d680069`.
+  The 6,090,672-byte Linux image SHA-256 is
+  `8a33c53becae82fcb42be8134a8210214aff7f8dfae7598adf20f78c369baa73`;
+  all seven artifact checksums, the partition limit, bFLT W^X, exact built
+  source, status-init, and no-LVGL gates passed;
+- the loader and Linux payload were flash/read-back verified on ESP32-P4
+  revision 1.3. The unchanged loader source reported version
+  `72e131c-dirty`, was 281,360 bytes, and had SHA-256
+  `2abf3258753af07af26bd120a82bb95b40e00e6afd3abb605cc74f733f06375f`;
+  the `-dirty` suffix records the uncommitted Linux/test changes at build time;
+- the final bounded 5,000 ms VPG gate passed. Active VPG reported
+  `host=00010002`, `lpclk=00000001`, bridge `00003200`, retained GDMA, and
+  `vpg-dpi-int=00080080`. Restoration advanced frames from 70 to 87 with
+  `entry_error=0`; the final framebuffer reported
+  `host=00000002 active=00000000 lpclk=00000001`, `boot_ready=1`, restored
+  brightness, advancing scanout, and zero faults, host errors, DMA errors, and
+  bridge underruns;
+- on a separate fresh reset where VPG had not run, the 600-second disconnected
+  acceptance gate passed on boot
+  `a7932259-6b81-47a9-b0ff-74cb7af7c062`. Frames advanced from 60 before
+  disconnect to 17,864 at the completed detached boundary and 19,015 after
+  reconnect. Boundary and reconnect state both retained framebuffer,
+  `boot_ready=1`, positive brightness, zero faults/errors/underruns/global host
+  errors, and the required continuous-video policy;
+- the final fresh-reset preflight passed normal and SIGTERM-driven
+  graphics-to-status restoration, advancing scanout, shell responsiveness,
+  and every machine health gate; and
+- M9.1 remains `TESTING`. Machine validation for the exact display candidate
+  is complete. A human must still confirm the actual loader/status,
+  graphics/status, VPG/status, and 600-second status pixels contain no cyan or
+  flicker, and the exact-candidate five-point touch interaction must be
+  repeated before M9.1 can be completed.
+
+Unattended no-reset follow-up recorded 2026-08-11, iteration 15:
+
+- the final flashed candidate remained on the same Linux boot for more than
+  2,120 seconds. No-reset snapshots reported boot ID
+  `a568c553-eb7b-4d8a-ab6a-7e1305431eed`, framebuffer source,
+  `boot_ready=1`, backlight power on at actual brightness 63, and live scanout
+  advancing first from frame 30,035 to 30,038 and later from 71,843 to 71,847;
+- its exact raw policy remained `host=00000002`, `active=00000000`, and
+  `lpclk=00000001`, with forced HS, video LP disabled, frame ACK disabled,
+  `faults=0`, zero DMA errors, zero bridge underruns, and zero accumulated DSI
+  host errors. Touch polling also remained ready with no I2C errors;
+- the first no-reset query preserved an empty passive capture but hit a host
+  USB write timeout while recovering the idle shell. Snapshot mode now uses
+  the already validated short-write/reopen recovery path, never clears queued
+  input, propagates the live replacement handle, and requires the complete
+  framebuffer, backlight, scanout, and display-health tuple. Its immediate
+  no-reset rerun passed;
+- the harness now records an anchored, phase-specific SHA-256 of the complete
+  2,048,000-byte `/dev/fb0` image at every quiescent status checkpoint. It
+  rejects a missing, duplicate, malformed, wrong-phase, or mismatched marker;
+- fresh-reset preflight retained framebuffer SHA-256
+  `d38565f64fba5402ab8b767f77648a01ba685479491b1d104b5a3eacc304601c`
+  across both normal and SIGTERM-driven graphics-to-status restoration. A
+  separate fresh-reset 5,000 ms VPG test retained that same hash across
+  framebuffer-to-bars-to-framebuffer restoration and passed every post-restore
+  health gate;
+- the full fresh 600-second disconnected acceptance rerun passed on boot
+  `dfcf2458-c15e-495e-86ad-002404c350c4`. The host remained closed for
+  603.016 seconds; the before, detached-boundary, and after-reconnect
+  framebuffer hashes all equaled
+  `d38565f64fba5402ab8b767f77648a01ba685479491b1d104b5a3eacc304601c`.
+  Frames advanced from 117 before disconnect to 17,920 at the detached boundary
+  and 18,976 after reconnect, with the same boot ID and zero display faults,
+  DMA errors, bridge underruns, or global host errors; and
+- these results prove that Linux, the framebuffer producer, the status pixels
+  in memory, and the display-health policy survived well beyond the original
+  several-minute idle-failure window. They cannot establish what photons the
+  JD9365 glass emitted. The visual and five-point touch gates below remain
+  mandatory.
+
+Exact-60 handoff experiment recorded 2026-08-11, iteration 16:
+
+- after the user again observed the solid light-blue panel, the investigation
+  stopped changing reveal delays and tested the JD9365 timing/link hypothesis;
+- an APLL profile produced an actual 69,907,226 Hz pixel clock with the original
+  880 by 1,324 totals, nominally 60.000023 Hz, and used 1,200 Mbps per DSI lane.
+  The loader initialized the panel, rendered its splash, and published the
+  expected raw clock contract before handing ownership to Linux;
+- the first Linux run used an 18-frame startup qualification and timed out
+  without enough pre-stop evidence. A single controlled rerun restored the
+  known-good four-frame qualification and added a read-only failure snapshot;
+- the rerun still received zero completed frames. GDMA reported `CHEN=1` but
+  its source address remained `48040c80->48040c80`, with channel status,
+  interrupt status, DMA error, bridge underrun, and global DSI host errors all
+  zero. The bridge was enabled at `00003201`, while the host packet status was
+  empty at `00010005` and the PHY was `000015b9`;
+- Linux read back DPI clock control `000000e3`, which retains APLL source 3,
+  clock enable 1, and divide-by-one, plus APLL digital clock control
+  `1f150005`, whose bit 20 remains set. These values rule out the generic
+  `clk_disable_unused` message and the four-versus-18-frame gate as the direct
+  cause, but they do not measure the APLL's analog output;
+- because Linux never reached the status framebuffer, this candidate did not
+  test the cyan idle failure and must not be described as a visual timing
+  failure. The exact-60/1,200 stopped-to-running handoff combination is rejected
+  unless a later isolated test separates the APLL pixel source from the D-PHY
+  lane rate;
+- the factory application was immediately restored to the proven 80 MHz /
+  1,500 Mbps loader, 281,344 bytes with SHA-256
+  `5f9697a8d8c0d04780132e4690f5378e72e7b58795dd11ccecea7ad3b475e949`.
+  NVS, SD, DTB, and metadata were preserved;
+- the current diagnostic Linux image is 6,098,864 bytes with SHA-256
+  `932bbdc5c4d26d89a1105ba7f0361c612c58ce351bb5a7f4b865c6e2902321ff`.
+  On restored boot `a96c85cb-fd95-4d19-afd3-2efaca32fa04`, status reveal passed,
+  scanout advanced from frame 745 to 748, the full framebuffer SHA-256 remained
+  `d38565f64fba5402ab8b767f77648a01ba685479491b1d104b5a3eacc304601c`,
+  and faults, DMA errors, bridge underruns, and DSI host errors were all zero;
+  and
+- M9.1 remains `TESTING`. No exact-60 change is accepted or pushed. The next
+  physical experiment must avoid another combined-variable Linux handoff test:
+  either an ESP-IDF-only static-framebuffer A/B, or a single cross-profile test
+  that changes only the lane rate while retaining the exact pixel clock. The
+  repository was returned to 80 MHz / 1,500 Mbps and its deterministic physical
+  reset/fail-dark loader builds at 281,648 bytes with SHA-256
+  `24db26404ec42444454bc3e970e4961529f5364c5941bc053cf884588877b118`;
+  that rebuilt loader has not been flashed.
+
+#### Historical M9.1 acceptance contract (superseded)
+
+The following gate applied to the final ABI-v2 adopt-live experiments. It is
+retained with their evidence and hashes, but it does not validate or prescribe
+testing for ABI v3.
+
+Because the status-restoration and source-transition implementations changed,
+historical ownership and presentation passes did not validate that revised
+candidate. Both features remained `TESTING` until the exact flashed artifacts
+could pass the visual and touch gates below.
+
+Historical M9.1 physical acceptance order:
+
+1. **COMPLETED (machine):** build, flash, and read-back verify the matching
+   source-frozen loader and Linux image; record their exact hashes.
+2. **MACHINE COMPLETE / VISUAL PENDING:** before running VPG on the same boot,
+   start a fresh 600-second `disconnect` test. The user must
+   observe a clean loader-to-status transition and confirm that the status page
+   remains visible without cyan or flicker for the entire disconnected interval.
+   Reconnection must prove the same Linux boot and advancing scanout.
+3. **MACHINE COMPLETE / VISUAL PENDING:** on a fresh reset, run `preflight`;
+   visually confirm clean normal-exit and signal-driven graphics-to-status
+   restoration.
+4. **MACHINE COMPLETE / VISUAL PENDING:** on a fresh reset, run bounded VPG;
+   visually confirm vertical bars and a clean dark-settle return to status.
+5. **TESTING:** run touch and the remaining regressions.
+
+VPG must not precede the disconnected soak on the same acceptance boot because
+a source toggle can resynchronize a marginal link and mask the pre-toggle
+condition. A fresh reset begins a new qualifying soak.
+
+Exit criterion: the exact flashed candidate cleanly transitions from loader to
+status, restores status after normal and signal-driven graphics exit without
+cyan or flicker, completes the bounded vertical-bars-to-status VPG cycle, and
+remains visibly on status for at least 600 seconds during a fresh
+USB-disconnected same-boot test. Every gate must report framebuffer source,
+`boot_ready=1`, backlight power on with positive actual brightness, advancing
+scanout, `faults=0`, `host-errors=00000000:00000000`, `underruns=0`, and DMA
+`errors=00000000`, with framebuffer policy
+`host=00000002 active=00000000 lpclk=00000001`, `frame-ack=off`,
+`clock=forced-hs`, and `lp=disabled`, while the USB shell and unrelated tasks
+remain responsive. The phase-specific `/dev/fb0` SHA-256 must also remain
+identical across normal restoration, signal-driven restoration, VPG
+restoration, and the before/boundary/after disconnected checkpoints.
+During the bounded VPG phase only, `vpg-dpi-int` may contain bits 7 and 19;
+`vpg-dpi-int & ~00080080` must equal zero, and the restored framebuffer's
+global `host-errors` must remain exactly zero.
+
+#### Current M9.2 ABI-v3 acceptance order
+
+The Patch-40 native cold-init candidate passes its ordered-series, 963-case
+model, object/style, semantic-audit, clean M7 ABI-v2 regression, fresh M9 full
+build, no-flash, and artifact-audit gates. Patch 40 remains unflashed. After
+exact flash/readback binds Patch 40, run each still-pending
+hardware mode from a fresh reset in this order:
+
+1. `disconnect --disconnect-seconds 600`;
+2. `preflight`;
+3. `stress --stress-cycles 3`;
+4. `touch`; and
+5. `soak --soak-seconds 600 --sample-seconds 15`.
+
+Every run must bind the exact ABI-v3 loader/Image/DTB/metadata, observe the
+state chain from `PROBED_QUIESCENT` through `RUNTIME_REVEALED`, keep all three
+buffer roles and commit/rearm generations valid, and report zero DMA, bridge,
+host, guard, or containment faults. Preflight must verify that `vpg_test_ms` is
+absent; no VPG operation belongs in the native gate. The user must observe the
+loader-to-status reveal, graphics restoration, disconnected interval, stress,
+touch, and soak for black, cyan, flicker, tearing, stale content, or blanking.
+Without that observation, the result is `MACHINE-PASS / VISUAL-UNVERIFIED`.
+
+### M9.3 - Optional LVGL service
+
+Section status: **PLANNED**
+
+Deliverables:
+
+- [ ] **PLANNED** - Buildroot package and GUI defconfig;
+- [ ] **PLANNED** - pinned LVGL 9.5.0 configuration;
+- [ ] **PLANNED** - partial-buffer display port;
+- [ ] **PLANNED** - Linux input port;
+- [ ] **PLANNED** - serialized event loop;
+- [ ] **PLANNED** - supervisor and safe-mode behavior; and
+- [ ] **PLANNED** - minimal system/recovery scene.
+
+Exit criterion: the service starts, renders, receives touch, stops, restarts,
+and restores terminal access. The terminal-only image contains no LVGL
+artifact.
+
+### M9.4 - UI-v1 and native C SDK
+
+Section status: **PLANNED**
+
+Deliverables:
+
+- [ ] **PLANNED** - frozen UI-v1 headers and protocol documentation;
+- [ ] **PLANNED** - `SO_PEERCRED` authorization and capability mapping;
+- [ ] **PLANNED** - session quotas and bounded parser;
+- [ ] **PLANNED** - object, transaction, resource, and event operations;
+- [ ] **PLANNED** - `<micronux/ui.h>` and `libmicronux-ui.a`;
+- [ ] **PLANNED** - CLI inspection client; and
+- [ ] **PLANNED** - protocol unit, malformed-input, and multi-client tests.
+
+Exit criterion: an unprivileged native C application creates an interactive
+scene and receives events without LVGL headers, framebuffer access, or special
+device permissions.
+
+### M9.5 - Window and session manager
+
+Section status: **PLANNED**
+
+Deliverables:
+
+- [ ] **PLANNED** - foreground lifecycle;
+- [ ] **PLANNED** - focus and input routing;
+- [ ] **PLANNED** - trusted system overlay;
+- [ ] **PLANNED** - virtual keyboard;
+- [ ] **PLANNED** - launcher/recovery scene;
+- [ ] **PLANNED** - suspend/resume/close behavior; and
+- [ ] **PLANNED** - deterministic cleanup after client faults.
+
+Exit criterion: two applications can be launched and switched one at a time;
+only the foreground application receives input; killing either client returns
+to a valid scene without restarting Linux.
+
+### M9.6 - Ignite target separation and MicroNUX adapter
+
+Section status: **PLANNED**
+
+Deliverables:
+
+- [ ] **PLANNED** - explicit standalone-firmware and MicroNUX build targets;
+- [ ] **PLANNED** - shared compiler, bytecode, VM, GC, and package contracts;
+- [ ] **PLANNED** - retained firmware LVGL backend;
+- [ ] **PLANNED** - LVGL-free MicroNUX UI-v1 backend;
+- [ ] **PLANNED** - `.igniteui` object/event translation;
+- [ ] **PLANNED** - typed GUI-unavailable behavior; and
+- [ ] **PLANNED** - negative dependency checks for the MicroNUX artifact.
+
+Exit criterion: the same representative `.ignite` and `.igniteui` sources run
+through embedded LVGL on standalone firmware and through UI-v1 on MicroNUX.
+The MicroNUX binary contains no LVGL, ESP-LVGL, or ESP-IDF GUI symbol.
+
+### M9.7 - Language and shell surfaces
+
+Section status: **PLANNED**
+
+Deliverables:
+
+- [ ] **PLANNED** - complete public C example;
+- [ ] **PLANNED** - documented foreign-function and direct-protocol binding
+  rules;
+- [ ] **PLANNED** - shell status and lifecycle commands;
+- [ ] **PLANNED** - bounded canvas example; and
+- [ ] **PLANNED** - API compatibility and automation-output tests.
+
+Exit criterion: C, Ignite for MicroNUX, and a protocol-level test client create
+equivalent scenes under the same permission and quota rules.
+
+### M9.8 - Packaging, security, and physical acceptance
+
+Section status: **PLANNED**
+
+Deliverables:
+
+- [ ] **PLANNED** - GUI enable/disable/restart workflow;
+- [ ] **PLANNED** - crash-loop safe mode;
+- [ ] **PLANNED** - terminal and GUI image-size comparison;
+- [ ] **PLANNED** - memory, CPU, input-latency, and frame-time measurements;
+- [ ] **PLANNED** - security and fault-injection tests; and
+- [ ] **PLANNED** - combined display, touch, microSD, C6 network, and
+  USB-console soak.
+
+Exit criterion: every acceptance gate below passes on the reference Kit C and
+the evidence is recorded in the repository.
+
+## Validation ladder
+
+### Host and build validation
+
+1. Build and test the UI-v1 encoder, decoder, client state machine, quotas, and
+   malformed-message handling on the host where possible.
+2. Build the terminal-only profile and prove no LVGL library, header-derived
+   object, font, theme, or `micronux-guid` binary is present.
+3. Build the GUI profile and record exact kernel, rootfs, and final flash-image
+   deltas.
+4. Audit the Ignite for MicroNUX link map and symbols for forbidden LVGL,
+   ESP-LVGL, and ESP-IDF GUI dependencies.
+5. Run existing M7 isolation and M8 device-service regressions before flashing.
+
+### Protocol and fault validation
+
+- reject unknown major ABI versions;
+- reject truncated, oversized, malformed, and unauthorized requests;
+- reject stale and cross-session handles;
+- enforce all quotas without partial visible changes;
+- allow a slow event client without blocking rendering or other clients;
+- clean up after client crash, kill, timeout, and disconnect;
+- restart the daemon without rebooting Linux;
+- enter terminal safe mode after a bounded crash loop; and
+- keep raw MMIO, DMA, framebuffer mapping, and input access unavailable to
+  ordinary applications.
+
+### Physical Kit C validation
+
+- boot terminal-only MicroNUX and confirm the existing console path;
+- boot GUI-enabled MicroNUX and confirm the system scene;
+- verify primary touch coordinates across corners, center, edges, press,
+  release, and drag;
+- run native C and Ignite UI examples;
+- switch and kill applications while observing recovery;
+- exercise microSD and C6 networking during rendering and touch input;
+- keep USB shell responsive throughout;
+- run a minimum 30-minute combined soak;
+- report zero DSI underruns and no stale backlight, focus, or input ownership;
+- measure input-to-visible response, frame time, CPU, and memory instead of
+  claiming unmeasured desktop performance; and
+- stop/disable the GUI and confirm terminal recovery.
+
+## Completion criteria
+
+M9 is complete only when:
+
+1. terminal-only MicroNUX contains no LVGL and retains its accepted behavior;
+2. GUI-enabled MicroNUX contains one LVGL owner, `micronux-guid`;
+3. Linux owns display, touch, backlight, and input at all times after handoff;
+4. ordinary applications cannot access LVGL pointers, raw framebuffer input,
+   MMIO, or DMA;
+5. native C and Ignite for MicroNUX use the same UI-v1 policy and events;
+6. Ignite for MicroNUX contains no direct or transitive LVGL/ESP-IDF GUI code;
+7. standalone Ignite firmware retains its embedded LVGL backend;
+8. foreground, overlay, focus, lifecycle, and cleanup behavior pass;
+9. daemon and application faults recover without rebooting Linux;
+10. display, touch, microSD, C6 networking, and USB console pass together; and
+11. physical acceptance records zero DSI underruns.
+
+## Explicit non-goals
+
+M9 does not include:
+
+- X11, Wayland, DRM desktop composition, or a Linux desktop environment;
+- overlapping, draggable, or resizable application windows;
+- one full-screen framebuffer per application;
+- video playback or high-frame-rate gaming guarantees;
+- arbitrary runtime LVGL plugins;
+- application-owned display or touch drivers;
+- raw LVGL pointers in the public ABI;
+- LVGL embedded in Ignite for MicroNUX; or
+- a claim that the current initramfs already supports runtime package install
+  and removal.
+
+## Expected repository changes during implementation
+
+MicroNUX changes are expected under:
+
+- `buildroot-external/package/micronux-gui/`;
+- `buildroot-external/configs/` for the GUI profile;
+- `buildroot-external/board/micronux/` for Linux input/display configuration
+  and narrowly scoped patches;
+- `scripts/` for M9 build and acceptance automation;
+- `docs/` for the UI-v1 contract and evidence; and
+- the existing MicroNUX Ignite adapter package for UI-v1 integration.
+
+The Ignite repository may require target-selection, backend-abstraction,
+package-capability, compiler/tooling, and validation changes. Those changes
+must preserve the existing standalone firmware backend and must not copy LVGL
+into the MicroNUX runtime.
+
+Each work package should be implemented, tested, committed, and pushed as a
+coherent checkpoint. Implementation must not skip forward past a failed
+kernel, protocol, isolation, or hardware gate.
+
+## Primary references
+
+- [LVGL 9.5 documentation](https://docs.lvgl.io/9.5/)
+- [LVGL display overview](https://docs.lvgl.io/9.5/main-modules/display/overview.html)
+- [LVGL input overview](https://docs.lvgl.io/9.5/main-modules/indev/overview.html)
+- [Waveshare ESP32-P4-Module-DEV-KIT](https://docs.waveshare.com/ESP32-P4-Module-DEV-KIT)
+- [Waveshare Kit C product details](https://www.waveshare.com/esp32-p4-module-dev-kit.htm)
+- [Linux device ownership and application model](device-ownership-and-applications.md)
+- [M7 Linux-owned display](m7-linux-display.md)
+- [M8 device service and application ABI](m8-device-services.md)

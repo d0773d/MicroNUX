@@ -1,0 +1,149 @@
+#!/bin/sh
+
+if ! /bin/busybox mount -t devtmpfs devtmpfs /dev; then
+	echo 'MICRONUX:M6:COMBINED:FAIL devtmpfs-mount'
+	exit 1
+fi
+if ! /bin/busybox mount -t proc proc /proc; then
+	echo 'MICRONUX:M6:COMBINED:FAIL proc-mount'
+	exit 1
+fi
+if ! /bin/busybox mount -t sysfs sysfs /sys; then
+	echo 'MICRONUX:M6:COMBINED:FAIL sysfs-mount'
+	exit 1
+fi
+
+export HOME=/root
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PS1='micronux# '
+
+display_sysfs=/sys/bus/platform/devices/500a0000.display
+native_display=0
+display_reveal_allowed=0
+if [ -r "$display_sysfs/native_state" ]; then
+	native_display=1
+	native_display_state=$(/bin/busybox cat "$display_sysfs/native_state")
+	if [ "$native_display_state" = PROBED_QUIESCENT ]; then
+		echo 'MICRONUX:M9.2:COLD-BOOT state=trigger action=cold_init'
+		if ! echo 1 >"$display_sysfs/cold_init"; then
+			native_display_state=$(/bin/busybox cat "$display_sysfs/native_state")
+			echo "MICRONUX:M9.2:COLD-BOOT state=fail reason=cold-init native-state=$native_display_state mode=headless"
+		else
+			native_display_state=$(/bin/busybox cat "$display_sysfs/native_state")
+		fi
+	fi
+	if [ "$native_display_state" = SCANOUT_QUALIFIED_QUIESCENT ]; then
+		for attempt in 1 2 3 4 5; do
+			if [ -c /dev/fb0 ] && [ -c /dev/tty1 ]; then
+				break
+			fi
+			/bin/busybox sleep 1
+		done
+		if [ -c /dev/fb0 ] && [ -c /dev/tty1 ]; then
+			display_reveal_allowed=1
+			echo 'MICRONUX:M9.2:COLD-BOOT state=scanout-ready native-state=SCANOUT_QUALIFIED_QUIESCENT fb=registered reveal=pending'
+		else
+			echo 'MICRONUX:M9.2:COLD-BOOT state=fail reason=framebuffer-device-timeout native-state=SCANOUT_QUALIFIED_QUIESCENT mode=headless'
+		fi
+	else
+		echo "MICRONUX:M9.2:COLD-BOOT state=fail reason=native-state native-state=$native_display_state mode=headless"
+	fi
+fi
+
+/usr/sbin/micronux-deviced-supervise &
+device_supervisor_pid=$!
+for attempt in 1 2 3; do
+	if [ -S /run/micronux/device-v1.sock ]; then
+		break
+	fi
+	/bin/busybox sleep 1
+done
+if [ ! -S /run/micronux/device-v1.sock ]; then
+	echo 'MICRONUX:M8:SERVICE:FAIL socket-missing'
+	exit 1
+fi
+echo 'MICRONUX:M8:SERVICE state=ready abi=1.0 socket=/run/micronux/device-v1.sock'
+
+if [ -x /usr/sbin/micronux-run ]; then
+	if ! /usr/sbin/micronux-run --check; then
+		echo 'MICRONUX:M7:JOB-SUPERVISOR:FAIL policy-installation'
+		exit 1
+	fi
+fi
+
+echo 'MICRONUX:M6:COMBINED:DRIVER storage=microsd-slot0 network=c6-sdio-slot1 arbitration=serialized'
+/bin/busybox sleep 5
+storage_state=missing
+if [ -b /dev/mmcblk0 ]; then
+	storage_state=ready
+	echo 'MICRONUX:M6:COMBINED:STORAGE state=ready name=mmcblk0'
+else
+	echo 'MICRONUX:M6:COMBINED:STORAGE state=missing name=mmcblk0'
+fi
+network_state=missing
+if [ -d /sys/class/net/ethsta0 ]; then
+	network_state=ready
+	echo 'MICRONUX:M6:COMBINED:IFACE state=ready name=ethsta0'
+	/bin/busybox ip link show ethsta0
+else
+	echo 'MICRONUX:M6:COMBINED:IFACE state=missing name=ethsta0'
+fi
+
+if [ "$native_display" -eq 0 ] && [ -c /dev/fb0 ] && [ -c /dev/tty1 ]; then
+	display_reveal_allowed=1
+fi
+if [ "$display_reveal_allowed" -eq 1 ] &&
+	[ -c /dev/fb0 ] && [ -c /dev/tty1 ]; then
+	if ! {
+		printf '\033[2J\033[H\033[1;36m'
+		printf '  MICRONUX\n'
+		printf '\033[0;37m  Linux device controller\n\n'
+		printf '  Display   800x1280 RGB565\n'
+		printf '  Storage   %s\n' "$storage_state"
+		printf '  Network   %s\n\n' "$network_state"
+		printf '\033[1;32m  SYSTEM READY\033[0;37m\n'
+		printf '  USB shell: ttyGS0\n'
+	} >/dev/tty1; then
+		echo 'MICRONUX:M7:FB-CONSOLE state=fail reason=status-render mode=headless'
+	else
+		cursor_state=unavailable
+		if [ -w /sys/class/graphics/fbcon/cursor_blink ] &&
+			echo 0 >/sys/class/graphics/fbcon/cursor_blink; then
+			cursor_state=steady
+		fi
+		reveal_state_valid=1
+		if [ "$native_display" -eq 1 ]; then
+			native_display_state=$(/bin/busybox cat "$display_sysfs/native_state")
+			if [ "$native_display_state" != SCANOUT_QUALIFIED_QUIESCENT ]; then
+				reveal_state_valid=0
+				echo "MICRONUX:M9.2:COLD-BOOT state=fail reason=native-state-changed native-state=$native_display_state mode=headless"
+			fi
+		fi
+		if [ "$reveal_state_valid" -eq 1 ]; then
+			if [ ! -w "$display_sysfs/boot_ready" ] ||
+				! echo 1 >"$display_sysfs/boot_ready"; then
+				echo 'MICRONUX:M7:FB-CONSOLE state=fail reason=display-reveal mode=headless'
+			elif [ "$native_display" -eq 1 ]; then
+				native_display_state=$(/bin/busybox cat "$display_sysfs/native_state")
+				if [ "$native_display_state" = RUNTIME_REVEALED ]; then
+					echo "MICRONUX:M7:FB-CONSOLE state=ready tty=tty1 role=status usb=ttyGS0 reveal=userspace-ready native-state=RUNTIME_REVEALED cursor=$cursor_state"
+				else
+					echo "MICRONUX:M9.2:COLD-BOOT state=fail reason=reveal-state native-state=$native_display_state mode=headless"
+				fi
+			else
+				echo "MICRONUX:M7:FB-CONSOLE state=ready tty=tty1 role=status usb=ttyGS0 reveal=userspace-ready cursor=$cursor_state"
+			fi
+		fi
+	fi
+fi
+
+echo 'MICRONUX:M6:COMBINED:SHELL ready console=ttyGS0 network=nonblocking device_api=1.0'
+while :; do
+	/bin/busybox setsid /bin/busybox cttyhack /bin/busybox sh -i \
+		</dev/ttyGS0 >/dev/ttyGS0 2>&1 &
+	console_shell_pid=$!
+	wait "$console_shell_pid"
+	console_status=$?
+	echo "MICRONUX:M6:COMBINED:SHELL state=disconnected rc=$console_status action=respawn"
+	/bin/busybox sleep 1
+done
