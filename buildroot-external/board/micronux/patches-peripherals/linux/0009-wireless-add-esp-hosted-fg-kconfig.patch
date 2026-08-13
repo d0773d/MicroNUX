@@ -1,7 +1,7 @@
 From 9ca7e0b1dcaa8a327a31cc6bbbd021928b03a4a4 Mon Sep 17 00:00:00 2001
 From: MicroNUX contributors <micronux@users.noreply.github.com>
 Date: Sat, 8 Aug 2026 15:00:00 -0700
-Subject: [PATCH 9/47] wireless: wire in ESP-Hosted-FG source
+Subject: [PATCH 9/48] wireless: wire in ESP-Hosted-FG source
 
 Allow the pinned ESP-Hosted-FG source package to be copied into the kernel
 tree before configuration and linked into the kernel.  MicroNUX needs the

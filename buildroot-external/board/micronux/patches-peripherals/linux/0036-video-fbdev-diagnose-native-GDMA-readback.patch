@@ -1,7 +1,7 @@
 From ad46ccf79d044222a35113bbdd5debc754ec240c Mon Sep 17 00:00:00 2001
 From: d0773d <dottedquad@gmail.com>
 Date: Wed, 12 Aug 2026 04:08:08 -0700
-Subject: [PATCH 36/47] video: fbdev: diagnose native GDMA readback
+Subject: [PATCH 36/48] video: fbdev: diagnose native GDMA readback
 
 Native cold init reports only the outer gdma-irq stage when a register
 readback disagrees. Keep fail-dark behavior. Capture each predicate once.

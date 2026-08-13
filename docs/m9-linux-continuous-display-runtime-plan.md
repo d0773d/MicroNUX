@@ -273,7 +273,49 @@ Current incremental Patch47 evidence:
   `878b56cc94ba9630cbcba36fcc1e9db473e9043690b2408db2e8d70ca34a766a`
   and
   `c775fd331d13ccbaf1621fd123d3d1fd58ea78ca0a7bfd1d660e1ce54110add8`;
-- flash/readback, runtime, and optical evidence remain pending.
+- exact Patch47 flash/readback succeeded, but the dark continuous-start gate
+  rejected the transition before reveal. The sealed failure showed
+  `chen=0`, `llp=00000001`, `sar=49300000`, the expected direct reload
+  control/config values, and zero channel, common, host, bridge, ECC, or
+  guard errors. Linux remained live and the backlight stayed on over a black
+  panel. This is a clean transition failure, not an SD-card failure.
+
+Current narrow Patch48 experiment:
+
+- product patch:
+  `buildroot-external/board/micronux/patches-peripherals/linux/0048-video-fbdev-clear-native-reload-link-state.patch`;
+- isolated commit: `d8dcea2721a07117e3eea8a7bc1c7b3b4ae1d3e4`;
+- product patch SHA-256:
+  `3b23a17919209a0f6500166e8136abbc2e0dba98b092524329ccd17e4675239b`;
+- postimage source SHA-256:
+  `c91efedfabd6c0db4beea4e4118b5206ea29181aaf3cbf87b34d697910858f71`;
+- Patch48 clears both retired linked-list pointer words after stopping and
+  draining the one-shot channel, requires both words to read zero before
+  direct reload programming, and distinguishes `enable-not-observed` from
+  `stopped-before-wrap`;
+- it does not change the reload topology, transfer timing, interrupt mask,
+  microSD isolation, panel programming, reveal sequence, or ABI-v2 path;
+- strict checkpatch and exact fuzz-zero application pass; the integrated
+  series checker passes platform 8, peripherals 48, isolation 10, total 66,
+  manifest
+  `e700efbdeeebfdbc7f4158462d4c6d895589344540f1189bda7c30c6ed1bbcf7`;
+- the display contract model passes 1,227 tests;
+- a clean M9 build passes with source contract
+  `dc0efd56c26c8c12fcf5a8d3f95cf571dbd16e2b8aa3c2f350bb99357661d87a`;
+- the built M9 driver source/object hashes are
+  `c91efedfabd6c0db4beea4e4118b5206ea29181aaf3cbf87b34d697910858f71`
+  and
+  `59b1086a1f988f571a91a1165733f1cc7e0d3e29f0aa241f078d24e5dd76f42e`;
+- all seven M9 artifact hashes verify; the 6,164,592-byte Image SHA-256 is
+  `be3716df1c78369321d98c765c928383307197160ed3d59c25f085fbcf57b56b`;
+- the Windows verifier rebuilds the pinned ESP-IDF v6.0.1 loader, validates
+  Linux and loader artifacts, and explicitly reports `Nothing was flashed`;
+- a clean M7 build in a new work directory passes its ABI-v2 gates and
+  14-file bFLT W^X audit with contract
+  `c927882d58b596b5a6cd1a043eeb54261fdb8541c25de75b784563e9929e00d1`;
+- M7 produces the same Patch48 driver source/object hashes, retains the ABI-v2
+  DTB, and all 18 artifact hashes verify;
+- Patch48 flash/readback, runtime, and optical evidence remain pending.
 
 Historical all-at-once prototype evidence (not the Patch47 product base):
 

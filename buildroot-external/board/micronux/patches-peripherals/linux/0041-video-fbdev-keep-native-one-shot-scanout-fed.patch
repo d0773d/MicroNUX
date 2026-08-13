@@ -1,7 +1,7 @@
 From 7d580199445835a1485e3e24d6686d44b12442fe Mon Sep 17 00:00:00 2001
 From: d0773d <dottedquad@gmail.com>
 Date: Wed, 12 Aug 2026 09:08:34 -0700
-Subject: [PATCH 41/47] video: fbdev: keep native one-shot scanout fed
+Subject: [PATCH 41/48] video: fbdev: keep native one-shot scanout fed
 
 ESP32-P4's DSI bridge emits its reserved pixel value when its FIFO
 underflows. The reset value decodes as light cyan in RGB565, which can

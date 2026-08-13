@@ -1,7 +1,7 @@
 From 7c89fa62e022050477acace06368fa757c75c51c Mon Sep 17 00:00:00 2001
 From: MicroNUX Project <micronux@example.invalid>
 Date: Sat, 8 Aug 2026 04:45:00 -0700
-Subject: [PATCH 5/47] mmc: dw: drop the ESP32-P4 descriptor override
+Subject: [PATCH 5/48] mmc: dw: drop the ESP32-P4 descriptor override
 
 The controller-specific builder now supplies the complete descriptor, so the
 old data-address-only override is redundant.

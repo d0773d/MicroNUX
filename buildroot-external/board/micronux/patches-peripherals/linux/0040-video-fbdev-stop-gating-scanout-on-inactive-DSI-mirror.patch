@@ -1,7 +1,7 @@
 From 0fac40ee31c1af165ea94a82a7b0d905d8da4861 Mon Sep 17 00:00:00 2001
 From: d0773d <dottedquad@gmail.com>
 Date: Wed, 12 Aug 2026 07:02:17 -0700
-Subject: [PATCH 40/47] video: fbdev: stop gating scanout on inactive DSI
+Subject: [PATCH 40/48] video: fbdev: stop gating scanout on inactive DSI
  mirror
 
 ESP-IDF v6.0.1 programs the primary video-mode register without

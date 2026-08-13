@@ -1,7 +1,7 @@
 From eb2d875645cc695622712d1383cd0b53483cc6ed Mon Sep 17 00:00:00 2001
 From: d0773d <dottedquad@gmail.com>
 Date: Wed, 12 Aug 2026 10:29:32 -0700
-Subject: [PATCH 43/47] video: fbdev: preserve native runtime fault evidence
+Subject: [PATCH 43/48] video: fbdev: preserve native runtime fault evidence
 
 Runtime containment destroys native sysfs objects and hardware state before
 reporting which health predicate failed. A late physical failure therefore

@@ -1,7 +1,7 @@
 From 2130ef8a261a3a3518df8955c04b82446cab732f Mon Sep 17 00:00:00 2001
 From: d0773d <dottedquad@gmail.com>
 Date: Wed, 12 Aug 2026 22:36:03 -0700
-Subject: [PATCH 47/47] video: fbdev: start native fixed-front hardware reload
+Subject: [PATCH 47/48] video: fbdev: start native fixed-front hardware reload
 
 Move the qualified ABI3 status front from one-shot CPU rearm to
 DW-GDMA reload mode while the panel remains dark.

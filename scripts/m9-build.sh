@@ -207,7 +207,7 @@ readonly DISPLAY_DRIVER="${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c"
 readonly MMC_DRIVER="${KERNEL_DIR}/drivers/mmc/host/dw_mmc.c"
 readonly EARLY_USB_CONSOLE="${KERNEL_DIR}/drivers/tty/serial/earlycon-esp32p4.c"
 readonly USB_CONSOLE="${KERNEL_DIR}/drivers/tty/serial/esp32_acm.c"
-readonly NATIVE_DISPLAY_DRIVER_SHA256="857199c3dd121df000981366c11b364605edb3f0c8ca5360a2211f2a5335953f"
+readonly NATIVE_DISPLAY_DRIVER_SHA256="c91efedfabd6c0db4beea4e4118b5206ea29181aaf3cbf87b34d697910858f71"
 display_driver_sha256="$(sha256sum "${DISPLAY_DRIVER}" | awk '{print $1}')"
 if [[ "${display_driver_sha256}" != "${NATIVE_DISPLAY_DRIVER_SHA256}" ]]; then
 	printf 'M9 kernel display source does not match the audited fixed-front reload source: %s\n' \
@@ -1063,6 +1063,21 @@ for patch47_runtime_marker in \
 	if ! grep -Fq "${patch47_runtime_marker}" "${DISPLAY_DRIVER}"; then
 		printf 'M9 kernel is missing Patch47 runtime marker: %s\n' \
 			"${patch47_runtime_marker}" >&2
+		exit 1
+	fi
+done
+
+for patch48_link_marker in \
+	'writel(0, dsi->channel + DW_GDMA_CH_LLP);' \
+	'writel(0, dsi->channel + DW_GDMA_CH_LLP + sizeof(u32));' \
+	'readl(dsi->channel + DW_GDMA_CH_LLP) ||' \
+	'readl(dsi->channel + DW_GDMA_CH_LLP + sizeof(u32)) ||' \
+	'reason=enable-not-observed' \
+	'reason=stopped-before-wrap'; do
+	if ! grep -Fq "${patch48_link_marker}" \
+		<<<"${patch47_start_compact}"; then
+		printf 'M9 kernel is missing Patch48 reload-link marker: %s\n' \
+			"${patch48_link_marker}" >&2
 		exit 1
 	fi
 done

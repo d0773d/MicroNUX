@@ -1,7 +1,7 @@
 From 5bbeaf9f50e831ff91c5f41f696d39b50c05e880 Mon Sep 17 00:00:00 2001
 From: d0773d <dottedquad@gmail.com>
 Date: Wed, 12 Aug 2026 03:24:24 -0700
-Subject: [PATCH 35/47] video: fbdev: validate native CLIC hardware IRQ
+Subject: [PATCH 35/48] video: fbdev: validate native CLIC hardware IRQ
 
 The handoff records the raw CLIC hardware IRQ, while platform_get_irq()
 returns a Linux virtual IRQ.  Resolve the IRQ data and compare hardware IRQ

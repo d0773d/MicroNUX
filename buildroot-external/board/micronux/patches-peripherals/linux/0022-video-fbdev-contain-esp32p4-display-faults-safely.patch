@@ -1,7 +1,7 @@
 From 1d6444b4ad407420a0a82f20031c4b46c9070f50 Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@example.invalid>
 Date: Mon, 10 Aug 2026 23:00:00 -0700
-Subject: [PATCH 22/47] video: fbdev: contain ESP32-P4 display faults safely
+Subject: [PATCH 22/48] video: fbdev: contain ESP32-P4 display faults safely
 
 Illuminate the panel only after a verified framebuffer or VPG source.
 

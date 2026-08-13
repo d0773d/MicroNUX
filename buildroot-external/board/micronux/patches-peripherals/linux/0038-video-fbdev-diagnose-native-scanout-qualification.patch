@@ -1,7 +1,7 @@
 From 397b8bed56b6165251011f0109ded884d1bd0fe2 Mon Sep 17 00:00:00 2001
 From: d0773d <dottedquad@gmail.com>
 Date: Wed, 12 Aug 2026 05:27:39 -0700
-Subject: [PATCH 38/47] video: fbdev: diagnose native scanout qualification
+Subject: [PATCH 38/48] video: fbdev: diagnose native scanout qualification
 
 Permit released I2C policy while native scanout remains in its dark
 initialization state. Keep the existing physical clock and pin release

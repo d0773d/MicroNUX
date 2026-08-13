@@ -1,7 +1,7 @@
 From 1b3faa9af351b15a3482e2e4b7ada21f41525a2d Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@example.invalid>
 Date: Wed, 12 Aug 2026 00:33:46 -0700
-Subject: [PATCH 32/47] video: fbdev: program native DSI panel cold stage
+Subject: [PATCH 32/48] video: fbdev: program native DSI panel cold stage
 
 Extend the ABI-v3 one-shot cold_init path so its completed I2C/LDO stage
 flows directly into native command-mode DSI panel programming.

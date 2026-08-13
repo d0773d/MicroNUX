@@ -1,7 +1,7 @@
 From 3286f665d4a4751f2073e702cd8d7cbf1590b7b3 Mon Sep 17 00:00:00 2001
 From: d0773d <dottedquad@gmail.com>
 Date: Wed, 12 Aug 2026 02:33:10 -0700
-Subject: [PATCH 34/47] video: fbdev: reveal native DSI scanout safely
+Subject: [PATCH 34/48] video: fbdev: reveal native DSI scanout safely
 
 Expose the ABI-v3 boot_ready gate only after the qualified native
 framebuffer is live. Bind its one-shot request to a completed userspace

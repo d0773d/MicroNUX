@@ -137,7 +137,7 @@ readonly DISPLAY_DRIVER="${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c"
 readonly MMC_DRIVER="${KERNEL_DIR}/drivers/mmc/host/dw_mmc.c"
 readonly EARLY_USB_CONSOLE="${KERNEL_DIR}/drivers/tty/serial/earlycon-esp32p4.c"
 readonly USB_CONSOLE="${KERNEL_DIR}/drivers/tty/serial/esp32_acm.c"
-readonly NATIVE_DISPLAY_DRIVER_SHA256="857199c3dd121df000981366c11b364605edb3f0c8ca5360a2211f2a5335953f"
+readonly NATIVE_DISPLAY_DRIVER_SHA256="c91efedfabd6c0db4beea4e4118b5206ea29181aaf3cbf87b34d697910858f71"
 readonly LINUX_PARTITION_SIZE=$((0x600000))
 readonly DISPLAY_POOL_ADDRESS=$((0x49300000))
 
@@ -946,6 +946,20 @@ if [[ "$(grep -cF 'synchronize_irq(dsi->irq);' \
 	printf 'M7 Patch47 fixed-front transition is not bounded/error-only.\n' >&2
 	exit 1
 fi
+for patch48_link_marker in \
+	'writel(0, dsi->channel + DW_GDMA_CH_LLP);' \
+	'writel(0, dsi->channel + DW_GDMA_CH_LLP + sizeof(u32));' \
+	'readl(dsi->channel + DW_GDMA_CH_LLP) ||' \
+	'readl(dsi->channel + DW_GDMA_CH_LLP + sizeof(u32)) ||' \
+	'reason=enable-not-observed' \
+	'reason=stopped-before-wrap'; do
+	if ! grep -Fq "${patch48_link_marker}" \
+		<<<"${patch47_start_compact}"; then
+		printf 'M7 kernel is missing ABI3-only Patch48 marker: %s\n' \
+			"${patch48_link_marker}" >&2
+		exit 1
+	fi
+done
 native_boot_ready_block="$(sed -n \
 	'/^static ssize_t micronux_native_boot_ready_store(/,/^}/p' \
 	"${DISPLAY_DRIVER}")"

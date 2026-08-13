@@ -1,0 +1,85 @@
+From d8dcea2721a07117e3eea8a7bc1c7b3b4ae1d3e4 Mon Sep 17 00:00:00 2001
+From: d0773d <dottedquad@gmail.com>
+Date: Thu, 13 Aug 2026 09:00:28 -0700
+Subject: [PATCH 48/48] video: fbdev: clear native reload link state
+
+Clear and verify the retired linked-list pointer before enabling direct
+register reload. Add distinct diagnostics for an enable that is never
+observed and a channel that stops before the first autonomous source wrap.
+
+Signed-off-by: d0773d <dottedquad@gmail.com>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 35 ++++++++++++++++++++++++++++---
+ 1 file changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index f2e4afe..f4ea7d0 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -6544,6 +6544,9 @@ static int micronux_native_start_continuous_fixed_front(struct micronux_dsi *dsi
+ 	writel(~0U, dsi->channel + DW_GDMA_CH_INT_CLEAR1);
+ 	writel(DW_GDMA_INT_COMMON_VALID_MASK,
+ 	       dsi->gdma + DW_GDMA_INT_CLEAR);
++	/* Leave the previous linked-list engine with no reusable list state. */
++	writel(0, dsi->channel + DW_GDMA_CH_LLP);
++	writel(0, dsi->channel + DW_GDMA_CH_LLP + sizeof(u32));
+ 
+ 	front_address = dsi->handoff.framebuffer_address[front];
+ 	writel(front_address, dsi->channel + DW_GDMA_CH_SAR);
+@@ -6576,6 +6579,8 @@ static int micronux_native_start_continuous_fixed_front(struct micronux_dsi *dsi
+ 	common = readl(dsi->gdma + DW_GDMA_INT_COMMON_STATUS);
+ 	top = readl(dsi->gdma + DW_GDMA_INT_STATUS);
+ 	if ((chen & channel) ||
++	    readl(dsi->channel + DW_GDMA_CH_LLP) ||
++	    readl(dsi->channel + DW_GDMA_CH_LLP + sizeof(u32)) ||
+ 	    readl(dsi->channel + DW_GDMA_CH_SAR) != front_address ||
+ 	    readl(dsi->channel + DW_GDMA_CH_DAR) !=
+ 		dsi->handoff.dsi_fifo_address ||
+@@ -6618,8 +6623,21 @@ static int micronux_native_start_continuous_fixed_front(struct micronux_dsi *dsi
+ 	 * otherwise waits for software to clear the event before the next block.
+ 	 */
+ 	writel(channel | (channel << 8), dsi->gdma + DW_GDMA_CHEN);
+-	if (!(readl(dsi->gdma + DW_GDMA_CHEN) & channel))
++	chen = readl(dsi->gdma + DW_GDMA_CHEN);
++	if (!(chen & channel)) {
++		dev_err(dsi->dev,
++			"MICRONUX:M9.2:COLD-INIT stage=continuous-start reason=enable-not-observed chen=%08x sar=%08x llp=%08x:%08x ctl=%08x:%08x status=%08x:%08x common=%08x top=%08x\n",
++			chen, readl(dsi->channel + DW_GDMA_CH_SAR),
++			readl(dsi->channel + DW_GDMA_CH_LLP),
++			readl(dsi->channel + DW_GDMA_CH_LLP + sizeof(u32)),
++			readl(dsi->channel + DW_GDMA_CH_CTL_LO),
++			readl(dsi->channel + DW_GDMA_CH_CTL_HI),
++			readl(dsi->channel + DW_GDMA_CH_INT_STATUS),
++			readl(dsi->channel + DW_GDMA_CH_INT_STATUS1),
++			readl(dsi->gdma + DW_GDMA_INT_COMMON_STATUS),
++			readl(dsi->gdma + DW_GDMA_INT_STATUS));
+ 		return -EIO;
++	}
+ 
+ 	/* Prove autonomous source wrap while the panel remains dark. */
+ 	previous_sar = readl(dsi->channel + DW_GDMA_CH_SAR);
+@@ -6633,8 +6651,19 @@ static int micronux_native_start_continuous_fixed_front(struct micronux_dsi *dsi
+ 		status1 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS1);
+ 		common = readl(dsi->gdma + DW_GDMA_INT_COMMON_STATUS);
+ 		top = readl(dsi->gdma + DW_GDMA_INT_STATUS);
+-		if (!(readl(dsi->gdma + DW_GDMA_CHEN) & channel) ||
+-		    sar < front_address ||
++		chen = readl(dsi->gdma + DW_GDMA_CHEN);
++		if (!(chen & channel)) {
++			dev_err(dsi->dev,
++				"MICRONUX:M9.2:COLD-INIT stage=continuous-start reason=stopped-before-wrap wraps=%u chen=%08x sar=%08x llp=%08x:%08x ctl=%08x:%08x status=%08x:%08x common=%08x top=%08x\n",
++				wraps, chen, sar,
++				readl(dsi->channel + DW_GDMA_CH_LLP),
++				readl(dsi->channel + DW_GDMA_CH_LLP + sizeof(u32)),
++				readl(dsi->channel + DW_GDMA_CH_CTL_LO),
++				readl(dsi->channel + DW_GDMA_CH_CTL_HI), status0,
++				status1, common, top);
++			return -EIO;
++		}
++		if (sar < front_address ||
+ 		    sar > front_address + dsi->handoff.framebuffer_size ||
+ 		    (status0 & DW_GDMA_INT_ERROR_MASK) ||
+ 		    (status1 & DW_GDMA_INT_ECC_ERROR_MASK) ||
+-- 
+2.54.0.windows.1
+

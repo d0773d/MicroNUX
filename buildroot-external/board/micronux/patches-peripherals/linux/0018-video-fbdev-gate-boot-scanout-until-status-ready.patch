@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@example.invalid>
 Date: Mon, 10 Aug 2026 18:10:00 -0700
-Subject: [PATCH 18/47] video: fbdev: gate boot scanout until status is ready
+Subject: [PATCH 18/48] video: fbdev: gate boot scanout until status is ready
 
 fbcon unblanks the framebuffer as soon as it registers, several seconds before
 userspace finishes drawing the MicroNUX status page. Starting DSI scanout while

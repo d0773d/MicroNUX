@@ -1,7 +1,7 @@
 From 8b48cd8ca8616f405449b82089ea5ca371449a1c Mon Sep 17 00:00:00 2001
 From: d0773d <dottedquad@gmail.com>
 Date: Wed, 12 Aug 2026 10:39:44 -0700
-Subject: [PATCH 44/47] video: fbdev: derate native DSI for PSRAM bandwidth
+Subject: [PATCH 44/48] video: fbdev: derate native DSI for PSRAM bandwidth
 
 Espressif documents the ESP32-P4 blue MIPI-DSI symptom as a PSRAM
 bandwidth underrun. Run ABI-v3 at 60 MHz DPI and 1 Gbps per lane.

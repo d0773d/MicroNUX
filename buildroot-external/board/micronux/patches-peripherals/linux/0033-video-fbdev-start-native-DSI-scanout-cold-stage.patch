@@ -1,7 +1,7 @@
 From d9dd1b9bebfea6050659c859004c26fc984752d6 Mon Sep 17 00:00:00 2001
 From: d0773d <dottedquad@gmail.com>
 Date: Wed, 12 Aug 2026 01:12:10 -0700
-Subject: [PATCH 33/47] video: fbdev: start native DSI scanout cold stage
+Subject: [PATCH 33/48] video: fbdev: start native DSI scanout cold stage
 
 Run the ABI-v3 cold-init request through native DPI, bridge, and
 one-frame GDMA initialization after the panel programming boundary.

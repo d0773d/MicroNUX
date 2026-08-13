@@ -1,7 +1,7 @@
 From 40c1c409ad9dc9c945d59bbba4856a2cfc2ea7b5 Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@example.invalid>
 Date: Tue, 11 Aug 2026 21:20:00 -0700
-Subject: [PATCH 26/47] video: fbdev: tolerate first-window DPI refill residue
+Subject: [PATCH 26/48] video: fbdev: tolerate first-window DPI refill residue
 
 Kit C reports both DPI payload-path status bits while the stopped
 bridge refills its first dark frames.  Treat them as residue only at the

@@ -1,7 +1,7 @@
 From 99fcff145f84b22c8996e7cab8ce9a77abe472e7 Mon Sep 17 00:00:00 2001
 From: d0773d <dottedquad@gmail.com>
 Date: Wed, 12 Aug 2026 06:07:43 -0700
-Subject: [PATCH 39/47] video: fbdev: validate native DMA arm transaction
+Subject: [PATCH 39/48] video: fbdev: validate native DMA arm transaction
 
 The DesignWare GDMA consumes and advances LLP immediately after channel
 enable. The one-shot terminal descriptor therefore exposes only its

@@ -1,7 +1,7 @@
 From 4c5a77ea966fb837f3473b2f1e7530568ddc5c5c Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@example.invalid>
 Date: Tue, 11 Aug 2026 21:10:00 -0700
-Subject: [PATCH 25/47] video: fbdev: qualify initial reveal and log blocks
+Subject: [PATCH 25/48] video: fbdev: qualify initial reveal and log blocks
 
 Use the same grace-plus-strict framebuffer qualification for the initial
 stopped-to-running transition that already protects VPG restoration.  Keep

@@ -1,7 +1,7 @@
 From 70117bd22759d818ecac09398159f8eaf44ec790 Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@example.invalid>
 Date: Wed, 12 Aug 2026 00:06:29 -0700
-Subject: [PATCH 31/47] video: fbdev: add native I2C and LDO cold stage
+Subject: [PATCH 31/48] video: fbdev: add native I2C and LDO cold stage
 
 Add a root-only, write-once cold_init control for ABI-v3 cold probe.
 Reclaim I2C0 with the pinned ESP-IDF v6.0.1 clock, timing, GPIO,
