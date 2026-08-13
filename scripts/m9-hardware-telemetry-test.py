@@ -78,7 +78,9 @@ def diagnostics_line(
         generation = frames
     return (
         "abi=3 state=RUNTIME_REVEALED "
-        f"frames={frames} faults={faults:x} "
+        "scanout-mode=continuous-fixed-front refresh-progress=sar "
+        f"sar=49300200 qualified-wraps=4 progress-samples={frames} "
+        f"frames=8 faults={faults:x} "
         f"error={error:08x} host-errors={host0:08x}:{host1:08x} "
         f"underruns={underruns} buffers=3 front=0 queued=-1 back=1 "
         f"rearm={rearms}/{rearm_failures} flips=1/1 "
@@ -105,7 +107,10 @@ def scanout_line(
 ) -> str:
     return (
         "running abi=3 state=RUNTIME_REVEALED "
-        f"frames={before}->{after} error=00000000 underruns=0 chen=1 "
+        "scanout-mode=continuous-fixed-front refresh-progress=sar "
+        "sar=49300100->49300200 qualified-wraps=4 "
+        f"progress-samples={after} frames=8->8 "
+        "error=00000000 underruns=0 chen=1 "
         "faults=0 host-errors=00000000:00000000 frame-ack=on "
         "clock=auto lp=enabled backlight-gate=on buffers=3 "
         f"front=0 queued=-1 back=1 rearm={after + 1}/0 flips=1/1 "

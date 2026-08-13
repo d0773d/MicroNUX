@@ -1,7 +1,7 @@
 From 836edacc6d2dc303638886b9a0e60abd1acc0ff6 Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@local>
 Date: Wed, 12 Aug 2026 12:18:37 -0700
-Subject: [PATCH 45/46] mmc: dw_mmc: allow an isolated ESP32-P4 slot
+Subject: [PATCH 45/47] mmc: dw_mmc: allow an isolated ESP32-P4 slot
 
 Permit an explicitly marked dual-slot controller to register one
 available child. This lets M9 suppress the failing removable slot

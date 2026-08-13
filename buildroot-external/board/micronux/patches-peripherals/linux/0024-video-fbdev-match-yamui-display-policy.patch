@@ -1,7 +1,7 @@
 From 6420b4c468345c6b3b349eb107a1baf687e167f6 Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@example.invalid>
 Date: Tue, 11 Aug 2026 18:15:30 -0700
-Subject: [PATCH 24/46] video: fbdev: match YamUI display policy
+Subject: [PATCH 24/47] video: fbdev: match YamUI display policy
 
 Use the external backlight enable as the authoritative dark gate.
 Restore the stock ESP-IDF/YamUI clock-lane, low-power blanking, and

@@ -137,7 +137,7 @@ readonly DISPLAY_DRIVER="${KERNEL_DIR}/drivers/video/fbdev/esp32p4-dsi.c"
 readonly MMC_DRIVER="${KERNEL_DIR}/drivers/mmc/host/dw_mmc.c"
 readonly EARLY_USB_CONSOLE="${KERNEL_DIR}/drivers/tty/serial/earlycon-esp32p4.c"
 readonly USB_CONSOLE="${KERNEL_DIR}/drivers/tty/serial/esp32_acm.c"
-readonly NATIVE_DISPLAY_DRIVER_SHA256="b9a188dd12066b2c596b7223f593d734e43aebc12e4639fb6a715e6c845bdabe"
+readonly NATIVE_DISPLAY_DRIVER_SHA256="857199c3dd121df000981366c11b364605edb3f0c8ca5360a2211f2a5335953f"
 readonly LINUX_PARTITION_SIZE=$((0x600000))
 readonly DISPLAY_POOL_ADDRESS=$((0x49300000))
 
@@ -189,7 +189,7 @@ fi
 
 display_driver_sha256="$(sha256sum "${DISPLAY_DRIVER}" | awk '{print $1}')"
 if [[ "${display_driver_sha256}" != "${NATIVE_DISPLAY_DRIVER_SHA256}" ]]; then
-	printf 'M7 kernel display source does not match the audited preparation source: %s\n' \
+	printf 'M7 kernel display source does not match the audited fixed-front reload source: %s\n' \
 		"${display_driver_sha256}" >&2
 	exit 1
 fi
@@ -261,9 +261,9 @@ gdma_runtime_block="$(sed -n \
 	"${DISPLAY_DRIVER}")"
 gdma_runtime_compact="$(tr '\n\t' '  ' <<<"${gdma_runtime_block}" | tr -s ' ')"
 for gdma_runtime_marker in \
-	'(st_ena0 & DW_GDMA_INT_STATUS0_DEFINED_MASK) == (DW_GDMA_INT_NATIVE_SCANOUT_MASK | DW_GDMA_INT_STATUS0_RO_MASK)' \
+	'(st_ena0 & DW_GDMA_INT_STATUS0_DEFINED_MASK) == (expected_intr | DW_GDMA_INT_STATUS0_RO_MASK)' \
 	'(st_ena1 & DW_GDMA_INT_STATUS1_DEFINED_MASK) == DW_GDMA_INT_ECC_ERROR_MASK' \
-	'(sig_ena0 & DW_GDMA_INT_STATUS0_DEFINED_MASK) == (DW_GDMA_INT_NATIVE_SCANOUT_MASK | DW_GDMA_INT_STATUS0_RO_MASK)' \
+	'(sig_ena0 & DW_GDMA_INT_STATUS0_DEFINED_MASK) == (expected_intr | DW_GDMA_INT_STATUS0_RO_MASK)' \
 	'(sig_ena1 & DW_GDMA_INT_STATUS1_DEFINED_MASK) == DW_GDMA_INT_ECC_ERROR_MASK' \
 	'(common_st_ena & DW_GDMA_INT_COMMON_DEFINED_MASK) == DW_GDMA_INT_COMMON_VALID_MASK' \
 	'(common_sig_ena & DW_GDMA_INT_COMMON_DEFINED_MASK) == DW_GDMA_INT_COMMON_VALID_MASK' \
@@ -920,9 +920,41 @@ if grep -Eq 'writel|readl|readl_poll' <<<"${patch46_reload_block}"; then
 	printf 'M7 Patch46 preparation unexpectedly accesses MMIO.\n' >&2
 	exit 1
 fi
-if grep -Eq 'native_continuous_fixed_front|start_continuous_fixed_front|scanout-mode=continuous-fixed-front' \
-	"${DISPLAY_DRIVER}"; then
-	printf 'M7 Patch46 preparation changed the shared one-shot runtime.\n' >&2
+patch47_start_block="$(sed -n \
+	'/^static int micronux_native_start_continuous_fixed_front(/,/^}/p' \
+	"${DISPLAY_DRIVER}")"
+patch47_start_compact="$(tr '\n\t' '  ' \
+	<<<"${patch47_start_block}" | tr -s ' ')"
+for patch47_marker in \
+	'dsi->scanout_active = false;' \
+	'synchronize_irq(dsi->irq);' \
+	'writel(front_address, dsi->channel + DW_GDMA_CH_SAR);' \
+	'writel(MICRONUX_DMA_CHANNEL_RELOAD_CFG_LO, dsi->channel + DW_GDMA_CH_CFG_LO);' \
+	'writel(DW_GDMA_INT_NATIVE_RELOAD_MASK | DW_GDMA_INT_STATUS0_RO_MASK, dsi->channel + DW_GDMA_CH_INT_STATUS_ENA);' \
+	'dsi->native_continuous_fixed_front = true;' \
+	'writel(channel | (channel << 8), dsi->gdma + DW_GDMA_CHEN);' \
+	'mode=continuous-fixed-front state=QUALIFIED'; do
+	if ! grep -Fq "${patch47_marker}" <<<"${patch47_start_compact}"; then
+		printf 'M7 kernel is missing ABI3-only Patch47 marker: %s\n' \
+			"${patch47_marker}" >&2
+		exit 1
+	fi
+done
+if [[ "$(grep -cF 'synchronize_irq(dsi->irq);' \
+	<<<"${patch47_start_block}")" -ne 2 ]] ||
+	grep -Fq 'DW_GDMA_INT_DMA_TFR_DONE' <<<"${patch47_start_block}"; then
+	printf 'M7 Patch47 fixed-front transition is not bounded/error-only.\n' >&2
+	exit 1
+fi
+native_boot_ready_block="$(sed -n \
+	'/^static ssize_t micronux_native_boot_ready_store(/,/^}/p' \
+	"${DISPLAY_DRIVER}")"
+if ! grep -Fq 'micronux_native_start_continuous_fixed_front(dsi);' \
+	<<<"${native_boot_ready_block}" ||
+	grep -Fq 'micronux_native_start_continuous_fixed_front(dsi);' \
+	<<<"$(sed -n '/^static int micronux_validate_handoff_v2(/,/^}/p' \
+		"${DISPLAY_DRIVER}")"; then
+	printf 'M7 Patch47 is not isolated to the ABI3 native reveal path.\n' >&2
 	exit 1
 fi
 

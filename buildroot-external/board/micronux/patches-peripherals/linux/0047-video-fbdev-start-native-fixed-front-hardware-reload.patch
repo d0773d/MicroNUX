@@ -1,0 +1,541 @@
+From 2130ef8a261a3a3518df8955c04b82446cab732f Mon Sep 17 00:00:00 2001
+From: d0773d <dottedquad@gmail.com>
+Date: Wed, 12 Aug 2026 22:36:03 -0700
+Subject: [PATCH 47/47] video: fbdev: start native fixed-front hardware reload
+
+Move the qualified ABI3 status front from one-shot CPU rearm to
+DW-GDMA reload mode while the panel remains dark.
+
+Validate autonomous source wraps before reveal and retain fail-dark
+containment.
+
+Signed-off-by: d0773d <dottedquad@gmail.com>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 313 ++++++++++++++++++++++++++++--
+ 1 file changed, 298 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 0a92c56..f2e4afe 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -336,6 +336,8 @@
+ 					 DW_GDMA_INT_ERROR_MASK)
+ #define DW_GDMA_INT_NATIVE_SCANOUT_MASK \
+ 	(DW_GDMA_INT_DMA_TFR_DONE | DW_GDMA_INT_ERROR_MASK)
++#define DW_GDMA_INT_NATIVE_RELOAD_MASK \
++	DW_GDMA_INT_ERROR_MASK
+ #define DW_GDMA_INT_STATUS0_RO_MASK	BIT(25)
+ /* P4 rev 1.3 uses IDF's hw_ver1 view; compare every documented bit. */
+ /* Undefined positions are reserved read-as-one fields on this silicon. */
+@@ -773,6 +775,9 @@ struct micronux_dsi {
+ 	u64 dark_baseline_commit_sequence;
+ 	u32 watchdog_frames;
+ 	u32 watchdog_sar;
++	u32 native_reload_qualified_wraps;
++	u32 native_refresh_progress_samples;
++	unsigned long native_last_progress_jiffies;
+ 	u64 native_last_arm_ns;
+ 	u64 native_arm_to_irq_last_ns;
+ 	u64 native_arm_to_irq_max_ns;
+@@ -828,6 +833,7 @@ struct micronux_dsi {
+ 	bool native_dark_confirmed;
+ 	bool native_reveal_may_be_lit;
+ 	bool native_source_rearm_unverified;
++	bool native_continuous_fixed_front;
+ 	enum micronux_native_i2c_state native_i2c_state;
+ 	unsigned long native_i2c_transition_deadline;
+ 	struct hrtimer scanout_timer;
+@@ -1166,6 +1172,9 @@ static bool micronux_pool_guards_valid(struct micronux_dsi *dsi, bool full)
+ static bool micronux_source_policy_valid(struct micronux_dsi *dsi,
+ 					 bool vpg);
+ static bool micronux_native_runtime_policy_valid(struct micronux_dsi *dsi);
++static bool micronux_cold_ldo_matches(struct micronux_dsi *dsi);
++static bool micronux_native_i2c_policy_valid(struct micronux_dsi *dsi);
++static bool micronux_native_pms_route_valid(struct micronux_dsi *dsi);
+ 
+ static bool micronux_native_scanout_live_state(struct micronux_dsi *dsi)
+ {
+@@ -1199,7 +1208,9 @@ static bool micronux_visible_source_valid(struct micronux_dsi *dsi)
+ 		     DSI_BRG_INT_UNDERRUN) ||
+ 		    !micronux_native_runtime_policy_valid(dsi))
+ 			return false;
+-		last_frame = READ_ONCE(dsi->last_frame_jiffies);
++		last_frame = READ_ONCE(dsi->native_continuous_fixed_front) ?
++			READ_ONCE(dsi->native_last_progress_jiffies) :
++			READ_ONCE(dsi->last_frame_jiffies);
+ 		return last_frame &&
+ 		       !time_after(jiffies,
+ 				   last_frame +
+@@ -1380,7 +1391,9 @@ static int micronux_backlight_update(struct backlight_device *backlight)
+ 		return micronux_backlight_disable(dsi);
+ 	if (!micronux_visible_source_valid(dsi)) {
+ 		disable_ret = micronux_backlight_disable(dsi);
+-		last_frame = READ_ONCE(dsi->last_frame_jiffies);
++		last_frame = READ_ONCE(dsi->native_continuous_fixed_front) ?
++			READ_ONCE(dsi->native_last_progress_jiffies) :
++			READ_ONCE(dsi->last_frame_jiffies);
+ 		frame_age_ms = last_frame ?
+ 			jiffies_to_msecs(jiffies - last_frame) : ~0UL;
+ 		vpg = READ_ONCE(dsi->vpg_test_active);
+@@ -1453,6 +1466,7 @@ static void micronux_native_fail_reveal_locked(struct micronux_dsi *dsi,
+ 					       const char *stage, int error,
+ 					       bool force_teardown);
+ static void micronux_commit_render_locked(struct micronux_dsi *dsi);
++static int micronux_native_start_continuous_fixed_front(struct micronux_dsi *dsi);
+ static int micronux_cold_i2c_initialize(struct micronux_dsi *dsi);
+ static int micronux_register_native_backlight(struct micronux_dsi *dsi);
+ static int
+@@ -1538,6 +1552,7 @@ static ssize_t micronux_native_boot_ready_store(struct micronux_dsi *dsi,
+ {
+ 	struct micronux_display_handoff_v3 *handoff = &dsi->cold_handoff;
+ 	struct micronux_native_reload_plan reload_plan;
++	struct micronux_scanout_snapshot snapshot;
+ 	unsigned long flags;
+ 	u64 target_commit;
+ 	u8 reveal_command = handoff->display_control_reveal_command;
+@@ -1594,6 +1609,32 @@ static ssize_t micronux_native_boot_ready_store(struct micronux_dsi *dsi,
+ 		 reload_plan.block_size, reload_plan.control_lo,
+ 		 reload_plan.control_hi, reload_plan.config_lo,
+ 		 reload_plan.config_hi, reload_plan.interrupt_mask);
++	ret = micronux_native_start_continuous_fixed_front(dsi);
++	if (ret) {
++		micronux_capture_scanout_snapshot(dsi, &snapshot,
++						  dsi->front_index, 0);
++		micronux_log_scanout_failure(dsi, "continuous-start",
++					     "fixed-front-transition", ret, 0, 0,
++					     dsi->source_generation, &snapshot);
++		dev_err(dsi->dev,
++			"MICRONUX:M9.2:COLD-INIT stage=continuous-start state=FAILED error=%d chen=%08x sar=%08x dar=%08x block=%08x ctl=%08x:%08x cfg=%08x:%08x status=%08x:%08x common=%08x top=%08x source=%08x:%08x front=%u presented=%u queued=%d\n",
++			ret, readl(dsi->gdma + DW_GDMA_CHEN),
++			readl(dsi->channel + DW_GDMA_CH_SAR),
++			readl(dsi->channel + DW_GDMA_CH_DAR),
++			readl(dsi->channel + DW_GDMA_CH_BLOCK_TS),
++			readl(dsi->channel + DW_GDMA_CH_CTL_LO),
++			readl(dsi->channel + DW_GDMA_CH_CTL_HI),
++			readl(dsi->channel + DW_GDMA_CH_CFG_LO),
++			readl(dsi->channel + DW_GDMA_CH_CFG_HI),
++			readl(dsi->channel + DW_GDMA_CH_INT_STATUS),
++			readl(dsi->channel + DW_GDMA_CH_INT_STATUS1),
++			readl(dsi->gdma + DW_GDMA_INT_COMMON_STATUS),
++			readl(dsi->gdma + DW_GDMA_INT_STATUS),
++			dsi->handoff.framebuffer_address[dsi->front_index],
++			dsi->handoff.framebuffer_size, dsi->front_index,
++			dsi->presented_index, dsi->queued_index);
++		goto fail_render;
++	}
+ 
+ 	WRITE_ONCE(dsi->native_i2c_transition_deadline,
+ 		   jiffies +
+@@ -1608,6 +1649,31 @@ static ssize_t micronux_native_boot_ready_store(struct micronux_dsi *dsi,
+ 	WRITE_ONCE(dsi->native_i2c_state,
+ 		   MICRONUX_NATIVE_I2C_ACTIVE_SERIALIZED);
+ 	if (!micronux_native_runtime_policy_valid(dsi)) {
++		micronux_capture_scanout_snapshot(dsi, &snapshot,
++						  dsi->front_index, 0);
++		micronux_log_scanout_failure(dsi,
++					     "continuous-runtime-policy",
++					     "post-i2c-policy", -EIO, 0, 0,
++					     dsi->source_generation, &snapshot);
++		dev_err(dsi->dev,
++			"MICRONUX:M9.2:COLD-INIT stage=continuous-runtime-policy direct=dar:%08x:block:%08x:ctl:%08x:%08x ena=%08x:%08x:%08x:%08x common-ena=%08x:%08x helpers=ldo:%u:i2c:%u:pms:%u:guards:%u front=%u source=%08x:%08x\n",
++			readl(dsi->channel + DW_GDMA_CH_DAR),
++			readl(dsi->channel + DW_GDMA_CH_BLOCK_TS),
++			readl(dsi->channel + DW_GDMA_CH_CTL_LO),
++			readl(dsi->channel + DW_GDMA_CH_CTL_HI),
++			readl(dsi->channel + DW_GDMA_CH_INT_STATUS_ENA),
++			readl(dsi->channel + DW_GDMA_CH_INT_STATUS_ENA1),
++			readl(dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA),
++			readl(dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA1),
++			readl(dsi->gdma + DW_GDMA_INT_STATUS_ENA),
++			readl(dsi->gdma + DW_GDMA_INT_SIGNAL_ENA),
++			micronux_cold_ldo_matches(dsi),
++			micronux_native_i2c_policy_valid(dsi),
++			micronux_native_pms_route_valid(dsi),
++			micronux_pool_guards_valid(dsi, false),
++			dsi->front_index,
++			dsi->handoff.framebuffer_address[dsi->front_index],
++			dsi->handoff.framebuffer_size);
+ 		ret = -EIO;
+ 		goto fail_render;
+ 	}
+@@ -1665,7 +1731,8 @@ static ssize_t micronux_native_boot_ready_store(struct micronux_dsi *dsi,
+ 		goto fail_render;
+ 	}
+ 	WRITE_ONCE(dsi->boot_display_ready, true);
+-	WRITE_ONCE(dsi->render_enabled, true);
++	/* This segment freezes the qualified status front; runtime flips stay closed. */
++	WRITE_ONCE(dsi->render_enabled, false);
+ 	/* Publish ready/render gates before the terminal runtime state. */
+ 	smp_wmb();
+ 	WRITE_ONCE(dsi->display_state,
+@@ -1674,7 +1741,7 @@ static ssize_t micronux_native_boot_ready_store(struct micronux_dsi *dsi,
+ 	backlight_locked = false;
+ 	mutex_unlock(&dsi->render_lock);
+ 	dev_info(dsi->dev,
+-		 "MICRONUX:M9.2:REVEAL state=RUNTIME_REVEALED boot-ready=1 source=userspace-status commit=%llu frames=4 same-front=yes control-command=0x17-acked pwm-command=63-acked brightness=63 backlight=registered i2c=active-serialized touch=registering health=monitored physical-panel-state=unobserved\n",
++		 "MICRONUX:M9.2:REVEAL state=RUNTIME_REVEALED boot-ready=1 source=userspace-status commit=%llu frames=4 same-front=yes scanout-mode=continuous-fixed-front cpu-rearm=disabled control-command=0x17-acked pwm-command=63-acked brightness=63 backlight=registered i2c=active-serialized touch=registering health=monitored physical-panel-state=unobserved\n",
+ 		 (unsigned long long)target_commit);
+ 	schedule_work(&dsi->touch_register_work);
+ 	mutex_unlock(&dsi->mode_lock);
+@@ -2054,6 +2121,18 @@ static ssize_t micronux_fb_read(struct fb_info *info, char __user *buf,
+ 	struct micronux_dsi *dsi = info->par;
+ 	ssize_t ret;
+ 
++	if (dsi->required_handoff_abi == MICRONUX_DISPLAY_ABI_VERSION_V3 &&
++	    READ_ONCE(dsi->native_continuous_fixed_front)) {
++		mutex_lock(&dsi->render_lock);
++		if (!READ_ONCE(dsi->native_continuous_fixed_front) ||
++		    !info->screen_base) {
++			mutex_unlock(&dsi->render_lock);
++			return -EAGAIN;
++		}
++		ret = fb_io_read(info, buf, count, ppos);
++		mutex_unlock(&dsi->render_lock);
++		return ret;
++	}
+ 	if (!micronux_render_allowed(dsi))
+ 		return -EAGAIN;
+ 	mutex_lock(&dsi->render_lock);
+@@ -2445,7 +2524,7 @@ static irqreturn_t micronux_native_dma_irq(struct micronux_dsi *dsi)
+ 	u32 common, status0, status1, top;
+ 	u32 fifo_depth;
+ 	u8 next_index;
+-	bool dma_error, faulted, inactive_contained = true, preserve;
++	bool continuous, dma_error, faulted, inactive_contained = true, preserve;
+ 	bool rearm_failed = false, wake_frame = false;
+ 
+ 	irq_entry_ns = local_clock();
+@@ -2464,6 +2543,7 @@ static irqreturn_t micronux_native_dma_irq(struct micronux_dsi *dsi)
+ 	writel(common, dsi->gdma + DW_GDMA_INT_CLEAR);
+ 	preserve = READ_ONCE(dsi->native_preserve_source) &&
+ 		   !READ_ONCE(dsi->native_dark_confirmed);
++	continuous = READ_ONCE(dsi->native_continuous_fixed_front);
+ 	if ((top & ~DW_GDMA_INT_TOP_ALLOWED) && preserve)
+ 		inactive_contained =
+ 			micronux_native_contain_inactive_irqs(dsi, top);
+@@ -2488,6 +2568,16 @@ static irqreturn_t micronux_native_dma_irq(struct micronux_dsi *dsi)
+ 			     (top & ~DW_GDMA_INT_TOP_ALLOWED)) ? BIT(31) : 0));
+ 		set_bit(MICRONUX_FAULT_DMA, &dsi->fault_bits);
+ 	}
++	/* Autonomous reload has no normal interrupt; any signaled source is a fault. */
++	if (continuous) {
++		if (dma_error) {
++			schedule_work(&dsi->fault_work);
++		} else {
++			WRITE_ONCE(dsi->last_dma_error, BIT(29));
++			micronux_latch_fault(dsi, MICRONUX_FAULT_DMA);
++		}
++		return IRQ_HANDLED;
++	}
+ 
+ 	if (!(status0 & DW_GDMA_INT_DMA_TFR_DONE)) {
+ 		if (dma_error) {
+@@ -2677,6 +2767,13 @@ static enum hrtimer_restart micronux_dma_poll(struct hrtimer *timer)
+ 			   READ_ONCE(dsi->pool_guard_errors) + 1);
+ 		micronux_latch_fault(dsi, MICRONUX_FAULT_POOL_GUARD);
+ 	}
++	if (monitor && native &&
++	    READ_ONCE(dsi->native_continuous_fixed_front) &&
++	    sar != dsi->watchdog_sar) {
++		WRITE_ONCE(dsi->native_refresh_progress_samples,
++			   READ_ONCE(dsi->native_refresh_progress_samples) + 1);
++		WRITE_ONCE(dsi->native_last_progress_jiffies, jiffies);
++	}
+ 	if (!monitor || frames != dsi->watchdog_frames ||
+ 	    sar != dsi->watchdog_sar) {
+ 		micronux_watchdog_seed_progress(dsi);
+@@ -3309,7 +3406,7 @@ static ssize_t ownership_show(struct device *dev,
+ 	if (dsi->required_handoff_abi ==
+ 	    MICRONUX_DISPLAY_ABI_VERSION_V3)
+ 		return sysfs_emit(buf,
+-			"linux abi=3 mode=native-cold-init fb%d buffers=3 dma-channel=0 frame-irq=%d rearm=explicit mmap=denied i2c=active-serialized\n",
++			"linux abi=3 mode=native-cold-init fb%d buffers=3 dma-channel=0 frame-irq=none gdma-error-irq=%d scanout-mode=continuous-fixed-front rearm=hardware-reload mmap=denied i2c=active-serialized\n",
+ 			dsi->info->node, dsi->irq);
+ 
+ 	return sysfs_emit(buf,
+@@ -3331,13 +3428,16 @@ static ssize_t scanout_show(struct device *dev,
+ 	u32 channel_enable, host, lpclk, underruns;
+ 	u32 host_error0, host_error1;
+ 	u32 rearm_attempts, rearm_failures, flip_requests, flip_completions;
++	u32 sar_before, sar_after;
+ 	u64 front_commit;
+ 	u8 front, render;
+ 	s8 queued;
+ 
+ 	before = READ_ONCE(dsi->scanout_frames);
++	sar_before = readl(dsi->channel + DW_GDMA_CH_SAR);
+ 	msleep(50);
+ 	after = READ_ONCE(dsi->scanout_frames);
++	sar_after = readl(dsi->channel + DW_GDMA_CH_SAR);
+ 	error = READ_ONCE(dsi->last_dma_error);
+ 	underruns = READ_ONCE(dsi->bridge_underruns);
+ 	channel_enable = readl(dsi->gdma + DW_GDMA_CHEN) &
+@@ -3368,14 +3468,17 @@ static ssize_t scanout_show(struct device *dev,
+ 				DSI_BRG_DPI_RSV_DATA_MASK;
+ 		bridge_misc = readl(dsi->bridge + DSI_BRG_DPI_MISC_CONFIG);
+ 		return sysfs_emit(buf,
+-			"%s abi=3 state=%s frames=%u->%u error=%08x underruns=%u chen=%u faults=%lx host-errors=%08x:%08x frame-ack=on clock=auto lp=enabled backlight-gate=%s buffers=3 front=%u queued=%d back=%u rearm=%u/%u flips=%u/%u generation=%u commit=%llu guards=%s guard-errors=%u arm-to-irq-ns=%llu/%llu arm-to-irq-over20ms=%u rearm-ns=%llu/%llu fifo-irq=%u/%u/%u fifo-poll=%u/%u/%u bridge-filler=%08x bridge-misc=%08x i2c=active-serialized\n",
+-			after != before && !error && !underruns && !faults &&
++			"%s abi=3 state=%s scanout-mode=continuous-fixed-front refresh-progress=sar sar=%08x->%08x qualified-wraps=%u progress-samples=%u frames=%u->%u error=%08x underruns=%u chen=%u faults=%lx host-errors=%08x:%08x frame-ack=on clock=auto lp=enabled backlight-gate=%s buffers=3 front=%u queued=%d back=%u rearm=%u/%u flips=%u/%u generation=%u commit=%llu guards=%s guard-errors=%u arm-to-irq-ns=%llu/%llu arm-to-irq-over20ms=%u rearm-ns=%llu/%llu fifo-irq=%u/%u/%u fifo-poll=%u/%u/%u bridge-filler=%08x bridge-misc=%08x i2c=active-serialized\n",
++			sar_after != sar_before && !error && !underruns && !faults &&
+ 			!host_error0 && !host_error1 && guards_valid &&
+ 			micronux_native_runtime_policy_valid(dsi) ?
+ 			"running" : "stalled",
+ 			READ_ONCE(dsi->display_state) ==
+ 				MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED ?
+ 			"RUNTIME_REVEALED" : "not-revealed",
++			sar_before, sar_after,
++			READ_ONCE(dsi->native_reload_qualified_wraps),
++			READ_ONCE(dsi->native_refresh_progress_samples),
+ 			before, after, error, underruns, !!channel_enable,
+ 			faults, host_error0, host_error1,
+ 			READ_ONCE(dsi->backlight_gate_enabled) ? "on" : "off",
+@@ -3455,10 +3558,13 @@ static ssize_t diagnostics_show(struct device *dev,
+ 				DSI_BRG_DPI_RSV_DATA_MASK;
+ 		bridge_misc = readl(dsi->bridge + DSI_BRG_DPI_MISC_CONFIG);
+ 		return sysfs_emit(buf,
+-			"abi=3 state=%s frames=%u faults=%lx error=%08x host-errors=%08x:%08x underruns=%u buffers=3 front=%u queued=%d back=%u rearm=%u/%u flips=%u/%u generation=%u commit=%llu guards=%s guard-errors=%u policy=%s arm-to-irq-ns=%llu/%llu arm-to-irq-over20ms=%u rearm-ns=%llu/%llu fifo-irq=%u/%u/%u fifo-poll=%u/%u/%u bridge-filler=%08x bridge-misc=%08x i2c=active-serialized physical-panel-state=unobserved\n",
++			"abi=3 state=%s scanout-mode=continuous-fixed-front refresh-progress=sar sar=%08x qualified-wraps=%u progress-samples=%u frames=%u faults=%lx error=%08x host-errors=%08x:%08x underruns=%u buffers=3 front=%u queued=%d back=%u rearm=%u/%u flips=%u/%u generation=%u commit=%llu guards=%s guard-errors=%u policy=%s arm-to-irq-ns=%llu/%llu arm-to-irq-over20ms=%u rearm-ns=%llu/%llu fifo-irq=%u/%u/%u fifo-poll=%u/%u/%u bridge-filler=%08x bridge-misc=%08x i2c=active-serialized physical-panel-state=unobserved\n",
+ 			READ_ONCE(dsi->display_state) ==
+ 				MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED ?
+ 			"RUNTIME_REVEALED" : "not-revealed",
++			readl(dsi->channel + DW_GDMA_CH_SAR),
++			READ_ONCE(dsi->native_reload_qualified_wraps),
++			READ_ONCE(dsi->native_refresh_progress_samples),
+ 			READ_ONCE(dsi->scanout_frames),
+ 			READ_ONCE(dsi->fault_bits),
+ 			READ_ONCE(dsi->last_dma_error),
+@@ -5887,14 +5993,22 @@ static bool micronux_native_i2c_policy_valid(struct micronux_dsi *dsi)
+ 
+ static bool micronux_native_runtime_policy_valid(struct micronux_dsi *dsi)
+ {
+-	u32 clocks0, clocks1, common_sig_ena, common_st_ena, index, peri03;
+-	u32 reset, sar, sig_ena0, sig_ena1, st_ena0, st_ena1;
++	u32 channel, chen, clocks0, clocks1, common_sig_ena, common_st_ena;
++	u32 expected_cfg_lo, expected_intr, index, peri03, reset, sar;
++	u32 sig_ena0, sig_ena1, st_ena0, st_ena1;
++	bool continuous = READ_ONCE(dsi->native_continuous_fixed_front);
+ 	bool source_valid = false;
+ 
++	channel = BIT(dsi->handoff.dma_channel);
++	expected_cfg_lo = continuous ? MICRONUX_DMA_CHANNEL_RELOAD_CFG_LO :
++				       MICRONUX_DMA_CHANNEL_CFG_LO;
++	expected_intr = continuous ? DW_GDMA_INT_NATIVE_RELOAD_MASK :
++				     DW_GDMA_INT_NATIVE_SCANOUT_MASK;
+ 	reset = readl(dsi->hp_clkrst + HP_CLKRST_HP_RST_EN0);
+ 	clocks0 = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL0);
+ 	clocks1 = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL1);
+ 	peri03 = readl(dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL03);
++	chen = readl(dsi->gdma + DW_GDMA_CHEN);
+ 	sar = readl(dsi->channel + DW_GDMA_CH_SAR);
+ 	st_ena0 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS_ENA);
+ 	st_ena1 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS_ENA1);
+@@ -5905,6 +6019,8 @@ static bool micronux_native_runtime_policy_valid(struct micronux_dsi *dsi)
+ 	for (index = 0; index < MICRONUX_DISPLAY_BUFFER_COUNT; index++) {
+ 		u32 start = dsi->handoff.framebuffer_address[index];
+ 
++		if (continuous && index != READ_ONCE(dsi->front_index))
++			continue;
+ 		/* A completed one-shot can expose the exact end before ISR rearm. */
+ 		if (sar >= start && sar <= start + dsi->handoff.framebuffer_size)
+ 			source_valid = true;
+@@ -5968,18 +6084,28 @@ static bool micronux_native_runtime_policy_valid(struct micronux_dsi *dsi)
+ 	       readl(dsi->bridge + DSI_BRG_FIFO_EMPTY_THRESHOLD) ==
+ 		DSI_BRG_NATIVE_FIFO_THRESHOLD &&
+ 	       readl(dsi->gdma + DW_GDMA_CFG) == 3 &&
+-	       !(readl(dsi->gdma + DW_GDMA_CHEN) & GENMASK(3, 1)) &&
++	       !(chen & GENMASK(3, 1)) &&
++	       (!continuous || (chen & channel)) &&
+ 	       readl(dsi->channel + DW_GDMA_CH_CFG_LO) ==
+-		MICRONUX_DMA_CHANNEL_CFG_LO &&
++		expected_cfg_lo &&
+ 	       readl(dsi->channel + DW_GDMA_CH_CFG_HI) ==
+ 		MICRONUX_DMA_CHANNEL_CFG_HI &&
++	       (!continuous ||
++		(readl(dsi->channel + DW_GDMA_CH_DAR) ==
++		 dsi->handoff.dsi_fifo_address &&
++		 readl(dsi->channel + DW_GDMA_CH_BLOCK_TS) ==
++		 MICRONUX_DMA_BLOCK_TRANSFER_SIZE &&
++		 readl(dsi->channel + DW_GDMA_CH_CTL_LO) ==
++		 MICRONUX_DMA_DESCRIPTOR_CTRL_LO &&
++		 readl(dsi->channel + DW_GDMA_CH_CTL_HI) ==
++		 MICRONUX_NATIVE_DMA_RELOAD_CTRL_HI)) &&
+ 	       (st_ena0 & DW_GDMA_INT_STATUS0_DEFINED_MASK) ==
+-		(DW_GDMA_INT_NATIVE_SCANOUT_MASK |
++		(expected_intr |
+ 		 DW_GDMA_INT_STATUS0_RO_MASK) &&
+ 	       (st_ena1 & DW_GDMA_INT_STATUS1_DEFINED_MASK) ==
+ 		DW_GDMA_INT_ECC_ERROR_MASK &&
+ 	       (sig_ena0 & DW_GDMA_INT_STATUS0_DEFINED_MASK) ==
+-		(DW_GDMA_INT_NATIVE_SCANOUT_MASK |
++		(expected_intr |
+ 		 DW_GDMA_INT_STATUS0_RO_MASK) &&
+ 	       (sig_ena1 & DW_GDMA_INT_STATUS1_DEFINED_MASK) ==
+ 		DW_GDMA_INT_ECC_ERROR_MASK &&
+@@ -6378,6 +6504,163 @@ micronux_native_requalify_front(struct micronux_dsi *dsi, u64 target)
+ 	return 0;
+ }
+ 
++static int micronux_native_start_continuous_fixed_front(struct micronux_dsi *dsi)
++{
++	unsigned long flags;
++	u64 deadline;
++	u32 abort_mask, channel, chen, common, ctrl_hi, front_address;
++	u32 previous_sar, sar, sig_ena0, state, status0, status1, st_ena0;
++	u32 top, wraps = 0;
++	u8 front;
++
++	channel = BIT(dsi->handoff.dma_channel);
++	abort_mask = channel | (channel << 8);
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	if (dsi->queued_index >= 0 ||
++	    dsi->front_index != dsi->presented_index ||
++	    dsi->front_commit_sequence != dsi->presented_commit_sequence) {
++		spin_unlock_irqrestore(&dsi->state_lock, flags);
++		return -ESTALE;
++	}
++	front = dsi->front_index;
++	dsi->scanout_active = false;
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++
++	/* Drain a completion that observed the old one-shot mode, then stop it. */
++	synchronize_irq(dsi->irq);
++	writel(channel << 8, dsi->gdma + DW_GDMA_CHEN);
++	if (readl_poll_timeout_atomic(dsi->gdma + DW_GDMA_CHEN, state,
++				      !(state & channel), 1, 1000)) {
++		writel(abort_mask, dsi->gdma + DW_GDMA_CHABORT);
++		if (readl_poll_timeout_atomic(dsi->gdma + DW_GDMA_CHABORT,
++					      state, !(state & abort_mask),
++					      1, 1000) ||
++		    (readl(dsi->gdma + DW_GDMA_CHEN) & channel))
++			return -ETIMEDOUT;
++	}
++	/* Drain a completion raised between the first drain and confirmed stop. */
++	synchronize_irq(dsi->irq);
++	writel(~0U, dsi->channel + DW_GDMA_CH_INT_CLEAR);
++	writel(~0U, dsi->channel + DW_GDMA_CH_INT_CLEAR1);
++	writel(DW_GDMA_INT_COMMON_VALID_MASK,
++	       dsi->gdma + DW_GDMA_INT_CLEAR);
++
++	front_address = dsi->handoff.framebuffer_address[front];
++	writel(front_address, dsi->channel + DW_GDMA_CH_SAR);
++	writel(dsi->handoff.dsi_fifo_address,
++	       dsi->channel + DW_GDMA_CH_DAR);
++	writel(MICRONUX_DMA_BLOCK_TRANSFER_SIZE,
++	       dsi->channel + DW_GDMA_CH_BLOCK_TS);
++	writel(MICRONUX_DMA_DESCRIPTOR_CTRL_LO,
++	       dsi->channel + DW_GDMA_CH_CTL_LO);
++	writel(MICRONUX_NATIVE_DMA_RELOAD_CTRL_HI,
++	       dsi->channel + DW_GDMA_CH_CTL_HI);
++	writel(MICRONUX_DMA_CHANNEL_RELOAD_CFG_LO,
++	       dsi->channel + DW_GDMA_CH_CFG_LO);
++	writel(MICRONUX_DMA_CHANNEL_CFG_HI,
++	       dsi->channel + DW_GDMA_CH_CFG_HI);
++	writel(DW_GDMA_INT_NATIVE_RELOAD_MASK |
++	       DW_GDMA_INT_STATUS0_RO_MASK,
++	       dsi->channel + DW_GDMA_CH_INT_STATUS_ENA);
++	writel(DW_GDMA_INT_NATIVE_RELOAD_MASK |
++	       DW_GDMA_INT_STATUS0_RO_MASK,
++	       dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA);
++	/* Validate the complete software-owned reload transaction before enable. */
++	wmb();
++	chen = readl(dsi->gdma + DW_GDMA_CHEN);
++	ctrl_hi = readl(dsi->channel + DW_GDMA_CH_CTL_HI);
++	st_ena0 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS_ENA);
++	sig_ena0 = readl(dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA);
++	status0 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS);
++	status1 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS1);
++	common = readl(dsi->gdma + DW_GDMA_INT_COMMON_STATUS);
++	top = readl(dsi->gdma + DW_GDMA_INT_STATUS);
++	if ((chen & channel) ||
++	    readl(dsi->channel + DW_GDMA_CH_SAR) != front_address ||
++	    readl(dsi->channel + DW_GDMA_CH_DAR) !=
++		dsi->handoff.dsi_fifo_address ||
++	    readl(dsi->channel + DW_GDMA_CH_BLOCK_TS) !=
++		MICRONUX_DMA_BLOCK_TRANSFER_SIZE ||
++	    readl(dsi->channel + DW_GDMA_CH_CTL_LO) !=
++		MICRONUX_DMA_DESCRIPTOR_CTRL_LO ||
++	    ctrl_hi != MICRONUX_NATIVE_DMA_RELOAD_CTRL_HI ||
++	    readl(dsi->channel + DW_GDMA_CH_CFG_LO) !=
++		MICRONUX_DMA_CHANNEL_RELOAD_CFG_LO ||
++	    readl(dsi->channel + DW_GDMA_CH_CFG_HI) !=
++		MICRONUX_DMA_CHANNEL_CFG_HI ||
++	    (st_ena0 & DW_GDMA_INT_STATUS0_DEFINED_MASK) !=
++		(DW_GDMA_INT_NATIVE_RELOAD_MASK |
++		 DW_GDMA_INT_STATUS0_RO_MASK) ||
++	    (sig_ena0 & DW_GDMA_INT_STATUS0_DEFINED_MASK) !=
++		(DW_GDMA_INT_NATIVE_RELOAD_MASK |
++		 DW_GDMA_INT_STATUS0_RO_MASK) ||
++	    (status0 & DW_GDMA_INT_NATIVE_RELOAD_MASK) ||
++	    (status1 & DW_GDMA_INT_ECC_ERROR_MASK) ||
++	    (common & DW_GDMA_INT_COMMON_VALID_MASK) ||
++	    (top & ~DW_GDMA_INT_TOP_ALLOWED))
++		return -EIO;
++
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	dsi->native_continuous_fixed_front = true;
++	dsi->scanout_active = true;
++	dsi->native_last_arm_ns = 0;
++	dsi->native_reload_qualified_wraps = 0;
++	dsi->native_refresh_progress_samples = 0;
++	dsi->native_last_progress_jiffies = 0;
++	dsi->render_index = front;
++	dsi->render_needs_sync = false;
++	dsi->render_dirty = false;
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++	micronux_set_render_mapping_locked(dsi);
++
++	/*
++	 * Block completion is deliberately disabled: DW_axi_dmac auto-reload
++	 * otherwise waits for software to clear the event before the next block.
++	 */
++	writel(channel | (channel << 8), dsi->gdma + DW_GDMA_CHEN);
++	if (!(readl(dsi->gdma + DW_GDMA_CHEN) & channel))
++		return -EIO;
++
++	/* Prove autonomous source wrap while the panel remains dark. */
++	previous_sar = readl(dsi->channel + DW_GDMA_CH_SAR);
++	deadline = ktime_get_mono_fast_ns() +
++		   (u64)MICRONUX_NATIVE_REVEAL_TIMEOUT_MS * NSEC_PER_MSEC;
++	while (ktime_get_mono_fast_ns() < deadline &&
++	       wraps < MICRONUX_SCANOUT_STABLE_FRAMES) {
++		usleep_range(20, 30);
++		sar = readl(dsi->channel + DW_GDMA_CH_SAR);
++		status0 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS);
++		status1 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS1);
++		common = readl(dsi->gdma + DW_GDMA_INT_COMMON_STATUS);
++		top = readl(dsi->gdma + DW_GDMA_INT_STATUS);
++		if (!(readl(dsi->gdma + DW_GDMA_CHEN) & channel) ||
++		    sar < front_address ||
++		    sar > front_address + dsi->handoff.framebuffer_size ||
++		    (status0 & DW_GDMA_INT_ERROR_MASK) ||
++		    (status1 & DW_GDMA_INT_ECC_ERROR_MASK) ||
++		    (common & DW_GDMA_INT_COMMON_VALID_MASK) ||
++		    (top & ~DW_GDMA_INT_TOP_ALLOWED))
++			return -EIO;
++		if (sar < previous_sar)
++			wraps++;
++		previous_sar = sar;
++	}
++	if (wraps < MICRONUX_SCANOUT_STABLE_FRAMES)
++		return -ETIMEDOUT;
++	if (!micronux_native_final_status_clean(dsi))
++		return -EIO;
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	dsi->native_reload_qualified_wraps = wraps;
++	dsi->native_last_progress_jiffies = jiffies;
++	dsi->watchdog_sar = previous_sar;
++	dsi->watchdog_stale_polls = 0;
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:SCANOUT mode=continuous-fixed-front state=QUALIFIED front=%u sar-wraps=%u cfg=00000005:0a020001 block-done=disabled cpu-rearm=disabled\n",
++		 front, wraps);
++	return 0;
++}
++
+ static bool micronux_cold_runtime_teardown(struct micronux_dsi *dsi)
+ {
+ 	u32 abort_mask, channel, common_sig_ena, common_st_ena, peri03, reset;
+-- 
+2.54.0.windows.1
+

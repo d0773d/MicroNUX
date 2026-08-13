@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@example.invalid>
 Date: Wed, 12 Aug 2026 00:00:00 -0700
-Subject: [PATCH 28/46] video: fbdev: disable per-frame DSI BTA
+Subject: [PATCH 28/47] video: fbdev: disable per-frame DSI BTA
 
 The JD9365 compatibility profile repeatedly fills both DSI host pixel
 payload FIFOs while the D-PHY data lanes are parked.  The host reports

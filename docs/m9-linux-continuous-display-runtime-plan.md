@@ -1,6 +1,6 @@
 # M9 Linux Continuous Display Runtime Plan
 
-Status: **ACTIVE - SEGMENTED RESTART FROM VERIFIED PATCH45 BASELINE**
+Status: **ACTIVE - PATCH47 FIXED-FRONT RELOAD BUILT, READY FOR FLASH TEST**
 Owner: Linux remains the sole runtime display owner
 Baseline: Patch45, M9 microSD slot 0 disabled, C6 SDIO slot 1 retained
 Last physical checkpoint: status page remained visible for 19 minutes, then two
@@ -20,25 +20,25 @@ rolled back immediately; fixes are not stacked onto a failed image.
 1. **Patch45 baseline - accepted.** CPU one-shot rearm remains active, M9
    microSD remains disabled, the status screen is stable, and two color-bar to
    status transitions passed.
-2. **Reload-plan preparation - in progress.** Construct and validate the exact
-   direct-register reload transaction after same-front qualification, but do
-   not write it to GDMA. The active scanout remains one-shot. Required evidence
-   is `CONTINUOUS-PREP state=VALIDATED active-scanout=one-shot
-   hardware-writes=0`, followed by the unchanged reveal and visual tests.
-3. **Continuous fixed-front enable - pending Segment 2.** Apply the already
-   validated plan while dark and repeat one immutable front autonomously. No
-   page flips are allowed.
-4. **Frame-boundary switching - pending Segment 3.** Add one controlled buffer
+2. **Patch46 reload-plan preparation - accepted.** The exact direct-register
+   transaction was validated without GDMA writes. Hardware reported
+   `CONTINUOUS-PREP state=VALIDATED active-scanout=one-shot
+   hardware-writes=0`, and the status page remained visible.
+3. **Patch47 continuous fixed-front enable - build validation complete.** The
+   validated plan is applied while dark, four autonomous SAR wraps are required
+   before reveal, block-done/CPU rearm are removed, and one immutable status
+   front repeats in hardware. Clean M9 and isolated M7/ABI-v2 regressions pass;
+   flashing and physical testing remain.
+4. **Frame-boundary switching - pending Patch47 optical acceptance.** Add one controlled buffer
    switch without weakening repeat-last-frame behavior.
-5. **Remove the CPU refresh dependency - pending Segment 4.** Retain the IRQ
-   only for errors and telemetry after autonomous refresh is proven.
-6. **Runtime workloads - pending Segment 5.** Add CPU, network, C6 SDIO, and
+5. **Runtime workloads - pending fixed-front acceptance.** Add CPU, network,
+   C6 SDIO, and
    storage load separately. M9 microSD remains disabled throughout this
    investigation.
 
-The preparation segment has an explicit non-goal: it must not alter GDMA,
-interrupt, rendering, backlight, panel, or page-flip behavior. Its plan is an
-in-memory validation object and one log line only.
+Patch47 has an explicit non-goal: it does not add runtime page flips or mutable
+front-buffer rendering. Those remain closed until fixed-front refresh passes
+the connected and autonomous optical gates.
 
 ## Historical Patch46-Patch50 experiment
 
@@ -124,7 +124,8 @@ hardware must continue scanning out the existing front buffer.
 
 ### Segment 1 - Continuous fixed-front refresh
 
-Status: **PRODUCT PATCH PASSES SOURCE, MODEL, COMPILE, AND STYLE GATES**
+Status: **PRODUCT PATCH PASSES SOURCE, MODEL, COMPILE, M9/M7 BUILD, AND
+NO-FLASH GATES**
 
 Goal: make GDMA continuously repeat one prevalidated front buffer without a
 per-frame CPU rearm. No page flip is permitted in this segment.
@@ -225,7 +226,56 @@ Verification:
 
 Rollback: restore the Patch45 one-shot implementation and its known telemetry.
 
-Frozen implementation evidence:
+Current incremental Patch47 evidence:
+
+- isolated repository: `.tmp-m9-segment3-fixed-front`;
+- commit: `2130ef8a261a3a3518df8955c04b82446cab732f`;
+- product patch:
+  `buildroot-external/board/micronux/patches-peripherals/linux/0047-video-fbdev-start-native-fixed-front-hardware-reload.patch`;
+- product patch SHA-256:
+  `933fb7ee65fb78e8a53593fee5546724773a608b8dc52cf9b33133d22a433dcc`;
+- postimage source SHA-256:
+  `857199c3dd121df000981366c11b364605edb3f0c8ca5360a2211f2a5335953f`;
+- standalone RISC-V object SHA-256:
+  `12e829ec1a1855c4de86614968b88e67a6542b7aa885d47e1b7bbfafd802ab37`;
+- strict Linux checkpatch passes with zero errors, warnings, or checks;
+- direct and fuzz-zero reconstructed postimages are byte-identical and compile
+  to the same object;
+- patch-series checker passes platform 8, peripherals 47, isolation 10,
+  total 65, manifest
+  `b0e70897d82ba8dc67232c44fa59e1065c6f4dbeda0b0f74d06902f2d963a4f9`;
+- the display contract model passes 1,216 tests with
+  `rearm=hardware-reload frame-irq=errors-only`;
+- the synthetic telemetry parser passes 49 cases using SAR/progress samples;
+- clean M9 build and Windows no-flash verification pass with source contract
+  `ddf3a022b5f6b344a2776ac3ab8a02f759fb7081a0e412aa95870842cf52e010`;
+- the packaged M9 Image is 6,164,592 bytes with SHA-256
+  `ef591e8e0a6597c0b0389e50019756684977bddd0b7edfc367685a0ec305d488`,
+  and all seven entries in `out/m9/SHA256SUMS` rehash exactly;
+- the built M9 driver source/object match the frozen evidence at
+  `857199c3dd121df000981366c11b364605edb3f0c8ca5360a2211f2a5335953f`
+  and
+  `12e829ec1a1855c4de86614968b88e67a6542b7aa885d47e1b7bbfafd802ab37`;
+- the pinned ESP-IDF v6.0.1 loader verifier passes with a 233,952-byte loader,
+  SHA-256
+  `8b566ef86a46fd36fe970e3ca120b24c0b44a1677bb625bc9d5a63413cb3f7bc`,
+  and explicitly reports that nothing was flashed;
+- accepted M9 build stdout/stderr SHA-256 values are
+  `5e0749d2ccda5f1f3136a36eb337fa66eb63240c5b5c2e37d2ab73d21d05fd7e`
+  and
+  `56e0c3802f1c68113547697b8f6b02ee7f02269206db7aedfb3b52dedcf3464f`;
+- a clean M7 build in a new work directory passes its ABI-v2 gates and
+  14-file bFLT W^X audit with source contract
+  `8c8bab429c0534c8065d2e9a178f563050c43768e0e86b213b65ab0747282eb2`;
+- the M7 build produced the same frozen driver source/object hashes as M9,
+  all 18 entries in `out/m7/SHA256SUMS` rehash exactly, and its retained
+  stdout/stderr SHA-256 values are
+  `878b56cc94ba9630cbcba36fcc1e9db473e9043690b2408db2e8d70ca34a766a`
+  and
+  `c775fd331d13ccbaf1621fd123d3d1fd58ea78ca0a7bfd1d660e1ce54110add8`;
+- flash/readback, runtime, and optical evidence remain pending.
+
+Historical all-at-once prototype evidence (not the Patch47 product base):
 
 - repository: `.tmp-m9-patch46-continuous-reload`;
 - commit: `6a6422c56c5f28254cb0d905dd16a2ac31c96c06`;

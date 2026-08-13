@@ -38,6 +38,11 @@ FAILURE_MARKERS = (
 SHELL_PROMPT_RE = re.compile(r"(?:^|\r?\n)(?:/ # |micronux# )$")
 SCANOUT_LINE_RE = re.compile(
     r"^running abi=3 state=RUNTIME_REVEALED "
+    r"scanout-mode=continuous-fixed-front refresh-progress=sar "
+    r"sar=(?P<sar_before>[0-9a-fA-F]{8})->"
+    r"(?P<sar_after>[0-9a-fA-F]{8}) "
+    r"qualified-wraps=(?P<qualified_wraps>\d+) "
+    r"progress-samples=(?P<progress_samples>\d+) "
     r"frames=(?P<before>\d+)->(?P<after>\d+) "
     r"error=(?P<error>[0-9a-fA-F]{8}) underruns=(?P<underruns>\d+) "
     r"chen=(?P<chen>[01]) faults=(?P<faults>[0-9a-fA-F]+) "
@@ -65,6 +70,10 @@ SCANOUT_LINE_RE = re.compile(
 )
 DIAGNOSTICS_LINE_RE = re.compile(
     r"^abi=3 state=RUNTIME_REVEALED "
+    r"scanout-mode=continuous-fixed-front refresh-progress=sar "
+    r"sar=(?P<sar>[0-9a-fA-F]{8}) "
+    r"qualified-wraps=(?P<qualified_wraps>\d+) "
+    r"progress-samples=(?P<progress_samples>\d+) "
     r"frames=(?P<frames>\d+) "
     r"faults=(?P<faults>[0-9a-fA-F]+) "
     r"error=(?P<error>[0-9a-fA-F]{8}) "
@@ -91,7 +100,8 @@ DIAGNOSTICS_LINE_RE = re.compile(
 )
 OWNERSHIP_LINE_RE = re.compile(
     r"^linux abi=3 mode=native-cold-init fb0 buffers=3 dma-channel=0 "
-    r"frame-irq=(?P<irq>\d+) rearm=explicit mmap=denied "
+    r"frame-irq=none gdma-error-irq=(?P<irq>\d+) "
+    r"scanout-mode=continuous-fixed-front rearm=hardware-reload mmap=denied "
     r"i2c=active-serialized\r?$",
     re.MULTILINE,
 )
@@ -110,7 +120,8 @@ DISCONNECT_UPTIME_RE = re.compile(
     r"BOUNDARY-POSTHASH|AFTER-PREHASH):UPTIME "
     r"(?P<uptime>[0-9]+(?:\.[0-9]+)?) "
     r"[0-9]+(?:\.[0-9]+)?\r?\n"
-    r"(?=abi=3 state=RUNTIME_REVEALED frames=)",
+    r"(?=abi=3 state=RUNTIME_REVEALED "
+    r"scanout-mode=continuous-fixed-front )",
     re.MULTILINE,
 )
 DIAGNOSTICS_PHASE_RE = re.compile(
@@ -514,8 +525,8 @@ def scanout_contract_problem(
     if len(samples) < minimum:
         return f"scanout-contract-count-{len(samples)}-expected-{minimum}"
     for index, values in enumerate(samples):
-        if values["after"] <= values["before"]:
-            return "scanout-frame-stalled"
+        if values["sar_after"] == values["sar_before"]:
+            return "scanout-sar-stalled"
         if (
             values["error"]
             or values["underruns"]
@@ -528,6 +539,8 @@ def scanout_contract_problem(
             return "scanout-health-nonzero"
         if values["buffers"] != 3:
             return "scanout-buffer-count"
+        if values["qualified_wraps"] < 4 or values["progress_samples"] < 1:
+            return "scanout-reload-progress"
         front = values["front"]
         queued = values["queued"]
         back = values["back"]
@@ -560,6 +573,7 @@ def scanout_contract_problem(
             for counter in (
                 "before",
                 "after",
+                "progress_samples",
                 "rearms",
                 "flip_requests",
                 "flip_completions",
@@ -580,7 +594,8 @@ def scanout_contract_problem(
         return "scanout-flip-not-observed"
     if require_progress and (
         len(samples) < 2
-        or samples[-1]["after"] <= samples[0]["after"]
+        or samples[-1]["progress_samples"]
+        <= samples[0]["progress_samples"]
     ):
         return "scanout-progress-not-observed"
     return None
@@ -594,6 +609,8 @@ def scanout_samples(output: str) -> list[dict[str, int]]:
         "host1",
         "bridge_filler",
         "bridge_misc",
+        "sar_before",
+        "sar_after",
     }
     return [
         {
@@ -612,6 +629,7 @@ def diagnostics_samples(output: str) -> list[dict[str, int]]:
         "host1",
         "bridge_filler",
         "bridge_misc",
+        "sar",
     }
     return [
         {
@@ -716,6 +734,8 @@ def diagnostics_contract_problem(
             return "diagnostics-queued-role"
         if values["frames"] < 1 or values["generation"] < 1:
             return "diagnostics-progress-counter"
+        if values["qualified_wraps"] < 4 or values["progress_samples"] < 1:
+            return "diagnostics-reload-progress"
         if values["rearms"] < 1 or values["commit"] < 1:
             return "diagnostics-runtime-counter"
         if values["arm_to_irq_over20ms"]:
@@ -734,6 +754,7 @@ def diagnostics_contract_problem(
             previous = samples[index - 1]
             for counter in (
                 "frames",
+                "progress_samples",
                 "rearms",
                 "flip_requests",
                 "flip_completions",
@@ -754,7 +775,8 @@ def diagnostics_contract_problem(
         return "diagnostics-flip-not-observed"
     if require_progress and (
         len(samples) < 2
-        or samples[-1]["frames"] <= samples[0]["frames"]
+        or samples[-1]["progress_samples"]
+        <= samples[0]["progress_samples"]
     ):
         return "diagnostics-progress-not-observed"
     return None
@@ -823,7 +845,10 @@ def disconnect_progress_rate(
         )
 
     elapsed = end_uptimes[0] - start_uptimes[0]
-    progress_delta = end_groups[0][0]["frames"] - start_groups[0][0]["frames"]
+    progress_delta = (
+        end_groups[0][0]["progress_samples"]
+        - start_groups[0][0]["progress_samples"]
+    )
     if elapsed <= 0:
         return f"{start_phase.lower()}-{end_phase.lower()}-uptime-order", None
     if progress_delta <= 0:
@@ -940,6 +965,8 @@ def boot_contract_problem(boot_log: str) -> str | None:
         "MICRONUX:M9.2:COLD-INIT state=SCANOUT_QUALIFIED_QUIESCENT",
         "MICRONUX:M9.2:REVEAL state=REVEALING trigger=boot_ready",
         "MICRONUX:M9.2:REVEAL state=QUALIFIED source=userspace-status",
+        "MICRONUX:M9.2:SCANOUT mode=continuous-fixed-front "
+        "state=QUALIFIED",
         "MICRONUX:M9.2:REVEAL stage=control state=ACKED command=0x17 pwm=0",
         "MICRONUX:M9.2:REVEAL state=RUNTIME_REVEALED boot-ready=1",
         "MICRONUX:M7:FB-CONSOLE state=ready tty=tty1 role=status "
@@ -961,7 +988,8 @@ def boot_contract_problem(boot_log: str) -> str | None:
         "firmware=validated records=204 dcs-packets=205",
         "ctrl-hi=c0108840 host=video frame-bta=enabled lp=all "
         "lpclk=00000003",
-        "frames=4 same-front=yes control-command=0x17-acked "
+        "frames=4 same-front=yes scanout-mode=continuous-fixed-front "
+        "cpu-rearm=disabled control-command=0x17-acked "
         "pwm-command=63-acked brightness=63 backlight=registered "
         "i2c=active-serialized",
         "physical-panel-state=unobserved",
@@ -1182,7 +1210,7 @@ def run_preflight(device: serial.Serial, boot_log: str) -> int:
     print(
         "MICRONUX:M9:PREFLIGHT:PASS "
         "touch=ready-or-unavailable shell=responsive console=restored "
-        "abi=3 mode=native-cold-init buffers=3 scanout=one-shot-explicit-rearm "
+        "abi=3 mode=native-cold-init buffers=3 scanout=continuous-fixed-front "
         "rearm-failures=0 signal=restored underruns=0 host-errors=0 "
         "frame-ack=enabled clock=auto lp=enabled backlight-gate=enabled "
         "vpg=unavailable "
@@ -1268,7 +1296,7 @@ def run_touch(device: serial.Serial, point_timeout_ms: int) -> int:
     print(
         "MICRONUX:M9:TOUCH-GATE:PASS "
         "points=5 touch=ready console=restored abi=3 "
-        "state=RUNTIME_REVEALED buffers=3 scanout=one-shot-explicit-rearm "
+        "state=RUNTIME_REVEALED buffers=3 scanout=continuous-fixed-front "
         "frame-ack=enabled faults=0 underruns=0 host-errors=0 "
         "brightness=63 brightness-source=cached-last-acked-write "
         "physical-panel-state=unobserved visual=required"
@@ -1367,7 +1395,7 @@ def run_soak(device: serial.Serial, soak_seconds: int, sample_seconds: int) -> i
         "MICRONUX:M9:SOAK:PASS "
         f"seconds={soak_seconds} samples={sample_count} "
         "shell=responsive framebuffer=stable touch=ready-or-unavailable "
-        "abi=3 state=RUNTIME_REVEALED buffers=3 scanout=one-shot-explicit-rearm "
+        "abi=3 state=RUNTIME_REVEALED buffers=3 scanout=continuous-fixed-front "
         "faults=0 underruns=0 host-errors=0 guards=ok "
         "frame-ack=enabled clock=auto lp=enabled backlight-gate=enabled "
         "brightness=63 brightness-source=cached-last-acked-write "
@@ -1557,7 +1585,7 @@ def run_stress(device: serial.Serial, stress_cycles: int) -> int:
         f"memfree_kib={before_free}->{after_free} "
         f"memavailable_kib={before_available}->{after_available} "
         "abi=3 state=RUNTIME_REVEALED touch=ready-or-unavailable "
-        "buffers=3 scanout=one-shot-explicit-rearm "
+        "buffers=3 scanout=continuous-fixed-front "
         "faults=0 underruns=0 host-errors=0 guards=ok "
         "frame-ack=enabled clock=auto lp=enabled "
         "brightness=63 brightness-source=cached-last-acked-write "
@@ -1950,7 +1978,7 @@ def run_disconnect(
         f"disconnected_seconds={disconnect_seconds} linux=retained "
         "shell=responsive framebuffer=stable abi=3 "
         "state=RUNTIME_REVEALED touch=ready-or-unavailable "
-        "buffers=3 scanout=one-shot-explicit-rearm "
+        "buffers=3 scanout=continuous-fixed-front "
         "faults=0 dma-errors=0 underruns=0 host-errors=0 guards=ok "
         "frame-ack=enabled clock=auto lp=enabled backlight-gate=enabled "
         "brightness=63 brightness-source=cached-last-acked-write "
@@ -2067,7 +2095,7 @@ def run_snapshot(
     print(
         "MICRONUX:M9:SNAPSHOT:CAPTURED "
         "reset=not-requested source=framebuffer abi=3 "
-        "state=RUNTIME_REVEALED buffers=3 scanout=one-shot-explicit-rearm "
+        "state=RUNTIME_REVEALED buffers=3 scanout=continuous-fixed-front "
         "framebuffer=stable faults=0 dma-errors=0 underruns=0 "
         "host-errors=0 guards=ok frame-ack=enabled clock=auto lp=enabled "
         "brightness=63 brightness-source=cached-last-acked-write "

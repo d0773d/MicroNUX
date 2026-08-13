@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@example.invalid>
 Date: Wed, 12 Aug 2026 00:00:00 -0700
-Subject: [PATCH 29/46] video: fbdev: request HS in auto clock mode
+Subject: [PATCH 29/47] video: fbdev: request HS in auto clock mode
 
 ESP-IDF and the upstream DesignWare MIPI DSI driver both keep
 PHY_TXREQUESTCLKHS asserted when automatic clock-lane control is enabled.

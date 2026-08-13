@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@example.invalid>
 Date: Mon, 10 Aug 2026 14:30:00 -0700
-Subject: [PATCH 17/46] video: fbdev: expose polled Kit C GT9271 input
+Subject: [PATCH 17/47] video: fbdev: expose polled Kit C GT9271 input
 
 The Waveshare Kit C routes its GT9271 over the same retained ESP32-P4 I2C
 controller used by the panel backlight, but the platform leaves touch reset

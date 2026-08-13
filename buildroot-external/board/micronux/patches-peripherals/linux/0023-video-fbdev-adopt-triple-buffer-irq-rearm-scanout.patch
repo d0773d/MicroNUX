@@ -1,7 +1,7 @@
 From 871d5d146acb535990eaef52a5347a5b08997ff6 Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@example.invalid>
 Date: Tue, 11 Aug 2026 12:22:35 -0700
-Subject: [PATCH 23/46] video: fbdev: adopt triple-buffer IRQ-rearm scanout
+Subject: [PATCH 23/47] video: fbdev: adopt triple-buffer IRQ-rearm scanout
 
 Replace the inherited circular auto-reload contract with ABI v2, three
 protected RGB565 framebuffers, and one marked-last descriptor per buffer.

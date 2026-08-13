@@ -1,7 +1,7 @@
 From 09ef52f275cd53144dd820a526ced0b2c14e7ccf Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@example.invalid>
 Date: Wed, 12 Aug 2026 00:00:00 -0700
-Subject: [PATCH 30/46] video: fbdev: add ABI-v3 native cold probe
+Subject: [PATCH 30/47] video: fbdev: add ABI-v3 native cold probe
 
 Select the display handoff ABI strictly from the device tree. Keep the
 existing ABI-v2 loader-adoption path for M7, while M9 accepts only the

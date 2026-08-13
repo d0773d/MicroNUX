@@ -1,7 +1,7 @@
 From 32df3ba16167162125fa41cf4f3476e3e801f361 Mon Sep 17 00:00:00 2001
 From: d0773d <dottedquad@gmail.com>
 Date: Wed, 12 Aug 2026 10:12:59 -0700
-Subject: [PATCH 42/46] video: fbdev: start telemetry at native reveal
+Subject: [PATCH 42/47] video: fbdev: start telemetry at native reveal
 
 Cold publication resets telemetry before userspace renders the status
 page, so framebuffer updates before the panel may illuminate can leave

@@ -1,7 +1,7 @@
 From 07ad4eaede716bedf1951d7863f074e1ac2f0cec Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@local>
 Date: Wed, 12 Aug 2026 19:30:22 -0700
-Subject: [PATCH 46/46] video: fbdev: validate native continuous reload plan
+Subject: [PATCH 46/47] video: fbdev: validate native continuous reload plan
 
 Prepare the exact fixed-front reload register values after the existing
 same-front qualification, but do not write them to GDMA. Keep the accepted

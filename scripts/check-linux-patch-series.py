@@ -14,7 +14,7 @@ BOARD = ROOT / "buildroot-external" / "board" / "micronux"
 CONFIGS = ROOT / "buildroot-external" / "configs"
 SERIES = (
     ("patches-platform", 8),
-    ("patches-peripherals", 46),
+    ("patches-peripherals", 47),
     ("patches-isolation", 10),
 )
 ISOLATION_CONFIGS = {

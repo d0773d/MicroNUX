@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@example.invalid>
 Date: Sun, 9 Aug 2026 00:00:00 -0700
-Subject: [PATCH 16/46] video: fbdev: add ESP32-P4 MicroNUX DSI handoff
+Subject: [PATCH 16/47] video: fbdev: add ESP32-P4 MicroNUX DSI handoff
 
 Claim the loader-initialized Kit C panel through a versioned, bounded
 handoff. Validate the DMA descriptor ring, retain DPI mode across the

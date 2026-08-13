@@ -1,7 +1,7 @@
 From 8d7e30e478eb7f4a76b5d9cf9f58cb10831c20ee Mon Sep 17 00:00:00 2001
 From: MicroNUX contributors <micronux@users.noreply.github.com>
 Date: Sat, 8 Aug 2026 23:58:00 -0700
-Subject: [PATCH 13/46] mmc: dw: run ESP32-P4 completions in process context
+Subject: [PATCH 13/47] mmc: dw: run ESP32-P4 completions in process context
 
 The ESP32-P4 integration polls command and data status synchronously because
 the external interrupt route is not yet reliable.  Running the completion

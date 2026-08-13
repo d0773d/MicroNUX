@@ -1742,7 +1742,10 @@ def test_hardware_parser() -> int:
     ) -> str:
         return (
             "running abi=3 state=RUNTIME_REVEALED "
-            f"frames={before}->{after} error=00000000 underruns=0 "
+            "scanout-mode=continuous-fixed-front refresh-progress=sar "
+            "sar=49300100->49300200 qualified-wraps=4 "
+            f"progress-samples={after} frames=8->8 "
+            "error=00000000 underruns=0 "
             "chen=1 faults=0 host-errors=00000000:00000000 frame-ack=on "
             "clock=auto lp=enabled backlight-gate=on buffers=3 "
             f"front={front} queued={queued} back={back} rearm={rearms}/0 "
@@ -1762,7 +1765,9 @@ def test_hardware_parser() -> int:
     ) -> str:
         return (
             "abi=3 state=RUNTIME_REVEALED "
-            f"frames={frames} faults=0 "
+            "scanout-mode=continuous-fixed-front refresh-progress=sar "
+            f"sar=49300200 qualified-wraps=4 progress-samples={frames} "
+            "frames=8 faults=0 "
             "error=00000000 host-errors=00000000:00000000 underruns=0 "
             f"buffers=3 front={front} queued={queued} back={back} "
             f"rearm={rearms}/0 flips={flip_requests}/{flip_completions} "
@@ -1863,7 +1868,7 @@ def test_hardware_parser() -> int:
     )
     check(
         scanout_problem(progress_regression, minimum=2)
-        == "scanout-before-regressed",
+        == "scanout-progress_samples-regressed",
         "hardware-scanout-progress-regression",
     )
     no_flip = scanout_first + scanout_line(
@@ -1922,7 +1927,7 @@ def test_hardware_parser() -> int:
     )
     check(
         diagnostics_problem(diagnostics_regression, minimum=2)
-        == "diagnostics-frames-regressed",
+        == "diagnostics-progress_samples-regressed",
         "hardware-diagnostics-regression",
     )
     check(
@@ -1935,7 +1940,9 @@ def test_hardware_parser() -> int:
 
     ownership = (
         "linux abi=3 mode=native-cold-init fb0 buffers=3 dma-channel=0 "
-        "frame-irq=18 rearm=explicit mmap=denied "
+        "frame-irq=none gdma-error-irq=18 "
+        "scanout-mode=continuous-fixed-front rearm=hardware-reload "
+        "mmap=denied "
         "i2c=active-serialized\n"
     )
     check(ownership_re.search(ownership) is not None, "hardware-ownership-valid")
@@ -2097,6 +2104,11 @@ def bind_to_sources() -> int:
         ROOT / "buildroot-external" / "board" / "micronux"
         / "patches-peripherals" / "linux"
         / "0046-video-fbdev-validate-native-continuous-reload-plan.patch"
+    )
+    fixed_reload_patch = (
+        ROOT / "buildroot-external" / "board" / "micronux"
+        / "patches-peripherals" / "linux"
+        / "0047-video-fbdev-start-native-fixed-front-hardware-reload.patch"
     )
     usb_console_patch = (
         ROOT / "buildroot-external" / "board" / "micronux"
@@ -2367,6 +2379,26 @@ def bind_to_sources() -> int:
             if line.startswith((" ", "+")) and not line.startswith("+++")
         ).split()
     )
+    fixed_reload_patch_text = fixed_reload_patch.read_text(encoding="utf-8")
+    fixed_reload_added_compact = " ".join(
+        "\n".join(
+            line[1:] for line in fixed_reload_patch_text.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        ).split()
+    )
+    fixed_reload_removed_compact = " ".join(
+        "\n".join(
+            line[1:] for line in fixed_reload_patch_text.splitlines()
+            if line.startswith("-") and not line.startswith("---")
+            and line != "-- "
+        ).split()
+    )
+    fixed_reload_postimage_compact = " ".join(
+        "\n".join(
+            line[1:] for line in fixed_reload_patch_text.splitlines()
+            if line.startswith((" ", "+")) and not line.startswith("+++")
+        ).split()
+    )
     usb_console_patch_text = usb_console_patch.read_text(encoding="utf-8")
     usb_console_added_compact = " ".join(
         "\n".join(
@@ -2415,6 +2447,7 @@ def bind_to_sources() -> int:
     bandwidth_tests = 0
     sd_isolation_tests = 0
     continuous_prep_tests = 0
+    fixed_reload_tests = 0
 
     def stage_e_check(condition: bool, reason: str) -> None:
         nonlocal stage_e_tests
@@ -2494,6 +2527,23 @@ def bind_to_sources() -> int:
             raise AssertionError(reason)
         continuous_prep_tests += 1
 
+    def fixed_reload_check(condition: bool, reason: str) -> None:
+        nonlocal fixed_reload_tests
+        if not condition:
+            raise AssertionError(reason)
+        fixed_reload_tests += 1
+
+    def fixed_reload_require_order(
+        text: str, tokens: tuple[str, ...], label: str
+    ) -> None:
+        position = -1
+        for token in tokens:
+            position = text.find(token, position + 1)
+            fixed_reload_check(
+                position >= 0,
+                f"fixed-reload-{label}-order:{token}",
+            )
+
     def native_feed_require_order(
         text: str, tokens: tuple[str, ...], label: str
     ) -> None:
@@ -2558,55 +2608,59 @@ def bind_to_sources() -> int:
     expected_source_hashes = (
         (
             reveal_patch,
-            "dc9f9902b5a787d052dfe61ea1ab418d30fadf2007df8ef1b40fae4cd913e068",
+            "88ee4f7760ddd93b75a6745ca380ebbdfdd13296caa245b8ac0bc017dc957694",
         ),
         (
             native_irq_patch,
-            "9e3a416bc6d724a99e8da81f88fd8b19cd922ff9e145c2e45476534970b28c45",
+            "71a97393ad664443dec4e375c5bcf7a133bedd8d881f1d1d15053525bd01cf1b",
         ),
         (
             native_diagnostic_patch,
-            "448c70f2078a548c068aaa98687e79926a14a355e1279a542ae759a7ad60054e",
+            "7097cf91d3647ad7ac64fe6c2d0a6658283d6265259f8a9f5f0bc2a4005d7870",
         ),
         (
             native_gdma_patch,
-            "ce5ac16d98e10e518dc8dc74c8d88ada4a4bb87ad010459e95d39b79380a68d9",
+            "a164057197f79ae8934116469bc2de6c2ea61d8db82b0adee8e47ea48623190a",
         ),
         (
             native_scanout_patch,
-            "ac27049f179f0e445095cf31ee8c37c7417c1a124c4c9f69dac9f9c7c072131f",
+            "3ea715d7c85d5243590708dc5bacb1aab587c8a48a41164a9cb3ec6a9b5d3cdf",
         ),
         (
             native_arm_patch,
-            "ebc2f0a8800bd133eb18e6be19d0b1dc3d1ebbcc347db81c2b91454d1fdab880",
+            "5596c305be86fd4977bec4d508255b0d78b00f0ee6832490560a9425d9f77456",
         ),
         (
             native_policy_patch,
-            "f0443bda132ff473f498d3cdac18f885f01f00e2d07e65a5e9eb899cbfed5c4f",
+            "86bbc07c2ab28319dbd6edcdcddf3310967338fc31864313f9402d3cadbfdbc6",
         ),
         (
             native_feed_patch,
-            "521c4c2eb8c37d51668850404d737010f66330bef1056ef106cfc4dd32bbdd8c",
+            "15ca984e1113b595b760a441c9d560f026d8fd7ee48f685d427b22e98a58194e",
         ),
         (
             visible_epoch_patch,
-            "0d9c78583de6b0dedf794e12c29f4606768b5bc0b10f811cfb8f877c3898654c",
+            "1959f4bb10d819ee45911fb695142fecd4b9f4c2c8b8ed3fe9f08d5979843efe",
         ),
         (
             fault_evidence_patch,
-            "57a993584b45628746bd6419ff52468567a32ed9fed1737083e79d325da78f54",
+            "cbf17456b2d5af6198adc1f7db86a53980da741485ca7aba77a7d11441f1f8e8",
         ),
         (
             bandwidth_patch,
-            "f2daf47a960a345097b88c0c7f5096f75bf174e926253c82f3f9a98d7a8deb98",
+            "a2dc81e6a07dee76e1905025af85d2a19ad00eed9c3b55a7f4ab26ab63f945b6",
         ),
         (
             sd_isolation_patch,
-            "88f7c7535573884b5980a896e63982ff31ef7db14ab319ea49fb6b6567ecfde9",
+            "0a6da514c06e1c8d2da951872a5fd8eaa35a4fc2e443772f201d0223ff0a1cd9",
         ),
         (
             continuous_prep_patch,
-            "f9305b344bd28f425c824affe3aa7e5ed42e6f8e3a1e48601c61ad691a920881",
+            "90b1c83eaab961c0798f1f71559fb4cd41afb77e6a916eca7b1d9137b143becf",
+        ),
+        (
+            fixed_reload_patch,
+            "933fb7ee65fb78e8a53593fee5546724773a608b8dc52cf9b33133d22a433dcc",
         ),
         (
             usb_console_patch,
@@ -2618,11 +2672,11 @@ def bind_to_sources() -> int:
         ),
         (
             hardware_test,
-            "194dfb8328011f152160fa68568589c7d39cbfedfddc3b2d4619d45ccc48219a",
+            "51d3043a281b9bb91b1d352f30d8afc81837862a4472f58150cee5bce850a840",
         ),
         (
             hardware_telemetry_test,
-            "f504f98dfbdd30c95449f8ac15930c4f9a844c2400f51631ec8b68bd80b199f5",
+            "181e9dd0b733245586711f3faa62819c70a6d237ad7e20c4d24ac79b26103a23",
         ),
     )
     for source, expected_hash in expected_source_hashes:
@@ -2912,7 +2966,7 @@ def bind_to_sources() -> int:
         raise AssertionError("scanout-patch-remove-state-order")
 
     stage_e_check(
-        "Subject: [PATCH 34/46] video: fbdev: reveal native DSI scanout safely"
+        "Subject: [PATCH 34/47] video: fbdev: reveal native DSI scanout safely"
         in reveal_patch_text,
         "reveal-patch-subject",
     )
@@ -2970,7 +3024,7 @@ def bind_to_sources() -> int:
         "native-irq-patch-path",
     )
     native_irq_check(
-        "Subject: [PATCH 35/46] video: fbdev: validate native CLIC hardware IRQ"
+        "Subject: [PATCH 35/47] video: fbdev: validate native CLIC hardware IRQ"
         in native_irq_patch_text,
         "native-irq-patch-subject",
     )
@@ -3013,7 +3067,7 @@ def bind_to_sources() -> int:
         "native-diagnostic-patch-path",
     )
     native_diagnostic_check(
-        "Subject: [PATCH 36/46] video: fbdev: diagnose native GDMA readback"
+        "Subject: [PATCH 36/47] video: fbdev: diagnose native GDMA readback"
         in native_diagnostic_patch_text,
         "native-diagnostic-patch-subject",
     )
@@ -3201,7 +3255,7 @@ def bind_to_sources() -> int:
         "native-gdma-patch-path",
     )
     native_gdma_check(
-        "Subject: [PATCH 37/46] video: fbdev: validate GDMA enable semantics"
+        "Subject: [PATCH 37/47] video: fbdev: validate GDMA enable semantics"
         in native_gdma_patch_text,
         "native-gdma-patch-subject",
     )
@@ -3389,7 +3443,7 @@ def bind_to_sources() -> int:
         "patch-commit",
     )
     native_scanout_check(
-        "Subject: [PATCH 38/46] video: fbdev: diagnose native scanout "
+        "Subject: [PATCH 38/47] video: fbdev: diagnose native scanout "
         "qualification" in native_scanout_patch_text,
         "patch-subject",
     )
@@ -3711,7 +3765,7 @@ def bind_to_sources() -> int:
         "patch-commit",
     )
     native_arm_check(
-        "Subject: [PATCH 39/46] video: fbdev: validate native DMA arm "
+        "Subject: [PATCH 39/47] video: fbdev: validate native DMA arm "
         "transaction" in native_arm_patch_text,
         "patch-subject",
     )
@@ -3736,8 +3790,8 @@ def bind_to_sources() -> int:
     )
     for stage_build in stage_builds:
         native_policy_check(
-            'NATIVE_DISPLAY_DRIVER_SHA256="b9a188dd12066b2c596b7223f593d734'
-            'e43aebc12e4639fb6a715e6c845bdabe"' in
+            'NATIVE_DISPLAY_DRIVER_SHA256="857199c3dd121df000981366c11b3646'
+            '05edb3f0c8ca5360a2211f2a5335953f"' in
             stage_build.read_text(encoding="utf-8"),
             f"post-source-sha256:{stage_build.name}",
         )
@@ -3963,7 +4017,7 @@ def bind_to_sources() -> int:
         "patch-commit",
     )
     native_policy_check(
-        "Subject: [PATCH 40/46] video: fbdev: stop gating scanout on inactive "
+        "Subject: [PATCH 40/47] video: fbdev: stop gating scanout on inactive "
         "DSI\n mirror" in native_policy_patch_text,
         "patch-subject",
     )
@@ -4116,7 +4170,7 @@ def bind_to_sources() -> int:
         "patch-commit",
     )
     native_feed_check(
-        "Subject: [PATCH 41/46] video: fbdev: keep native one-shot "
+        "Subject: [PATCH 41/47] video: fbdev: keep native one-shot "
         "scanout fed" in native_feed_patch_text,
         "patch-subject",
     )
@@ -4460,7 +4514,7 @@ def bind_to_sources() -> int:
     visible_epoch_check(
         "From 32df3ba16167162125fa41cf4f3476e3e801f361 "
         "Mon Sep 17 00:00:00 2001" in visible_epoch_patch_text and
-        "Subject: [PATCH 42/46] video: fbdev: start telemetry at native reveal"
+        "Subject: [PATCH 42/47] video: fbdev: start telemetry at native reveal"
         in visible_epoch_patch_text and
         "index 460454f..2089446 100644" in visible_epoch_patch_text and
         "1 file changed, 5 insertions(+)" in visible_epoch_patch_text,
@@ -4485,7 +4539,7 @@ def bind_to_sources() -> int:
     fault_evidence_check(
         "From eb2d875645cc695622712d1383cd0b53483cc6ed "
         "Mon Sep 17 00:00:00 2001" in fault_evidence_patch_text and
-        "Subject: [PATCH 43/46] video: fbdev: preserve native runtime fault "
+        "Subject: [PATCH 43/47] video: fbdev: preserve native runtime fault "
         "evidence" in fault_evidence_patch_text and
         "index 2089446..0070e7e 100644" in fault_evidence_patch_text,
         "fault-evidence-identity",
@@ -4519,7 +4573,7 @@ def bind_to_sources() -> int:
     bandwidth_check(
         "From 8b48cd8ca8616f405449b82089ea5ca371449a1c "
         "Mon Sep 17 00:00:00 2001" in bandwidth_patch_text and
-        "Subject: [PATCH 44/46] video: fbdev: derate native DSI for PSRAM "
+        "Subject: [PATCH 44/47] video: fbdev: derate native DSI for PSRAM "
         "bandwidth" in bandwidth_patch_text and
         "index 0070e7e..64b8dfa 100644" in bandwidth_patch_text,
         "bandwidth-patch-identity",
@@ -4568,8 +4622,8 @@ def bind_to_sources() -> int:
 
     for stage_build in stage_builds:
         bandwidth_check(
-            'NATIVE_DISPLAY_DRIVER_SHA256="b9a188dd12066b2c596b7223f593d734'
-            'e43aebc12e4639fb6a715e6c845bdabe"' in
+            'NATIVE_DISPLAY_DRIVER_SHA256="857199c3dd121df000981366c11b3646'
+            '05edb3f0c8ca5360a2211f2a5335953f"' in
             stage_build.read_text(encoding="utf-8"),
             f"post-bandwidth-source-sha256:{stage_build.name}",
         )
@@ -4584,7 +4638,7 @@ def bind_to_sources() -> int:
     sd_isolation_check(
         "From 836edacc6d2dc303638886b9a0e60abd1acc0ff6 "
         "Mon Sep 17 00:00:00 2001" in sd_isolation_patch_text and
-        "Subject: [PATCH 45/46] mmc: dw_mmc: allow an isolated ESP32-P4 "
+        "Subject: [PATCH 45/47] mmc: dw_mmc: allow an isolated ESP32-P4 "
         "slot" in sd_isolation_patch_text and
         "index e87a490..f68733f 100644" in sd_isolation_patch_text and
         "1 file changed, 6 insertions(+), 2 deletions(-)" in
@@ -4610,10 +4664,10 @@ def bind_to_sources() -> int:
 
     continuous_prep_check(
         hashlib.sha256(continuous_prep_patch.read_bytes()).hexdigest() ==
-        "f9305b344bd28f425c824affe3aa7e5ed42e6f8e3a1e48601c61ad691a920881" and
+        "90b1c83eaab961c0798f1f71559fb4cd41afb77e6a916eca7b1d9137b143becf" and
         "From 07ad4eaede716bedf1951d7863f074e1ac2f0cec" in
         continuous_prep_patch_text and
-        "Subject: [PATCH 46/46] video: fbdev: validate native continuous "
+        "Subject: [PATCH 46/47] video: fbdev: validate native continuous "
         "reload plan" in continuous_prep_patch_text and
         "1 file changed, 69 insertions(+)" in continuous_prep_patch_text,
         "continuous-prep-identity",
@@ -4655,12 +4709,98 @@ def bind_to_sources() -> int:
         continuous_prep_added_compact,
         "continuous-prep-one-shot-retained",
     )
+    fixed_reload_check(
+        "From 2130ef8a261a3a3518df8955c04b82446cab732f" in
+        fixed_reload_patch_text and
+        "Subject: [PATCH 47/47] video: fbdev: start native fixed-front "
+        "hardware reload" in fixed_reload_patch_text and
+        "index 0a92c56..f2e4afe 100644" in fixed_reload_patch_text and
+        "1 file changed, 298 insertions(+), 15 deletions(-)" in
+        fixed_reload_patch_text,
+        "fixed-reload-identity",
+    )
+    fixed_reload_check(
+        "drivers/video/fbdev/esp32p4-dsi.c" in fixed_reload_patch_text and
+        "drivers/mmc" not in fixed_reload_patch_text and
+        "arch/riscv" not in fixed_reload_patch_text,
+        "fixed-reload-driver-only",
+    )
+    for token in (
+        "#define DW_GDMA_INT_NATIVE_RELOAD_MASK",
+        "bool native_continuous_fixed_front",
+        "u32 native_reload_qualified_wraps",
+        "unsigned long native_last_progress_jiffies",
+        "micronux_native_start_continuous_fixed_front",
+        "scanout-mode=continuous-fixed-front cpu-rearm=disabled",
+        "scanout-mode=continuous-fixed-front rearm=hardware-reload",
+        "refresh-progress=sar",
+    ):
+        fixed_reload_check(
+            token in fixed_reload_added_compact,
+            f"fixed-reload-binding:{token}",
+        )
+    fixed_start = fixed_reload_postimage_compact.index(
+        "static int micronux_native_start_continuous_fixed_front(struct "
+        "micronux_dsi *dsi) {"
+    )
+    fixed_end = fixed_reload_postimage_compact.index(
+        "static bool micronux_cold_runtime_teardown", fixed_start
+    )
+    fixed_start_block = fixed_reload_postimage_compact[fixed_start:fixed_end]
+    fixed_reload_require_order(
+        fixed_start_block,
+        (
+            "dsi->queued_index >= 0",
+            "dsi->front_index != dsi->presented_index",
+            "dsi->scanout_active = false",
+            "synchronize_irq(dsi->irq)",
+            "writel(channel << 8, dsi->gdma + DW_GDMA_CHEN)",
+            "synchronize_irq(dsi->irq)",
+            "writel(front_address, dsi->channel + DW_GDMA_CH_SAR)",
+            "writel(dsi->handoff.dsi_fifo_address, dsi->channel + "
+            "DW_GDMA_CH_DAR)",
+            "writel(MICRONUX_DMA_BLOCK_TRANSFER_SIZE, dsi->channel + "
+            "DW_GDMA_CH_BLOCK_TS)",
+            "writel(MICRONUX_NATIVE_DMA_RELOAD_CTRL_HI, dsi->channel + "
+            "DW_GDMA_CH_CTL_HI)",
+            "writel(MICRONUX_DMA_CHANNEL_RELOAD_CFG_LO, dsi->channel + "
+            "DW_GDMA_CH_CFG_LO)",
+            "writel(DW_GDMA_INT_NATIVE_RELOAD_MASK | "
+            "DW_GDMA_INT_STATUS0_RO_MASK",
+            "wmb()",
+            "dsi->native_continuous_fixed_front = true",
+            "writel(channel | (channel << 8), dsi->gdma + DW_GDMA_CHEN)",
+            "wraps < MICRONUX_SCANOUT_STABLE_FRAMES",
+            "micronux_native_final_status_clean(dsi)",
+            "mode=continuous-fixed-front state=QUALIFIED",
+        ),
+        "dark-transition",
+    )
+    fixed_reload_check(
+        fixed_start_block.count("synchronize_irq(dsi->irq)") == 2 and
+        "DW_GDMA_INT_DMA_TFR_DONE" not in fixed_start_block,
+        "fixed-reload-no-completion-dependency",
+    )
+    fixed_reload_check(
+        "if (continuous) { if (dma_error) { schedule_work(&dsi->fault_work); "
+        "} else { WRITE_ONCE(dsi->last_dma_error, BIT(29)); "
+        "micronux_latch_fault(dsi, MICRONUX_FAULT_DMA); } "
+        "return IRQ_HANDLED; }" in fixed_reload_postimage_compact,
+        "fixed-reload-unexpected-irq-faults",
+    )
+    fixed_reload_check(
+        "WRITE_ONCE(dsi->render_enabled, false)" in
+        fixed_reload_added_compact and
+        "WRITE_ONCE(dsi->render_enabled, true)" in
+        fixed_reload_removed_compact,
+        "fixed-reload-front-frozen",
+    )
     for stage_build in stage_builds:
-        continuous_prep_check(
-            'NATIVE_DISPLAY_DRIVER_SHA256="b9a188dd12066b2c596b7223f593d734'
-            'e43aebc12e4639fb6a715e6c845bdabe"' in
+        fixed_reload_check(
+            'NATIVE_DISPLAY_DRIVER_SHA256="857199c3dd121df000981366c11b3646'
+            '05edb3f0c8ca5360a2211f2a5335953f"' in
             stage_build.read_text(encoding="utf-8"),
-            f"continuous-prep-source-sha256:{stage_build.name}",
+            f"fixed-reload-source-sha256:{stage_build.name}",
         )
 
     boot_reveal = source_block(
@@ -5243,8 +5383,11 @@ def bind_to_sources() -> int:
         'r"^running abi=3 state=RUNTIME_REVEALED "',
         'r"^abi=3 state=RUNTIME_REVEALED "',
         'r"frames=(?P<before>\\d+)->(?P<after>\\d+) "',
-        "frame-irq=(?P<irq>",
-        "rearm=explicit",
+        "frame-irq=none gdma-error-irq=(?P<irq>",
+        "scanout-mode=continuous-fixed-front rearm=hardware-reload",
+        "refresh-progress=sar",
+        "qualified-wraps=(?P<qualified_wraps>",
+        "progress-samples=(?P<progress_samples>",
         "frame-ack=on",
         "i2c=active-serialized",
         "physical-panel-state=unobserved",
@@ -5753,7 +5896,7 @@ def bind_to_sources() -> int:
         + native_gdma_tests + native_scanout_tests + native_arm_tests
         + native_policy_tests + native_feed_tests + visible_epoch_tests
         + fault_evidence_tests + bandwidth_tests
-        + sd_isolation_tests + continuous_prep_tests
+        + sd_isolation_tests + continuous_prep_tests + fixed_reload_tests
         + len(required_dts) * len(device_trees)
         + len(required_cold_patch) + len(required_cold_patch_layout)
         + len(required_ldo_patch) + len(required_panel_patch) + 1
@@ -5776,7 +5919,7 @@ def main() -> int:
         f"tests={tests} legacy_abi=2 cold_abi=3 cold_size=00c0 "
         "cold_flags=00003fff "
         "cold_page=1000 panel_payload_crc=cea07f9b kernel_end=49300000 "
-        "buffers=3 rearm=fast-one-shot frame-irq=completion "
+        "buffers=3 rearm=hardware-reload frame-irq=errors-only "
         "active-mirror=diagnostic-only policy-predicates=42 "
         "underflow-filler=black telemetry-epoch=reveal "
         "fault-evidence=preserved bandwidth-profile=60mhz-1000mbps "

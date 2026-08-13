@@ -1,7 +1,7 @@
 From 39e452858f8e9ba130bf9594b75836527833d3e4 Mon Sep 17 00:00:00 2001
 From: d0773d <dottedquad@gmail.com>
 Date: Wed, 12 Aug 2026 04:39:32 -0700
-Subject: [PATCH 37/46] video: fbdev: validate GDMA enable semantics
+Subject: [PATCH 37/47] video: fbdev: validate GDMA enable semantics
 
 ESP32-P4 rev 1.3 returns one for undefined bits in the DW-GDMA
 interrupt-enable registers. Compare every documented hw_ver1 field while
