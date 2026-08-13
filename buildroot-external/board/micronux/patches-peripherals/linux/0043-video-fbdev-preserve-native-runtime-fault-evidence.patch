@@ -1,0 +1,220 @@
+From eb2d875645cc695622712d1383cd0b53483cc6ed Mon Sep 17 00:00:00 2001
+From: d0773d <dottedquad@gmail.com>
+Date: Wed, 12 Aug 2026 10:29:32 -0700
+Subject: [PATCH 43/46] video: fbdev: preserve native runtime fault evidence
+
+Runtime containment destroys native sysfs objects and hardware state before
+reporting which health predicate failed. A late physical failure therefore
+collapses to a generic -EIO.
+
+Capture endpoint guard state, fault classes, sticky host state, live
+bridge/GDMA registers, and timing telemetry before off-first teardown.
+Containment policy and ordering remain unchanged.
+
+Signed-off-by: d0773d <dottedquad@gmail.com>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 125 +++++++++++++++++++++++++++++-
+ 1 file changed, 121 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 2089446..0070e7e 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -869,6 +869,13 @@ struct micronux_native_telemetry {
+ 	u32 fifo_poll_zero;
+ };
+ 
++struct micronux_runtime_fault_record {
++	struct micronux_scanout_snapshot snapshot;
++	struct micronux_native_telemetry telemetry;
++	enum micronux_display_state display_state;
++	unsigned long trigger_faults;
++};
++
+ static void
+ micronux_native_capture_telemetry_locked(struct micronux_dsi *dsi,
+ 					 struct micronux_native_telemetry *telemetry)
+@@ -892,6 +899,10 @@ micronux_capture_scanout_snapshot(struct micronux_dsi *dsi,
+ 				  struct micronux_scanout_snapshot *snapshot, u8 index,
+ 	u32 ignored_status1);
+ static void
++micronux_capture_runtime_fault_snapshot(struct micronux_dsi *dsi,
++					struct micronux_scanout_snapshot *snapshot,
++					u8 index);
++static void
+ micronux_log_scanout_failure(struct micronux_dsi *dsi,
+ 			     const char *reason, const char *detail,
+ 	int error, int window, int poll_error, u32 initial_generation,
+@@ -1435,6 +1446,14 @@ micronux_native_requalify_front(struct micronux_dsi *dsi, u64 target);
+ static void
+ micronux_native_reset_telemetry(struct micronux_dsi *dsi,
+ 				bool reset_last_arm);
++static void
++micronux_capture_runtime_fault(struct micronux_dsi *dsi,
++			       enum micronux_display_state state,
++			       unsigned long trigger_faults,
++			       struct micronux_runtime_fault_record *record);
++static void
++micronux_log_runtime_fault(struct micronux_dsi *dsi,
++			   const struct micronux_runtime_fault_record *record);
+ static bool micronux_native_final_status_clean(struct micronux_dsi *dsi);
+ static const struct attribute_group micronux_native_runtime_group;
+ static void micronux_native_unregister_runtime_objects(struct micronux_dsi *dsi);
+@@ -1443,7 +1462,9 @@ static void micronux_fault_work(struct work_struct *work)
+ {
+ 	struct micronux_dsi *dsi = container_of(work, struct micronux_dsi,
+ 						 fault_work);
++	struct micronux_runtime_fault_record record;
+ 	unsigned long faults;
++	bool captured = false;
+ 	int ret;
+ 
+ 	mutex_lock(&dsi->mode_lock);
+@@ -1453,6 +1474,13 @@ static void micronux_fault_work(struct work_struct *work)
+ 		enum micronux_display_state state =
+ 			READ_ONCE(dsi->display_state);
+ 
++		if (faults &&
++		    (state == MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT ||
++		     state == MICRONUX_DISPLAY_STATE_REVEALING ||
++		     state == MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED)) {
++			micronux_capture_runtime_fault(dsi, state, faults, &record);
++			captured = true;
++		}
+ 		if (faults && state ==
+ 		    MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT)
+ 			micronux_cold_runtime_fail_quiescent(dsi, "runtime-fault-dark", -EIO);
+@@ -1460,6 +1488,8 @@ static void micronux_fault_work(struct work_struct *work)
+ 			 (state == MICRONUX_DISPLAY_STATE_REVEALING ||
+ 			  state == MICRONUX_DISPLAY_STATE_RUNTIME_REVEALED))
+ 			micronux_native_fail_reveal_locked(dsi, "runtime-fault", -EIO, false);
++		if (captured)
++			micronux_log_runtime_fault(dsi, &record);
+ 		mutex_unlock(&dsi->mode_lock);
+ 		return;
+ 	}
+@@ -5935,9 +5965,10 @@ static bool micronux_native_runtime_policy_valid(struct micronux_dsi *dsi)
+ }
+ 
+ static void
+-micronux_capture_scanout_snapshot(struct micronux_dsi *dsi,
+-				  struct micronux_scanout_snapshot *snapshot, u8 index,
+-	u32 ignored_status1)
++__micronux_capture_scanout_snapshot(struct micronux_dsi *dsi,
++				    struct micronux_scanout_snapshot *snapshot,
++				    u8 index, u32 ignored_status1,
++				    bool full_guards)
+ {
+ 	if (index >= MICRONUX_DISPLAY_BUFFER_COUNT)
+ 		index = 0;
+@@ -5976,7 +6007,7 @@ micronux_capture_scanout_snapshot(struct micronux_dsi *dsi,
+ 	snapshot->last_dma_error = READ_ONCE(dsi->last_dma_error);
+ 	snapshot->rearm_attempts = READ_ONCE(dsi->rearm_attempts);
+ 	snapshot->rearm_failures = READ_ONCE(dsi->rearm_failures);
+-	snapshot->guards_valid = micronux_pool_guards_valid(dsi, true);
++	snapshot->guards_valid = micronux_pool_guards_valid(dsi, full_guards);
+ 	snapshot->host_mode = readl(dsi->host + DSI_HOST_MODE_CFG);
+ 	snapshot->host_vid = readl(dsi->host + DSI_HOST_VID_MODE_CFG);
+ 	snapshot->host_active =
+@@ -5986,6 +6017,23 @@ micronux_capture_scanout_snapshot(struct micronux_dsi *dsi,
+ 		micronux_native_runtime_policy_valid(dsi);
+ }
+ 
++static void
++micronux_capture_scanout_snapshot(struct micronux_dsi *dsi,
++				  struct micronux_scanout_snapshot *snapshot, u8 index,
++	u32 ignored_status1)
++{
++	__micronux_capture_scanout_snapshot(dsi, snapshot, index,
++					    ignored_status1, true);
++}
++
++static void
++micronux_capture_runtime_fault_snapshot(struct micronux_dsi *dsi,
++					struct micronux_scanout_snapshot *snapshot,
++					u8 index)
++{
++	__micronux_capture_scanout_snapshot(dsi, snapshot, index, 0, false);
++}
++
+ static void
+ micronux_log_scanout_failure(struct micronux_dsi *dsi,
+ 			     const char *reason, const char *detail,
+@@ -6016,6 +6064,75 @@ micronux_log_scanout_failure(struct micronux_dsi *dsi,
+ 		snapshot->descriptor_ctrl_hi);
+ }
+ 
++static void
++micronux_capture_runtime_fault(struct micronux_dsi *dsi,
++			       enum micronux_display_state state,
++			       unsigned long trigger_faults,
++			       struct micronux_runtime_fault_record *record)
++{
++	unsigned long flags;
++	u8 front;
++
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	front = dsi->front_index;
++	micronux_native_capture_telemetry_locked(dsi, &record->telemetry);
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++	micronux_capture_runtime_fault_snapshot(dsi, &record->snapshot, front);
++	record->display_state = state;
++	record->trigger_faults = trigger_faults;
++}
++
++static void
++micronux_log_runtime_fault(struct micronux_dsi *dsi,
++			   const struct micronux_runtime_fault_record *record)
++{
++	const struct micronux_native_telemetry *telemetry = &record->telemetry;
++	const struct micronux_scanout_snapshot *snapshot = &record->snapshot;
++	const char *state_name;
++
++	if (record->display_state ==
++	    MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT)
++		state_name = "SCANOUT_QUALIFIED_QUIESCENT";
++	else if (record->display_state == MICRONUX_DISPLAY_STATE_REVEALING)
++		state_name = "REVEALING";
++	else
++		state_name = "RUNTIME_REVEALED";
++
++	dev_err(dsi->dev,
++		"MICRONUX:M9.2:RUNTIME-FAULT state=CAPTURED display-state=%s trigger-faults=%lx faults=%lx classes=dma:%u,underrun:%u,stale:%u,host:%u,guard:%u,backlight:%u frames=%u generation=%u dma-error=%08x rearm=%u/%u guards=%u runtime-policy=%u arm-to-irq-ns=%llu/%llu over20ms=%u rearm-ns=%llu/%llu fifo-irq=%u/%u/%u fifo-poll=%u/%u/%u\n",
++		state_name, record->trigger_faults, snapshot->fault_bits,
++		test_bit(MICRONUX_FAULT_DMA, &snapshot->fault_bits),
++		test_bit(MICRONUX_FAULT_UNDERRUN, &snapshot->fault_bits),
++		test_bit(MICRONUX_FAULT_STALE_FRAME, &snapshot->fault_bits),
++		test_bit(MICRONUX_FAULT_DSI_HOST, &snapshot->fault_bits),
++		test_bit(MICRONUX_FAULT_POOL_GUARD, &snapshot->fault_bits),
++		test_bit(MICRONUX_FAULT_BACKLIGHT_CONTROL,
++			 &snapshot->fault_bits),
++		snapshot->frames, snapshot->generation, snapshot->last_dma_error,
++		snapshot->rearm_attempts, snapshot->rearm_failures,
++		snapshot->guards_valid, snapshot->runtime_policy_valid,
++		telemetry->arm_to_irq_last_ns, telemetry->arm_to_irq_max_ns,
++		telemetry->arm_to_irq_over_20ms, telemetry->rearm_last_ns,
++		telemetry->rearm_max_ns, telemetry->fifo_irq_last,
++		telemetry->fifo_irq_min, telemetry->fifo_irq_zero,
++		telemetry->fifo_poll_last, telemetry->fifo_poll_min,
++		telemetry->fifo_poll_zero);
++	dev_err(dsi->dev,
++		"MICRONUX:M9.2:RUNTIME-FAULT state=CAPTURED snapshot=host raw=%08x:%08x sticky=%08x:%08x seen=%u mode=%08x vid=%08x active=%08x lpclk=%08x bridge-raw=%08x bridge-filler=%08x bridge-misc=%08x underruns=%u gdma=%08x:%08x:%08x:%08x cfg=%08x chen=%08x cfglo=%08x cfghi=%08x llp=%08x sar=%08x ctrlhi=%08x\n",
++		snapshot->host_raw0, snapshot->host_raw1,
++		snapshot->host_sticky0, snapshot->host_sticky1,
++		snapshot->host_status_seen, snapshot->host_mode,
++		snapshot->host_vid, snapshot->host_active, snapshot->host_lpclk,
++		snapshot->bridge_raw, snapshot->bridge_filler,
++		snapshot->bridge_misc, snapshot->bridge_underruns,
++		snapshot->gdma_top, snapshot->gdma_status0,
++		snapshot->gdma_status1, snapshot->gdma_common,
++		snapshot->gdma_cfg, snapshot->gdma_chen,
++		snapshot->gdma_cfg_lo, snapshot->gdma_cfg_hi,
++		snapshot->gdma_llp, snapshot->gdma_sar,
++		snapshot->descriptor_ctrl_hi);
++}
++
+ static int micronux_native_start_scanout(struct micronux_dsi *dsi)
+ {
+ 	struct micronux_scanout_snapshot snapshot;
+-- 
+2.54.0.windows.1

@@ -1,7 +1,18 @@
 # M6 Storage and Peripheral Bring-up
 
 Status: **simultaneous microSD and ESP32-C6 networking stable; physical Kit C
-JD9365 loader scanout proven; Linux ownership completed in M7**
+JD9365 loader scanout proven; historical Linux ownership accepted in M7;
+the Patch-41 ABI-v3 runtime was physically rejected after the panel went black
+with its backlight enabled; Patch 44 passes static/model/build/no-flash gates
+and awaits exact flash/readback and long-run visual validation**
+
+The current Patch-44 display candidate changes only the ABI-v3 native profile
+to 60-MHz DPI and 1000 Mbps per DSI lane, retains the Patch-41 fast one-shot
+rearm and black underflow filler, and uses 200-MHz PSRAM/XIP with a 256-KiB
+L2/64-byte cache configuration. Its 7/44/10 manifest is
+`9571ba5f78edc65675ca066652df583a9b0842b41a3baa209820e9696123805d` and
+its 1126-case model passes. It remains unflashed; this is not physical
+acceptance of the display or a change to the accepted M6 storage/network path.
 
 M6 starts with the Waveshare board's onboard microSD interface. Storage can be
 isolated from the minimal USB console and from the ESP32-C6 wireless transport,
@@ -488,13 +499,125 @@ reservation `[0x48000000,0x48400000)`, which Linux excludes from ordinary
 allocation. M6-D0 remains the electrical and timing proof; it is not an
 emulator or an application-facing display path.
 
-M6-D1 and the minimal M6-D2 console gate are now complete in the isolated M7
-profile. The production loader leaves DPI/framebuffer mode selected, blanks the
-backlight, quiesces callback-driven scanout, and publishes a versioned
-descriptor-ring contract. Linux validates the contract, starts hardware reload
-as `/dev/fb0`, confirms the first frame through the routed GDMA interrupt, then
-restores and owns the 100x80 framebuffer console and backlight.
-The runtime hardware-pattern switch is intentionally disabled on P4 revision
-1.3 because returning from VPG can stall the external DPI stream. See
+M6-D1 and the minimal M6-D2 console gate were completed in the isolated M7
+profile. That accepted image used a versioned single-buffer descriptor-ring
+contract and hardware reload. Current M9.2 source instead publishes an ABI-v3
+dark/quiescent contract: Linux performs native I2C/LDO, JD9365, D-PHY, DSI,
+bridge, GDMA, interrupt, triple-buffer, and reveal initialization. Linux remains
+the intended owner of `/dev/fb0`, the 100x80 framebuffer console, touch, and the
+backlight. The patch-36 diagnostic candidate was flashed and read back exactly;
+its sealed boot log rejected the GDMA enable-register tuple, contained the
+display path, and continued in headless mode. Patch 37 replaced those full-word
+checks with documented-field comparisons and then passed exact flash/readback
+under `build/m9-readback/20260812T120632185Z-2993c451`. The sealed passive log
+`out/m9/hardware-runs/20260812T120919Z-snapshot-b5890811aa40-0611024a.log`
+(SHA-256
+`52ebc5ed26487e68419411f73cd263566e3fb8a47920e1b67f33f150d21d94b6`)
+reached GDMA `CONFIGURED`, then deterministically failed scanout qualification
+because the dark `SCANOUT_INITIALIZING` policy rejected its correctly released
+I2C state. Containment reached `FAILED_QUIESCENT` and retained the headless USB
+shell; `optical-state=unobserved` means this is not panel-output evidence.
+
+Patch 38 corrects only that released-I2C state predicate and adds read-only
+qualification diagnostics. Its exact patch/commit/post-source/object values
+are `8471fcb6b9ec9656b82dc44c29a790c9f70a1d306a16d4b8b34fe7f04f96f177`,
+`397b8bed56b6165251011f0109ded884d1bd0fe2`,
+`3aa68ea94d60385476fd3b5817f493cfeaeb38d915c4ee643bdda54d5273f65e`,
+and `55736ed8b0df502b9dc1c31440a596f7b5c81797bc4020b8d373cffa14f3f666`.
+It passed exact flash/readback under
+`build/m9-readback/20260812T125425532Z-95d60702`; `readback.json` has SHA-256
+`702ba99d9ca84bf25593301c300575a9706294dcae62f8db2ef982336e337a46`.
+The sealed passive snapshot
+`out/m9/hardware-runs/20260812T125714Z-snapshot-b5890811aa40-3670b4ef.log`
+has SHA-256
+`1c43ac04f307de252342fdc4cdc49d3aa6f18520be5cca254d4e7df294b677ac`.
+It reached GDMA `CONFIGURED`, then failed dark at
+`arm-readback/descriptor-channel-readback` with `cfg=3`, `chen=1`,
+`cfglo=0000000f`, `cfghi=0a020001`, `llp=1`, `sar=48031500`, and
+`ctrlhi=c0108840`; all captured fault status was zero. The engine had already
+fetched the head (`SAR=front+0x500`) and advanced live LLP to the terminal
+descriptor's `0 | memory-port` value `1`, so the post-enable head-LLP equality
+was a false rejection. Containment reached `FAILED_QUIESCENT`, kept the
+headless shell, and recorded `optical-state=unobserved`.
+
+Patch 39 moves all exact descriptor/configuration/head-LLP validation before
+CHEN and limits post-enable validation to channel-active plus error/status
+safety. Its patch/commit/post-source/object SHA-256 evidence is
+`d8c774f42019dddeba6020ec019b4fd61474dec3c2913c33b5c2ad191deabe94`,
+`99fcff145f84b22c8996e7cab8ce9a77abe472e7`,
+`68378f2ca532ec36020a3a99a57c2b8a909b694cb11d613764427acd76c7de0c`,
+and `b86cbf98fe2e2d2b894928049d9110cafedb290fbd1b2257285e06143997331a`.
+Strict checkpatch 0/0/0, fuzz-zero application, W=1 `-Werror`, and the
+independent semantic audit are clear. The historical 7/39/10 series had 56 patches,
+manifest
+`0f993160af2ce5bb03d791a3708065972764111a7da05a8b5272a03306a9db74`,
+and the frozen shared model passed 920 cases. The clean M7 ABI-v2 regression passed
+source contract
+`112e8a0afef2f14151a8fcc9e5f8c054e671370d47b8ae042d87a15e52b00ca4`
+and its 14-file bFLT W^X audit; retained log
+`out/build-logs/m7-patch39-final-rerun-20260812T063011.stdout.log` has SHA-256
+`4ccc716b3ca1d9c9de013eb59e852fd0d876d58cd4f222792fce89610242d382`.
+The fresh M9 full build passes source contract
+`e9c1e789fe87a5a7735c62785ff0113bca61c9d924e964c0a39ce30d69ab5fba`;
+retained stdout
+`build/patch39-m9-build/m9-full-final-20260812T062855.stdout.log` has SHA-256
+`66767316f4a0d528ca1ac036a2066b9ce0569ff597c542b035b91e2538ee6678`.
+The no-flash verifier passes with the 246,640-byte loader at
+`e314b558d923e8fa0175f9d4eb692ce5728eac3175053ca47c53775a0dbf9104`,
+reports `Nothing was flashed`, and retained stdout
+`build/patch39-m9-build/m9-noflash-final-20260812T063226.stdout.log` has SHA-256
+`773a31cdc8ae7223f3bea628a1cbd7f23e1d9e1be0dea62037e2dd6138010586`.
+The seven-artifact audit passed. Patch 39 subsequently passed exact
+flash/readback under `build/m9-readback/20260812T134841478Z-1a4e56fe`;
+`readback.json` has SHA-256
+`691fd9ac949de313a74c5591870bd3a95769baeae7f8c7be7d22dd429be61c09`.
+The sealed snapshot
+`out/m9/hardware-runs/20260812T135132Z-snapshot-b5890811aa40-2b712727.log`
+has SHA-256
+`9f4cb506b955c9e0b2fbfbbaf3927271de3eef40df7b0e1b0a67a3991d3228ac`.
+Linux reached `generation=4 frames=4 rearm=5/0 guards=1` with no host, bridge,
+GDMA, DMA, or software faults. Exact programmed `VID_MODE_CFG=0000ff02` was
+healthy; only the disabled optional shadow mirror remained `active=00000000`,
+so the old policy failed to `FAILED_QUIESCENT`. The log records
+`optical-state=unobserved`.
+
+Patch 40 removes only the three-line active-shadow composite and its two-line
+runtime equality (zero additions, five deletions), while retaining the active
+register and component diagnostics, exact `VID_MODE_CFG=0000ff02`, and all
+other 40 policy predicates. It changes no write, teardown, reveal, or ABI-v2
+behavior. Its patch/commit/post-source/object SHA-256 evidence is
+`04df043b79760379cc8f4d0d74847d892e3895bc1b55eba3b90af23695647ed1`,
+`0fac40ee31c1af165ea94a82a7b0d905d8da4861`,
+`13088b8fefe6cf8ca415615e2cf8e9e62a6f3d972d2f010c49965139924a5164`,
+and `845e536b031622f29cc8d1e157c1e284e453f8fde8d053a2dba20182368dcdd1`.
+The audit is clear; the current 7/40/10 checker passes all 57 patches with
+manifest `f9318e1a6e7480f1105ec5a435ad71d2754bb6d91a79bcc471747249128ed983`,
+and the model passes 963 cases. The clean isolated Patch-40 M7 ABI-v2 regression
+passes source contract
+`6b1d5d730c7370f364fed80c507f8ba8454c52b9ee247a22cde96a54233d8206`.
+Retained stdout
+`out/m7/build-logs/20260812T072708Z-patch40-clean.stdout.log` has SHA-256
+`9bddb74e3734cd977bd3b98a28cab29e75a626e6483219ccf88cca418fc47c05`.
+Its driver source/object gates match the Patch-40 hashes above, and its 14-file,
+128-byte-granule bFLT W^X audit passes. Exact Image, DTB, metadata, and rootfs
+SHA-256 values are
+`ca34bd104c670427bc7567991056eb9f423cd875290bd238050b384c71454f27`,
+`42e3ac2fadcbeda59a13ee3cfd4afb490607e13185b7db48b2c3ee1fd00a4fe6`,
+`a1f0c6047b453846831eca90ab6d6675a3933e369fa479d138c4331b97741728`,
+and `1721822da26deba72d2952af1d5bade5c9d8b7eeb8d6d6c4616a83c2ff8ba3ae`.
+Metadata CRC32 is `901bf054`, and the payload ends at `0x48a0cd08`. This was
+build-only: no COM access, reset, or flash occurred, and it is not new physical
+acceptance. The fresh M9 build passes source contract
+`4f21d0c9e47cc0c003ccbfe9db8c558e18fcf1cf82cceb1e50319661d6ce2686`;
+full-build and no-flash stdout hashes are
+`0c15ef3f2c0e40f531b77a12cdf1ec5731272005b2488d96789348bd2319cb6e`
+and `4b64a06e8d65391d5fab3182cdf864fb815a455fe06e6be91c0cf9724f7f3e6e`.
+The no-flash verifier reports `Nothing was flashed`, and the seven-artifact
+audit passes. Patch 40 is unflashed, so runtime and visual acceptance remain
+pending. The native ABI-v3 interface contains no runtime VPG control. Exact
+build and artifact details are retained in the M9.2 native-display ledger.
+
+The historical M7 runtime hardware-pattern switch was intentionally disabled
+on P4 revision 1.3 because returning from VPG can stall the external DPI stream. See
 the [M7 Linux-owned Kit C display report](m7-linux-display.md) for the exact
 ownership, DMA, security, and three-boot evidence.

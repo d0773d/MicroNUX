@@ -1,0 +1,60 @@
+From 5bbeaf9f50e831ff91c5f41f696d39b50c05e880 Mon Sep 17 00:00:00 2001
+From: d0773d <dottedquad@gmail.com>
+Date: Wed, 12 Aug 2026 03:24:24 -0700
+Subject: [PATCH 35/46] video: fbdev: validate native CLIC hardware IRQ
+
+The handoff records the raw CLIC hardware IRQ, while platform_get_irq()
+returns a Linux virtual IRQ.  Resolve the IRQ data and compare hardware IRQ
+numbers so a valid ABI-v3 handoff is not rejected before native cold init.
+
+Signed-off-by: d0773d <dottedquad@gmail.com>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 8948d4a..f0543ad 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -21,6 +21,7 @@
+ #include <linux/hrtimer.h>
+ #include <linux/input.h>
+ #include <linux/interrupt.h>
++#include <linux/irq.h>
+ #include <linux/jiffies.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+@@ -4845,6 +4846,7 @@ static int micronux_validate_cold_hardware(struct micronux_dsi *dsi)
+ static int micronux_validate_handoff_v3(struct micronux_dsi *dsi, u32 address)
+ {
+ 	struct micronux_display_handoff_v3 *handoff = &dsi->cold_handoff;
++	struct irq_data *irq_data;
+ 	void __iomem *source;
+ 	u64 end[MICRONUX_DISPLAY_BUFFER_COUNT];
+ 	u64 descriptor_page_end;
+@@ -4939,11 +4941,22 @@ static int micronux_validate_handoff_v3(struct micronux_dsi *dsi, u32 address)
+ 	    descriptor_page_end > ESP32P4_SD_DMA_RESERVE_START)
+ 		return micronux_cold_reject(dsi, "descriptor-sd-dma-overlap");
+ 
++	/* The handoff records raw CLIC hwirq 18, not Linux's allocated virq. */
++	irq_data = irq_get_irq_data(dsi->irq);
++	if (!irq_data)
++		return micronux_cold_reject(dsi, "gdma-linux-irq-data");
++	if (irqd_to_hwirq(irq_data) != handoff->gdma_clic_irq) {
++		dev_err(dsi->dev,
++			"MICRONUX:M9.2:COLD-IRQ state=mismatch linux-virq=%d hwirq=%lu expected=%u display-writes=0\n",
++			dsi->irq, (unsigned long)irqd_to_hwirq(irq_data),
++			handoff->gdma_clic_irq);
++		return micronux_cold_reject(dsi, "gdma-linux-hwirq");
++	}
++
+ 	if (handoff->dma_channel != 0 ||
+ 	    handoff->dsi_fifo_address != ESP32P4_DSI_FIFO_ADDRESS ||
+ 	    handoff->gdma_irq_source != MICRONUX_DISPLAY_COLD_GDMA_IRQ_SOURCE ||
+ 	    handoff->gdma_clic_irq != MICRONUX_DISPLAY_COLD_GDMA_CLIC_IRQ ||
+-	    handoff->gdma_clic_irq != dsi->irq ||
+ 	    handoff->i2c_port != MICRONUX_DISPLAY_COLD_I2C_PORT ||
+ 	    handoff->i2c_sda_gpio != MICRONUX_DISPLAY_COLD_I2C_SDA_GPIO ||
+ 	    handoff->i2c_scl_gpio != MICRONUX_DISPLAY_COLD_I2C_SCL_GPIO ||
+-- 
+2.54.0.windows.1

@@ -109,6 +109,9 @@ $sdkconfigDefaults = @(
     (Join-Path $loaderPath "sdkconfig.m7.defaults")
 ) -join ";"
 
+Remove-Item -LiteralPath $sdkconfigPath -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath "$sdkconfigPath.old" -Force -ErrorAction SilentlyContinue
+
 & $idfPython $idfPy -C $loaderPath -B $buildPath `
     -D "SDKCONFIG=$sdkconfigPath" `
     -D "SDKCONFIG_DEFAULTS=$sdkconfigDefaults" reconfigure
@@ -121,7 +124,12 @@ foreach ($required in @(
     "CONFIG_MICRONUX_C6_SDIO_PROFILE=y",
     "CONFIG_MICRONUX_SDMMC_DUAL_SLOT_PROFILE=y",
     "CONFIG_MICRONUX_MIPI_DSI=y",
-    "CONFIG_MICRONUX_MIPI_PANEL_JD9365_800_1280=y"
+    "CONFIG_MICRONUX_MIPI_PANEL_JD9365_800_1280=y",
+    "CONFIG_SPIRAM_SPEED_200M=y",
+    "CONFIG_SPIRAM_XIP_FROM_PSRAM=y",
+    "CONFIG_CACHE_L2_CACHE_256KB=y",
+    "CONFIG_CACHE_L2_CACHE_LINE_64B=y",
+    "CONFIG_COMPILER_OPTIMIZATION_PERF=y"
 )) {
     if ($configuration -notmatch "(?m)^$([regex]::Escape($required))\r?$") {
         throw "M7 generated configuration is missing '$required'."
@@ -161,7 +169,10 @@ if ($strings -notmatch "MICRONUX:M7:PMP baseline=pass early-deny=pass" -or
     $strings -notmatch "MICRONUX:M7:PMP-AUDIT state=fail" -or
     $strings -notmatch "MICRONUX:M7:DMA-PMS state=pass" -or
     $strings -notmatch "MICRONUX:M7:SPLASH progress=%u state=visible" -or
-    $strings -notmatch "MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending") {
+    $strings -notmatch "MICRONUX:M9.2:DSI-HANDOFF state=ready abi=2" -or
+    $strings -notmatch "MICRONUX:M9.2:DSI-HANDOFF-SOURCE state=ready pattern=vertical-bars bridge=dpi-disabled backlight=off" -or
+    $strings -notmatch "owner=linux-pending pattern=vertical-bars buffers=3 dma=irq-rearm channel=%d" -or
+    $strings -notmatch "timing=%lu/%lu/%lu:%lu/%lu/%lu") {
     throw "M7 security or display handoff markers are missing from the linked loader."
 }
 Write-Host "M7 loader built: image=$($image.Length)B sha256=$digest idf=v6.0.1 early-deny=tracked kit-c=jd9365"

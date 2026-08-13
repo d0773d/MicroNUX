@@ -1,0 +1,133 @@
+From 07ad4eaede716bedf1951d7863f074e1ac2f0cec Mon Sep 17 00:00:00 2001
+From: MicroNUX <micronux@local>
+Date: Wed, 12 Aug 2026 19:30:22 -0700
+Subject: [PATCH 46/46] video: fbdev: validate native continuous reload plan
+
+Prepare the exact fixed-front reload register values after the existing
+same-front qualification, but do not write them to GDMA. Keep the accepted
+one-shot scanout active and log the validated plan for the next incremental
+stage.
+
+Signed-off-by: MicroNUX <micronux@local>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 69 +++++++++++++++++++++++++++++++
+ 1 file changed, 69 insertions(+)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 64b8dfa..0a92c56 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -360,7 +360,9 @@
+ #define MICRONUX_NATIVE_DMA_DESCRIPTOR_CTRL_HI	0x40108840
+ #define MICRONUX_NATIVE_DMA_DESCRIPTOR_ARMED	0xc0108840
+ #define MICRONUX_DMA_CHANNEL_CFG_LO	0x0000000f
++#define MICRONUX_DMA_CHANNEL_RELOAD_CFG_LO	0x00000005
+ #define MICRONUX_DMA_CHANNEL_CFG_HI	0x0a020001
++#define MICRONUX_NATIVE_DMA_RELOAD_CTRL_HI	0x00108840
+ #define MICRONUX_HEALTH_POLL_MS		50
+ #define MICRONUX_FB_WRITE_CHUNK		512
+ #define MICRONUX_FB_WRITE_GAP_US	2
+@@ -701,6 +703,18 @@ struct micronux_panel_firmware {
+ 	u16 record_count;
+ };
+ 
++struct micronux_native_reload_plan {
++	u32 source;
++	u32 destination;
++	u32 block_size;
++	u32 control_lo;
++	u32 control_hi;
++	u32 config_lo;
++	u32 config_hi;
++	u32 interrupt_mask;
++	u8 front;
++};
++
+ struct micronux_dsi {
+ 	struct device *dev;
+ 	void __iomem *host;
+@@ -1443,6 +1457,9 @@ static int micronux_cold_i2c_initialize(struct micronux_dsi *dsi);
+ static int micronux_register_native_backlight(struct micronux_dsi *dsi);
+ static int
+ micronux_native_requalify_front(struct micronux_dsi *dsi, u64 target);
++static int
++micronux_native_prepare_reload_plan(struct micronux_dsi *dsi,
++				    struct micronux_native_reload_plan *plan);
+ static void
+ micronux_native_reset_telemetry(struct micronux_dsi *dsi,
+ 				bool reset_last_arm);
+@@ -1520,6 +1537,7 @@ static ssize_t micronux_native_boot_ready_store(struct micronux_dsi *dsi,
+ 						const char *buf, size_t count)
+ {
+ 	struct micronux_display_handoff_v3 *handoff = &dsi->cold_handoff;
++	struct micronux_native_reload_plan reload_plan;
+ 	unsigned long flags;
+ 	u64 target_commit;
+ 	u8 reveal_command = handoff->display_control_reveal_command;
+@@ -1567,6 +1585,15 @@ static ssize_t micronux_native_boot_ready_store(struct micronux_dsi *dsi,
+ 	ret = micronux_native_requalify_front(dsi, target_commit);
+ 	if (ret)
+ 		goto fail_render;
++	ret = micronux_native_prepare_reload_plan(dsi, &reload_plan);
++	if (ret)
++		goto fail_render;
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:CONTINUOUS-PREP state=VALIDATED active-scanout=one-shot hardware-writes=0 front=%u source=%08x destination=%08x block=%08x control=%08x:%08x config=%08x:%08x interrupts=%08x\n",
++		 reload_plan.front, reload_plan.source, reload_plan.destination,
++		 reload_plan.block_size, reload_plan.control_lo,
++		 reload_plan.control_hi, reload_plan.config_lo,
++		 reload_plan.config_hi, reload_plan.interrupt_mask);
+ 
+ 	WRITE_ONCE(dsi->native_i2c_transition_deadline,
+ 		   jiffies +
+@@ -6255,6 +6282,48 @@ static bool native_target_ready(struct micronux_dsi *dsi, u64 commit_sequence)
+ 	return ready || READ_ONCE(dsi->fault_bits);
+ }
+ 
++static int
++micronux_native_prepare_reload_plan(struct micronux_dsi *dsi,
++				    struct micronux_native_reload_plan *plan)
++{
++	unsigned long flags;
++	u64 transfer_bytes;
++	u8 front;
++
++	if (!plan)
++		return -EINVAL;
++
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	if (dsi->front_index >= MICRONUX_DISPLAY_BUFFER_COUNT ||
++	    dsi->queued_index >= 0 ||
++	    dsi->front_index != dsi->presented_index ||
++	    dsi->front_commit_sequence != dsi->presented_commit_sequence) {
++		spin_unlock_irqrestore(&dsi->state_lock, flags);
++		return -ESTALE;
++	}
++	front = dsi->front_index;
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++
++	transfer_bytes = ((u64)MICRONUX_DMA_BLOCK_TRANSFER_SIZE + 1) * 8;
++	if (dsi->handoff.dma_channel >= DW_GDMA_CHANNEL_COUNT ||
++	    transfer_bytes != dsi->handoff.framebuffer_size ||
++	    !IS_ALIGNED(dsi->handoff.framebuffer_address[front], 8) ||
++	    !IS_ALIGNED(dsi->handoff.dsi_fifo_address, 8))
++		return -EINVAL;
++
++	plan->source = dsi->handoff.framebuffer_address[front];
++	plan->destination = dsi->handoff.dsi_fifo_address;
++	plan->block_size = MICRONUX_DMA_BLOCK_TRANSFER_SIZE;
++	plan->control_lo = MICRONUX_DMA_DESCRIPTOR_CTRL_LO;
++	plan->control_hi = MICRONUX_NATIVE_DMA_RELOAD_CTRL_HI;
++	plan->config_lo = MICRONUX_DMA_CHANNEL_RELOAD_CFG_LO;
++	plan->config_hi = MICRONUX_DMA_CHANNEL_CFG_HI;
++	plan->interrupt_mask = DW_GDMA_INT_ERROR_MASK;
++	plan->front = front;
++
++	return 0;
++}
++
+ static bool native_window_ready(struct micronux_dsi *dsi, u32 generation)
+ {
+ 	return READ_ONCE(dsi->source_generation) - generation >=
+-- 
+2.54.0.windows.1

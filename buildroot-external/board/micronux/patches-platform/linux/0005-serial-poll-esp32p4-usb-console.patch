@@ -1,7 +1,7 @@
 From 8b9cb9712d20730371498b579ae0bcc9b0fdc11b Mon Sep 17 00:00:00 2001
 From: MicroNUX Project <micronux@example.invalid>
 Date: Sat, 8 Aug 2026 05:10:00 -0700
-Subject: [PATCH 5/7] serial: poll ESP32-P4 USB console status
+Subject: [PATCH 5/8] serial: poll ESP32-P4 USB console status
 
 ESP32-P4 revision 1.3 does not reliably re-arm this peripheral source
 through the current Linux CLIC IRQ path.  Poll the USB Serial/JTAG status

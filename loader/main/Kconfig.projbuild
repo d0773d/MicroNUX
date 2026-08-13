@@ -15,6 +15,23 @@ menu "MicroNUX loader profile"
             install its verified U-return rules. The loader audits all 16
             entries and refuses handoff on any mismatch.
 
+    config MICRONUX_M9_JD9365_COLD_RELINQUISH
+        bool "Relinquish a cold JD9365 display to M9 Linux"
+        depends on IDF_TARGET_ESP32P4
+        depends on ESP32P4_SELECTS_REV_LESS_V3
+        depends on !ESP_SYSTEM_MEMPROT
+        select MICRONUX_M7_EARLY_UMODE_DENY
+        default n
+        help
+            Prepare only the Waveshare 10.1-inch 800x1280 JD9365 resource
+            contract for native Linux cold initialization. The loader sends
+            acknowledged PWM-zero, reset-prepare, and reset-assert
+            commands to the write-only external controller, leaves the D-PHY
+            LDO, DSI host/bridge, and GDMA quiescent, reserves cleared
+            framebuffer and descriptor storage, and commits ABI v3 only as
+            the final write before the Linux jump. It never creates an
+            ESP-IDF panel, starts scanout, or draws a splash.
+
     config MICRONUX_C6_SDIO_PROFILE
         bool "Prepare ESP32-C6 SDIO slot 1 instead of microSD slot 0"
         default n
@@ -47,6 +64,7 @@ menu "MicroNUX loader profile"
 
     config MICRONUX_MIPI_DSI
         bool "Enable the MIPI-DSI electrical proof profile"
+        depends on !MICRONUX_M9_JD9365_COLD_RELINQUISH
         default n
         help
             Initialize one explicitly selected Waveshare MIPI-DSI panel and
@@ -58,6 +76,7 @@ menu "MicroNUX loader profile"
     config MICRONUX_MIPI_DSI_PROBE
         bool "Probe for a MIPI display adapter without powering the panel"
         depends on !MICRONUX_MIPI_DSI
+        depends on !MICRONUX_M9_JD9365_COLD_RELINQUISH
         default n
         help
             Check only whether the Waveshare display adapter acknowledges at

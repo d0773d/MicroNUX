@@ -1,7 +1,7 @@
 From cec70a1509215d6528608534125e86054c079f34 Mon Sep 17 00:00:00 2001
 From: MicroNUX Project <micronux@example.invalid>
 Date: Sat, 8 Aug 2026 04:47:00 -0700
-Subject: [PATCH 07/22] mmc: dw: report ESP32-P4 descriptor size
+Subject: [PATCH 07/46] mmc: dw: report ESP32-P4 descriptor size
 
 Include the controller-specific descriptor size in its boot-time diagnostic.
 

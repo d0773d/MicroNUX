@@ -6,11 +6,11 @@ disposable Git worktree under `build/`; the installed SDK is never modified.
 The verified patched-source SHA-256 values are:
 
 - `cpu_region_protect.c`:
-  `26c4c6a1fed3aa64ef7b331fab905f54bb33674fe71db561412a157dc9db131f`;
+  `6fef47b34a8fddd51823fba5bbd443e78435d7d34f3cc3937bb254a29fce63be`;
 - `esp_lcd_panel_dpi.c`:
-  `f5f5ce836267020d72f5f9a7591647cc6606d8729fc26a12197889d03b3eeeb1`;
+  `c817340fedf56ca6c6d74d634948ed39473df5766c371e0ca07f06e26f662264`;
 - `esp_lcd_mipi_dsi.h`:
-  `eb60e0441b65229424eb55f9ffae4638186d4785a0279296c1b53c452dc44ba6`.
+  `f81b73c3dc9d4b5f88e15ca638773e955a7657ca43a5495eda55f6d41b961d9d`.
 
 `0001-esp32p4-deny-u-mode-platform-regions.patch` changes the pre-v3 ESP32-P4
 bootloader/application PMP setup as soon as the patch is applied. Patch
@@ -22,13 +22,20 @@ Affected platform entries become unlocked regions with no U-mode R/W/X bits.
 The M-mode loader and Linux kernel continue to bypass those permissions.
 
 `0002-lcd-add-dpi-circular-handoff.patch` adds an exact-version integration API
-that quiesces the loader-created DPI transfer, constructs a four-descriptor
-ring as a bounded handoff template, and returns the framebuffer, descriptors,
-and channel to MicroNUX. The loader leaves DPI/framebuffer mode selected and
-publishes a versioned, CRC-protected handoff. Linux validates the ring, then
-programs the channel's hardware reload mode itself. This patch deliberately
-does not claim to be a general ESP-IDF API: its semantics are narrow and
-pinned to the source digests above.
+that quiesces the loader-created DPI transfer, allocates three stopped
+64-byte descriptors as a bounded handoff pool, and returns the loader front
+framebuffer, descriptors, and channel to MicroNUX. Every descriptor is marked
+last but deliberately invalid, unlinked, and free of block interrupts. The
+caller must first use the ESP-IDF v6.0.1 pattern API to disable bridge DPI and
+select host VPG. The handoff keeps that hardware-generated source active while
+the framebuffer DMA is stopped, then publishes the ABI-v2, CRC-protected
+resource contract. Linux validates the VPG source, stopped channel, and pool;
+rewrites one descriptor for each front/back/spare framebuffer; and explicitly
+rearms one complete-frame transfer from each transfer-done IRQ. The historical
+filename is retained to avoid an unrelated patch-path migration; the patch no
+longer constructs a circular ring or selects hardware auto-reload. This patch
+does not claim to be a general ESP-IDF API: its semantics are narrow and pinned
+to the source digests above.
 
 The M7 preparation script must verify the source commit, check that both
 patches apply cleanly, apply each once, and verify all resulting source digests

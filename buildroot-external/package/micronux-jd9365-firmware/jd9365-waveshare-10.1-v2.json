@@ -1,0 +1,1042 @@
+{
+  "schema": "micronux-jd9365-command-source-v1",
+  "license": "Apache-2.0",
+  "source": {
+    "component": "waveshare/esp_lcd_jd9365_10_1",
+    "component_version": "2.0.0",
+    "repository": "git://github.com/waveshareteam/Waveshare-ESP32-components.git",
+    "commit": "9daffb7168b3c093a330da700988a22092294eef",
+    "path": "display/lcd/esp_lcd_jd9365_10_1/esp_lcd_jd9365_10_1.c",
+    "source_file_sha256": "c80f8ae4771adf46adabbcf3fedca73262504f068387b713c358476cb1629585"
+  },
+  "profile": {
+    "name": "Waveshare JD9365 10.1-inch v2 RGB565 two-lane",
+    "output": "jd9365-waveshare-10.1-v2.bin",
+    "prelude_records": 4,
+    "vendor_records": 200
+  },
+  "prelude": [
+    {
+      "command": "0xE0",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x36",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x3A",
+      "data": "55",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x80",
+      "data": "01",
+      "delay_ms": 0
+    }
+  ],
+  "vendor_records": [
+    {
+      "command": "0xE0",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0xE1",
+      "data": "93",
+      "delay_ms": 0
+    },
+    {
+      "command": "0xE2",
+      "data": "65",
+      "delay_ms": 0
+    },
+    {
+      "command": "0xE3",
+      "data": "F8",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x80",
+      "data": "01",
+      "delay_ms": 0
+    },
+    {
+      "command": "0xE0",
+      "data": "01",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x00",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x01",
+      "data": "38",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x03",
+      "data": "10",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x04",
+      "data": "38",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x0C",
+      "data": "74",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x17",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x18",
+      "data": "AF",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x19",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x1A",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x1B",
+      "data": "AF",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x1C",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x35",
+      "data": "26",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x37",
+      "data": "09",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x38",
+      "data": "04",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x39",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x3A",
+      "data": "01",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x3C",
+      "data": "78",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x3D",
+      "data": "FF",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x3E",
+      "data": "FF",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x3F",
+      "data": "7F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x40",
+      "data": "06",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x41",
+      "data": "A0",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x42",
+      "data": "81",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x43",
+      "data": "1E",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x44",
+      "data": "0D",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x45",
+      "data": "28",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x55",
+      "data": "02",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x57",
+      "data": "69",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x59",
+      "data": "0A",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x5A",
+      "data": "2A",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x5B",
+      "data": "17",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x5D",
+      "data": "7F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x5E",
+      "data": "6A",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x5F",
+      "data": "5B",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x60",
+      "data": "4F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x61",
+      "data": "4A",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x62",
+      "data": "3D",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x63",
+      "data": "41",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x64",
+      "data": "2A",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x65",
+      "data": "44",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x66",
+      "data": "43",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x67",
+      "data": "44",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x68",
+      "data": "62",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x69",
+      "data": "52",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x6A",
+      "data": "59",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x6B",
+      "data": "4C",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x6C",
+      "data": "48",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x6D",
+      "data": "3A",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x6E",
+      "data": "26",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x6F",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x70",
+      "data": "7F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x71",
+      "data": "6A",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x72",
+      "data": "5B",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x73",
+      "data": "4F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x74",
+      "data": "4A",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x75",
+      "data": "3D",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x76",
+      "data": "41",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x77",
+      "data": "2A",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x78",
+      "data": "44",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x79",
+      "data": "43",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x7A",
+      "data": "44",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x7B",
+      "data": "62",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x7C",
+      "data": "52",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x7D",
+      "data": "59",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x7E",
+      "data": "4C",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x7F",
+      "data": "48",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x80",
+      "data": "3A",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x81",
+      "data": "26",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x82",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0xE0",
+      "data": "02",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x00",
+      "data": "42",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x01",
+      "data": "42",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x02",
+      "data": "40",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x03",
+      "data": "40",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x04",
+      "data": "5E",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x05",
+      "data": "5E",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x06",
+      "data": "5F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x07",
+      "data": "5F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x08",
+      "data": "5F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x09",
+      "data": "57",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x0A",
+      "data": "57",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x0B",
+      "data": "77",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x0C",
+      "data": "77",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x0D",
+      "data": "47",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x0E",
+      "data": "47",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x0F",
+      "data": "45",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x10",
+      "data": "45",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x11",
+      "data": "4B",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x12",
+      "data": "4B",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x13",
+      "data": "49",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x14",
+      "data": "49",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x15",
+      "data": "5F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x16",
+      "data": "41",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x17",
+      "data": "41",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x18",
+      "data": "40",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x19",
+      "data": "40",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x1A",
+      "data": "5E",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x1B",
+      "data": "5E",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x1C",
+      "data": "5F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x1D",
+      "data": "5F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x1E",
+      "data": "5F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x1F",
+      "data": "57",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x20",
+      "data": "57",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x21",
+      "data": "77",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x22",
+      "data": "77",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x23",
+      "data": "46",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x24",
+      "data": "46",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x25",
+      "data": "44",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x26",
+      "data": "44",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x27",
+      "data": "4A",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x28",
+      "data": "4A",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x29",
+      "data": "48",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x2A",
+      "data": "48",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x2B",
+      "data": "5F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x2C",
+      "data": "01",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x2D",
+      "data": "01",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x2E",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x2F",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x30",
+      "data": "1F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x31",
+      "data": "1F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x32",
+      "data": "1E",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x33",
+      "data": "1E",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x34",
+      "data": "1F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x35",
+      "data": "17",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x36",
+      "data": "17",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x37",
+      "data": "37",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x38",
+      "data": "37",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x39",
+      "data": "08",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x3A",
+      "data": "08",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x3B",
+      "data": "0A",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x3C",
+      "data": "0A",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x3D",
+      "data": "04",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x3E",
+      "data": "04",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x3F",
+      "data": "06",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x40",
+      "data": "06",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x41",
+      "data": "1F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x42",
+      "data": "02",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x43",
+      "data": "02",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x44",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x45",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x46",
+      "data": "1F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x47",
+      "data": "1F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x48",
+      "data": "1E",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x49",
+      "data": "1E",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x4A",
+      "data": "1F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x4B",
+      "data": "17",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x4C",
+      "data": "17",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x4D",
+      "data": "37",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x4E",
+      "data": "37",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x4F",
+      "data": "09",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x50",
+      "data": "09",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x51",
+      "data": "0B",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x52",
+      "data": "0B",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x53",
+      "data": "05",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x54",
+      "data": "05",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x55",
+      "data": "07",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x56",
+      "data": "07",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x57",
+      "data": "1F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x58",
+      "data": "40",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x5B",
+      "data": "30",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x5C",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x5D",
+      "data": "34",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x5E",
+      "data": "05",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x5F",
+      "data": "02",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x63",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x64",
+      "data": "6A",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x67",
+      "data": "73",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x68",
+      "data": "07",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x69",
+      "data": "08",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x6A",
+      "data": "6A",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x6B",
+      "data": "08",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x6C",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x6D",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x6E",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x6F",
+      "data": "88",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x75",
+      "data": "FF",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x77",
+      "data": "DD",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x78",
+      "data": "2C",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x79",
+      "data": "15",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x7A",
+      "data": "17",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x7D",
+      "data": "14",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x7E",
+      "data": "82",
+      "delay_ms": 0
+    },
+    {
+      "command": "0xE0",
+      "data": "04",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x00",
+      "data": "0E",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x02",
+      "data": "B3",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x09",
+      "data": "61",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x0E",
+      "data": "48",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x37",
+      "data": "58",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x2B",
+      "data": "0F",
+      "delay_ms": 0
+    },
+    {
+      "command": "0xE0",
+      "data": "00",
+      "delay_ms": 0
+    },
+    {
+      "command": "0xE6",
+      "data": "02",
+      "delay_ms": 0
+    },
+    {
+      "command": "0xE7",
+      "data": "0C",
+      "delay_ms": 0
+    },
+    {
+      "command": "0x11",
+      "data": "00",
+      "delay_ms": 120
+    },
+    {
+      "command": "0x29",
+      "data": "00",
+      "delay_ms": 20
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+From 0fac40ee31c1af165ea94a82a7b0d905d8da4861 Mon Sep 17 00:00:00 2001
+From: d0773d <dottedquad@gmail.com>
+Date: Wed, 12 Aug 2026 07:02:17 -0700
+Subject: [PATCH 40/46] video: fbdev: stop gating scanout on inactive DSI
+ mirror
+
+ESP-IDF v6.0.1 programs the primary video-mode register without
+enabling the optional video shadow bank. On ESP32-P4 rev 1.3, the
+corresponding read-only active register therefore remains at its reset
+value even while clean frame DMA completions advance.
+
+Keep active-register reads as diagnostics, but remove its synthesized
+value from native runtime acceptance. Continue requiring the exact
+programmed video policy and every clock, power, routing, bridge, GDMA,
+source-range, and guard predicate.
+
+Signed-off-by: d0773d <dottedquad@gmail.com>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 5 -----
+ 1 file changed, 5 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 712066d..a8bff0a 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -245,9 +245,6 @@
+ #define DSI_HOST_NATIVE_VIDEO_POLICY	(DSI_HOST_FRAME_BTA_ACK_EN | \
+ 					 DSI_HOST_LP_VIDEO_EN_MASK | \
+ 					 DSI_HOST_VID_MODE_BURST)
+-#define DSI_HOST_NATIVE_VIDEO_POLICY_ACT \
+-	(DSI_HOST_FRAME_BTA_ACK_EN_ACT | DSI_HOST_LP_VIDEO_EN_ACT_MASK | \
+-	 DSI_HOST_VID_MODE_BURST)
+ 
+ #define DSI_BRG_CLK_EN			0x00
+ #define DSI_BRG_EN			0x04
+@@ -5682,8 +5679,6 @@ static bool micronux_native_runtime_policy_valid(struct micronux_dsi *dsi)
+ 	       !(readl(dsi->host + DSI_HOST_MODE_CFG) & BIT(0)) &&
+ 	       readl(dsi->host + DSI_HOST_VID_MODE_CFG) ==
+ 		DSI_HOST_NATIVE_VIDEO_POLICY &&
+-	       readl(dsi->host + DSI_HOST_VID_MODE_CFG_ACT) ==
+-		DSI_HOST_NATIVE_VIDEO_POLICY_ACT &&
+ 	       readl(dsi->host + DSI_HOST_LPCLK_CTRL) ==
+ 		DSI_HOST_CLOCK_LANE_AUTO &&
+ 	       !(readl(dsi->host + DSI_HOST_VID_MODE_CFG) &
+-- 
+2.54.0.windows.1

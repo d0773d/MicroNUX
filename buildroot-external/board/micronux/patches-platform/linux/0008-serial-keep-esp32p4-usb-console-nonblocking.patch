@@ -1,0 +1,63 @@
+From 9a452b79256f8d45977f74cb9a1d57691cf63e2f Mon Sep 17 00:00:00 2001
+From: MicroNUX Project <micronux@example.invalid>
+Date: Wed, 12 Aug 2026 21:29:09 -0700
+Subject: [PATCH 8/8] serial: keep ESP32-P4 USB console nonblocking
+
+The USB Serial/JTAG transmit FIFO stops draining when no host has the
+native CDC port open. Early console output currently spins forever in that
+state, while the regular console relies on a jiffies timeout from an
+IRQ-disabled section where jiffies may not advance. Either path can stop an
+unattended Linux boot before the display driver probes.
+
+Treat console output as loss-tolerant: write a byte only when FIFO space is
+already available. Leave the buffered tty transmit path unchanged.
+
+Signed-off-by: MicroNUX Project <micronux@example.invalid>
+---
+ drivers/tty/serial/earlycon-esp32p4.c |  6 +++---
+ drivers/tty/serial/esp32_acm.c        | 12 +++---------
+ 2 files changed, 6 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/tty/serial/earlycon-esp32p4.c b/drivers/tty/serial/earlycon-esp32p4.c
+index 9a5cca5..5d77e2d 100644
+--- a/drivers/tty/serial/earlycon-esp32p4.c
++++ b/drivers/tty/serial/earlycon-esp32p4.c
+@@ -17,9 +17,9 @@
+ 
+ static void esp32p4_earlycon_putc(struct uart_port *port, unsigned char ch)
+ {
+-	while (!(readl_relaxed(port->membase + ESP32P4_USB_SERIAL_CONF) &
+-		 ESP32P4_USB_SERIAL_DATA_FREE))
+-		cpu_relax();
++	if (!(readl_relaxed(port->membase + ESP32P4_USB_SERIAL_CONF) &
++		  ESP32P4_USB_SERIAL_DATA_FREE))
++		return;
+ 
+ 	writel_relaxed(ch, port->membase + ESP32P4_USB_SERIAL_FIFO);
+ 	if (ch == '\n')
+diff --git a/drivers/tty/serial/esp32_acm.c b/drivers/tty/serial/esp32_acm.c
+index ff1fd68..fabb895 100644
+--- a/drivers/tty/serial/esp32_acm.c
++++ b/drivers/tty/serial/esp32_acm.c
+@@ -148,15 +148,9 @@ static void esp32s3_acm_put_char(struct uart_port *port, u8 c)
+ 
+ static void esp32s3_acm_put_char_sync(struct uart_port *port, u8 c)
+ {
+-	unsigned long timeout = jiffies + HZ;
+-
+-	while (!esp32s3_acm_tx_fifo_free(port)) {
+-		if (time_after(jiffies, timeout)) {
+-			dev_warn(port->dev, "timeout waiting for TX FIFO\n");
+-			return;
+-		}
+-		cpu_relax();
+-	}
++	if (!esp32s3_acm_tx_fifo_free(port))
++		return;
++
+ 	esp32s3_acm_put_char(port, c);
+ 	esp32s3_acm_push(port);
+ }
+-- 
+2.54.0.windows.1
+

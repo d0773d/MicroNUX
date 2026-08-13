@@ -1,0 +1,128 @@
+From ad46ccf79d044222a35113bbdd5debc754ec240c Mon Sep 17 00:00:00 2001
+From: d0773d <dottedquad@gmail.com>
+Date: Wed, 12 Aug 2026 04:08:08 -0700
+Subject: [PATCH 36/46] video: fbdev: diagnose native GDMA readback
+
+Native cold init reports only the outer gdma-irq stage when a register
+readback disagrees. Keep fail-dark behavior. Capture each predicate once.
+Log the raw register tuple and expected values before returning -EIO.
+
+Signed-off-by: d0773d <dottedquad@gmail.com>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 77 ++++++++++++++++++++-----------
+ 1 file changed, 49 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index f0543ad..8e16257 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -5348,7 +5348,9 @@ static int micronux_native_configure_dpi_bridge(struct micronux_dsi *dsi)
+ 
+ static int micronux_native_configure_gdma(struct micronux_dsi *dsi)
+ {
+-	u32 clocks0, clocks1, reset, value;
++	u32 cfg, cfg_hi, cfg_lo, chen, clocks0, clocks1, reset, value;
++	u32 common_sig_ena, common_st_ena, sig_ena0, sig_ena1;
++	u32 st_ena0, st_ena1;
+ 	int ret;
+ 
+ 	clocks0 = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL0);
+@@ -5363,13 +5365,20 @@ static int micronux_native_configure_gdma(struct micronux_dsi *dsi)
+ 	       dsi->hp_clkrst + HP_CLKRST_HP_RST_EN0);
+ 	writel(reset & ~HP_CLKRST_GDMA_RESET,
+ 	       dsi->hp_clkrst + HP_CLKRST_HP_RST_EN0);
+-	if (!(readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL0) &
+-	      HP_CLKRST_GDMA_CPU_CLK_EN) ||
+-	    !(readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL1) &
+-	      HP_CLKRST_GDMA_SYS_CLK_EN) ||
+-	    (readl(dsi->hp_clkrst + HP_CLKRST_HP_RST_EN0) &
+-	     HP_CLKRST_GDMA_RESET))
++	clocks0 = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL0);
++	clocks1 = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL1);
++	reset = readl(dsi->hp_clkrst + HP_CLKRST_HP_RST_EN0);
++	if (!(clocks0 & HP_CLKRST_GDMA_CPU_CLK_EN) ||
++	    !(clocks1 & HP_CLKRST_GDMA_SYS_CLK_EN) ||
++	    (reset & HP_CLKRST_GDMA_RESET)) {
++		dev_err(dsi->dev,
++			"MICRONUX:M9.2:COLD-INIT stage=gdma-irq reason=hp-clock-reset-readback clk0=%08x clk1=%08x rst=%08x expected-clk0-set=%08x expected-clk1-set=%08x rst-clear-mask=%08x\n",
++			clocks0, clocks1, reset,
++			(u32)HP_CLKRST_GDMA_CPU_CLK_EN,
++			(u32)HP_CLKRST_GDMA_SYS_CLK_EN,
++			(u32)HP_CLKRST_GDMA_RESET);
+ 		return -EIO;
++	}
+ 	dsi->cold_gdma_active = true;
+ 
+ 	writel(1, dsi->gdma + DW_GDMA_RESET);
+@@ -5397,8 +5406,13 @@ static int micronux_native_configure_gdma(struct micronux_dsi *dsi)
+ 	       dsi->gdma + DW_GDMA_INT_CLEAR);
+ 	ret = devm_request_irq(dsi->dev, dsi->irq, micronux_dma_irq, 0,
+ 			       dev_name(dsi->dev), dsi);
+-	if (ret)
++	if (ret) {
++		dev_err(dsi->dev,
++			"MICRONUX:M9.2:COLD-INIT stage=gdma-irq reason=request-irq error=%d linux-virq=%d hwirq=%lu\n",
++			ret, dsi->irq,
++			(unsigned long)dsi->cold_handoff.gdma_clic_irq);
+ 		return ret;
++	}
+ 	dsi->cold_irq_registered = true;
+ 	writel(DW_GDMA_INT_NATIVE_SCANOUT_MASK |
+ 	       DW_GDMA_INT_STATUS0_RO_MASK,
+@@ -5410,27 +5424,34 @@ static int micronux_native_configure_gdma(struct micronux_dsi *dsi)
+ 	writel(~0U, dsi->channel + DW_GDMA_CH_INT_CLEAR1);
+ 	writel(DW_GDMA_INT_COMMON_VALID_MASK,
+ 	       dsi->gdma + DW_GDMA_INT_CLEAR);
+-	if (readl(dsi->gdma + DW_GDMA_CFG) != 1 ||
+-	    readl(dsi->channel + DW_GDMA_CH_CFG_LO) !=
+-		MICRONUX_DMA_CHANNEL_CFG_LO ||
+-	    readl(dsi->channel + DW_GDMA_CH_CFG_HI) !=
+-		MICRONUX_DMA_CHANNEL_CFG_HI ||
+-	    readl(dsi->channel + DW_GDMA_CH_INT_STATUS_ENA) !=
+-		(DW_GDMA_INT_NATIVE_SCANOUT_MASK |
+-		 DW_GDMA_INT_STATUS0_RO_MASK) ||
+-	    readl(dsi->channel + DW_GDMA_CH_INT_STATUS_ENA1) !=
+-		DW_GDMA_INT_ECC_ERROR_MASK ||
+-	    readl(dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA) !=
+-		(DW_GDMA_INT_NATIVE_SCANOUT_MASK |
+-		 DW_GDMA_INT_STATUS0_RO_MASK) ||
+-	    readl(dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA1) !=
+-		DW_GDMA_INT_ECC_ERROR_MASK ||
+-	    readl(dsi->gdma + DW_GDMA_INT_STATUS_ENA) !=
+-		DW_GDMA_INT_COMMON_VALID_MASK ||
+-	    readl(dsi->gdma + DW_GDMA_INT_SIGNAL_ENA) !=
+-		DW_GDMA_INT_COMMON_VALID_MASK ||
+-	    (readl(dsi->gdma + DW_GDMA_CHEN) & GENMASK(3, 0)))
++	cfg = readl(dsi->gdma + DW_GDMA_CFG);
++	cfg_lo = readl(dsi->channel + DW_GDMA_CH_CFG_LO);
++	cfg_hi = readl(dsi->channel + DW_GDMA_CH_CFG_HI);
++	st_ena0 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS_ENA);
++	st_ena1 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS_ENA1);
++	sig_ena0 = readl(dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA);
++	sig_ena1 = readl(dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA1);
++	common_st_ena = readl(dsi->gdma + DW_GDMA_INT_STATUS_ENA);
++	common_sig_ena = readl(dsi->gdma + DW_GDMA_INT_SIGNAL_ENA);
++	chen = readl(dsi->gdma + DW_GDMA_CHEN);
++	if (cfg != 1 ||
++	    cfg_lo != MICRONUX_DMA_CHANNEL_CFG_LO ||
++	    cfg_hi != MICRONUX_DMA_CHANNEL_CFG_HI ||
++	    st_ena0 != (DW_GDMA_INT_NATIVE_SCANOUT_MASK |
++			DW_GDMA_INT_STATUS0_RO_MASK) ||
++	    st_ena1 != DW_GDMA_INT_ECC_ERROR_MASK ||
++	    sig_ena0 != (DW_GDMA_INT_NATIVE_SCANOUT_MASK |
++			 DW_GDMA_INT_STATUS0_RO_MASK) ||
++	    sig_ena1 != DW_GDMA_INT_ECC_ERROR_MASK ||
++	    common_st_ena != DW_GDMA_INT_COMMON_VALID_MASK ||
++	    common_sig_ena != DW_GDMA_INT_COMMON_VALID_MASK ||
++	    (chen & GENMASK(3, 0))) {
++		dev_err(dsi->dev,
++			"MICRONUX:M9.2:COLD-INIT stage=gdma-irq reason=register-readback cfg=%08x cfglo=%08x cfghi=%08x stena0=%08x stena1=%08x sigena0=%08x sigena1=%08x common-stena=%08x common-sigena=%08x chen=%08x expected=00000001:0000000f:0a020001:023f7fe2:0000000f:023f7fe2:0000000f:001fff8f:001fff8f:chen[3:0]=0\n",
++			cfg, cfg_lo, cfg_hi, st_ena0, st_ena1, sig_ena0,
++			sig_ena1, common_st_ena, common_sig_ena, chen);
+ 		return -EIO;
++	}
+ 	dev_info(dsi->dev,
+ 		 "MICRONUX:M9.2:COLD-INIT stage=gdma-irq state=CONFIGURED controller=enabled irq-master=masked ch=0 cfg=0000000f:0a020001 completion=full-transfer errors=status0-ecc-common irq-route=24:18 descriptors=one-frame-last irq=registered source=stopped immutable-enables=ch0-bit25,ch1-bits0-3,common-bit7-bits9-20\n");
+ 	return 0;
+-- 
+2.54.0.windows.1

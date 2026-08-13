@@ -1,0 +1,114 @@
+From 8b48cd8ca8616f405449b82089ea5ca371449a1c Mon Sep 17 00:00:00 2001
+From: d0773d <dottedquad@gmail.com>
+Date: Wed, 12 Aug 2026 10:39:44 -0700
+Subject: [PATCH 44/46] video: fbdev: derate native DSI for PSRAM bandwidth
+
+Espressif documents the ESP32-P4 blue MIPI-DSI symptom as a PSRAM
+bandwidth underrun. Run ABI-v3 at 60 MHz DPI and 1 Gbps per lane.
+This retains ample payload margin while reducing framebuffer demand.
+Keep ABI-v2 unchanged.
+
+Signed-off-by: d0773d <dottedquad@gmail.com>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 36 +++++++++++++++----------------
+ 1 file changed, 18 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 0070e7e..64b8dfa 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -239,7 +239,7 @@
+ #define DSI_HOST_PHY_TMR_VALUE		0x00320068
+ #define DSI_HOST_PHY_TMR_LPCLK_VALUE	0x002e0080
+ #define DSI_HOST_PCKHDL_VALUE		0x00000019
+-#define DSI_HOST_CLKMGR_VALUE		0x0000130a
++#define DSI_HOST_CLKMGR_VALUE		0x00000d07
+ #define DSI_HOST_CMD_MODE_DBI_LP		0x010f7f02
+ #define DSI_HOST_FRAME_BTA_ACK_EN_ACT	BIT(8)
+ #define DSI_HOST_LP_VIDEO_EN_ACT_MASK	(GENMASK(7, 2) | BIT(9))
+@@ -418,8 +418,8 @@ static const char native_no_completion[] =
+ #define HP_CLKRST_DSI_DPI_CLK_SRC	GENMASK(6, 5)
+ #define HP_CLKRST_DSI_DPI_CLK_DIV	GENMASK(15, 8)
+ #define HP_CLKRST_DSI_DPI_CLK_SRC_F240M	1
+-#define HP_CLKRST_DSI_DPI_CLK_DIV_VALUE	2
+-#define HP_CLKRST_DSI_DPI_CLOCK_VALUE	0x000002a3
++#define HP_CLKRST_DSI_DPI_CLK_DIV_VALUE	3
++#define HP_CLKRST_DSI_DPI_CLOCK_VALUE	0x000003a3
+ #define HP_CLKRST_GDMA_RESET		BIT(21)
+ #define HP_CLKRST_DSI_BRIDGE_RESET	BIT(26)
+ #define HP_CLKRST_I2C0_RESET		BIT(22)
+@@ -4370,12 +4370,12 @@ static int micronux_cold_dsi_enable(struct micronux_dsi *dsi)
+ 	writel(BIT(0) | BIT(1) | BIT(2), dsi->host + DSI_HOST_PHY_RSTZ);
+ 	writel(DSI_HOST_PHY_RSTZ_READY, dsi->host + DSI_HOST_PHY_RSTZ);
+ 
+-	/* PLL_F20M at 20 MHz, 1500 Mbps: M=150, N=2, range selector 0x3c. */
+-	micronux_cold_phy_write(dsi, 0x44, 0x78);
++	/* PLL_F20M at 20 MHz, 1000 Mbps: M=50, N=1, range selector 0x2a. */
++	micronux_cold_phy_write(dsi, 0x44, 0x54);
+ 	micronux_cold_phy_write(dsi, 0x19, 0x30);
+-	micronux_cold_phy_write(dsi, 0x17, 0x01);
+-	micronux_cold_phy_write(dsi, 0x18, 0x15);
+-	micronux_cold_phy_write(dsi, 0x18, 0x84);
++	micronux_cold_phy_write(dsi, 0x17, 0x00);
++	micronux_cold_phy_write(dsi, 0x18, 0x11);
++	micronux_cold_phy_write(dsi, 0x18, 0x81);
+ 	ret = readl_poll_timeout(dsi->host + DSI_HOST_PHY_STATUS, status,
+ 				 status & BIT(0), 10,
+ 				 MICRONUX_DISPLAY_COLD_PHY_TIMEOUT_US);
+@@ -4411,7 +4411,7 @@ static int micronux_cold_dsi_enable(struct micronux_dsi *dsi)
+ 	if (!micronux_cold_dsi_matches(dsi))
+ 		return -EIO;
+ 	dev_info(dsi->dev,
+-		 "MICRONUX:M9.2:COLD-INIT stage=native-dsi state=READY idf=v6.0.1 ref=pll-f20m lane-mbps=1500 lanes=2 pll-m=150 pll-n=2 range=3c host=command dbi=lp cmd-ack=requested lpclk=00000003 phy=locked-stopped bridge=disabled dpi-clock=off gdma-reset=asserted gdma-clocks=off irq=unregistered\n");
++		 "MICRONUX:M9.2:COLD-INIT stage=native-dsi state=READY idf=v6.0.1 ref=pll-f20m lane-mbps=1000 lanes=2 pll-m=50 pll-n=1 range=2a host=command dbi=lp cmd-ack=requested lpclk=00000003 phy=locked-stopped bridge=disabled dpi-clock=off gdma-reset=asserted gdma-clocks=off irq=unregistered\n");
+ 	return 0;
+ }
+ 
+@@ -5201,8 +5201,8 @@ static int micronux_validate_handoff_v3(struct micronux_dsi *dsi, u32 address)
+ 	    handoff->width != 800 || handoff->height != 1280 ||
+ 	    handoff->stride != 1600 ||
+ 	    handoff->pixel_format != MICRONUX_DISPLAY_PIXEL_FORMAT_RGB565_LE ||
+-	    handoff->pixel_clock_hz != 80000000 ||
+-	    handoff->lane_bit_rate_mbps != 1500 ||
++	    handoff->pixel_clock_hz != 60000000 ||
++	    handoff->lane_bit_rate_mbps != 1000 ||
+ 	    handoff->data_lanes != 2 ||
+ 	    handoff->buffer_count != MICRONUX_DISPLAY_BUFFER_COUNT ||
+ 	    handoff->hsync_pulse_width != MICRONUX_DISPLAY_HSYNC_PULSE ||
+@@ -5597,9 +5597,9 @@ static int micronux_native_configure_dpi_bridge(struct micronux_dsi *dsi)
+ 	writel(800, dsi->host + DSI_HOST_VID_PKT_SIZE);
+ 	writel(0, dsi->host + DSI_HOST_VID_NUM_CHUNKS);
+ 	writel(0, dsi->host + DSI_HOST_VID_NULL_SIZE);
+-	writel(47, dsi->host + DSI_HOST_VID_HSA_TIME);
+-	writel(47, dsi->host + DSI_HOST_VID_HBP_TIME);
+-	writel(2063, dsi->host + DSI_HOST_VID_HLINE_TIME);
++	writel(42, dsi->host + DSI_HOST_VID_HSA_TIME);
++	writel(42, dsi->host + DSI_HOST_VID_HBP_TIME);
++	writel(1833, dsi->host + DSI_HOST_VID_HLINE_TIME);
+ 	writel(4, dsi->host + DSI_HOST_VID_VSA_LINES);
+ 	writel(10, dsi->host + DSI_HOST_VID_VBP_LINES);
+ 	writel(30, dsi->host + DSI_HOST_VID_VFP_LINES);
+@@ -5659,9 +5659,9 @@ static int micronux_native_configure_dpi_bridge(struct micronux_dsi *dsi)
+ 	    readl(dsi->host + DSI_HOST_VID_PKT_SIZE) != 800 ||
+ 	    readl(dsi->host + DSI_HOST_VID_NUM_CHUNKS) ||
+ 	    readl(dsi->host + DSI_HOST_VID_NULL_SIZE) ||
+-	    readl(dsi->host + DSI_HOST_VID_HSA_TIME) != 47 ||
+-	    readl(dsi->host + DSI_HOST_VID_HBP_TIME) != 47 ||
+-	    readl(dsi->host + DSI_HOST_VID_HLINE_TIME) != 2063 ||
++	    readl(dsi->host + DSI_HOST_VID_HSA_TIME) != 42 ||
++	    readl(dsi->host + DSI_HOST_VID_HBP_TIME) != 42 ||
++	    readl(dsi->host + DSI_HOST_VID_HLINE_TIME) != 1833 ||
+ 	    readl(dsi->host + DSI_HOST_VID_VSA_LINES) != 4 ||
+ 	    readl(dsi->host + DSI_HOST_VID_VBP_LINES) != 10 ||
+ 	    readl(dsi->host + DSI_HOST_VID_VFP_LINES) != 30 ||
+@@ -5675,7 +5675,7 @@ static int micronux_native_configure_dpi_bridge(struct micronux_dsi *dsi)
+ 		DSI_BRG_NATIVE_MISC_OFF)
+ 		return -EIO;
+ 	dev_info(dsi->dev,
+-		 "MICRONUX:M9.2:COLD-INIT stage=dpi-bridge state=CONFIGURED source=f240m divider=3 dpi-hz=80000000 host=command video-policy=0000ff02 frame-bta=enabled lp=all-periods-and-commands lpclk=00000003 burst=sync-pulses-type2 timing=800x1280:20/20/40:4/10/30 bridge=enabled output=off underflow-filler=00000000 discard-vcnt=800\n");
++		 "MICRONUX:M9.2:COLD-INIT stage=dpi-bridge state=CONFIGURED source=f240m divider=4 dpi-hz=60000000 host=command video-policy=0000ff02 frame-bta=enabled lp=all-periods-and-commands lpclk=00000003 burst=sync-pulses-type2 timing=800x1280:20/20/40:4/10/30 bridge=enabled output=off underflow-filler=00000000 discard-vcnt=800\n");
+ 	return 0;
+ }
+ 
+-- 
+2.54.0.windows.1

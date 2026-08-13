@@ -1,0 +1,41 @@
+From 836edacc6d2dc303638886b9a0e60abd1acc0ff6 Mon Sep 17 00:00:00 2001
+From: MicroNUX <micronux@local>
+Date: Wed, 12 Aug 2026 12:18:37 -0700
+Subject: [PATCH 45/46] mmc: dw_mmc: allow an isolated ESP32-P4 slot
+
+Permit an explicitly marked dual-slot controller to register one
+available child. This lets M9 suppress the failing removable slot
+without changing the shared C6 SDIO transport.
+
+Signed-off-by: MicroNUX <micronux@local>
+---
+ drivers/mmc/host/dw_mmc.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+index e87a490..f68733f 100644
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -3404,14 +3404,18 @@ static int dw_mci_init_slots(struct dw_mci *host)
+ 		}
+ 	}
+ 
+-	if (host->num_slots != ARRAY_SIZE(host->slots)) {
++	if (!host->num_slots ||
++	    (host->num_slots != ARRAY_SIZE(host->slots) &&
++	     !of_property_read_bool(host->dev->of_node,
++				    "espressif,allow-single-slot"))) {
+ 		dev_err(host->dev, "dual-slot profile requires slots 0 and 1\n");
+ 		ret = -EINVAL;
+ 		goto err_cleanup;
+ 	}
+ 
+ 	dev_info(host->dev,
+-		 "ESP32-P4 dual-slot arbitration enabled for microSD and C6 SDIO\n");
++		 "ESP32-P4 dual-slot arbitration enabled with %u active slot(s)\n",
++		 host->num_slots);
+ 	return 0;
+ 
+ err_cleanup:
+-- 
+2.54.0.windows.1

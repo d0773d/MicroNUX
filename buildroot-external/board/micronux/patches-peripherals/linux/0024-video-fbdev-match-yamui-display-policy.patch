@@ -1,0 +1,180 @@
+From 6420b4c468345c6b3b349eb107a1baf687e167f6 Mon Sep 17 00:00:00 2001
+From: MicroNUX <micronux@example.invalid>
+Date: Tue, 11 Aug 2026 18:15:30 -0700
+Subject: [PATCH 24/46] video: fbdev: match YamUI display policy
+
+Use the external backlight enable as the authoritative dark gate.
+Restore the stock ESP-IDF/YamUI clock-lane, low-power blanking, and
+frame-ack policy while retaining Linux triple-buffer IRQ-rearm ownership.
+
+Signed-off-by: MicroNUX <micronux@example.invalid>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 90 +++++++++++++++++++++++--------
+ 1 file changed, 67 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 107e361..eec4e0a 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -156,6 +156,8 @@
+ #define MICRONUX_SCANOUT_STABLE_FRAMES	4
+ #define MICRONUX_FRAME_REVEAL_RECENT_MS	250
+ #define MICRONUX_BACKLIGHT_OFF_SETTLE_MS 100
++#define MICRONUX_DISPLAY_BACKLIGHT_DISABLED 0x13
++#define MICRONUX_DISPLAY_BACKLIGHT_ENABLED 0x17
+ #define MICRONUX_VPG_SOURCE_SETTLE_MS	250
+ #define MICRONUX_VPG_TEST_MIN_MS	250
+ #define MICRONUX_VPG_TEST_MAX_MS	10000
+@@ -296,6 +298,7 @@ struct micronux_dsi {
+ 	unsigned long last_frame_jiffies;
+ 	u8 watchdog_stale_polls;
+ 	u8 applied_brightness;
++	bool backlight_gate_enabled;
+ 	u8 front_index;
+ 	u8 render_index;
+ 	s8 queued_index;
+@@ -578,29 +581,68 @@ static bool micronux_visible_source_valid(struct micronux_dsi *dsi)
+ 			   msecs_to_jiffies(MICRONUX_FRAME_REVEAL_RECENT_MS));
+ }
+ 
++static int micronux_backlight_disable(struct micronux_dsi *dsi)
++{
++	int gate_ret, pwm_ret;
++
++	pwm_ret = micronux_i2c_write_reg8(dsi, dsi->handoff.i2c_address,
++					  dsi->handoff.backlight_register, 0);
++	gate_ret = micronux_i2c_write_reg8(dsi, dsi->handoff.i2c_address,
++					   dsi->handoff.display_control_register,
++					   MICRONUX_DISPLAY_BACKLIGHT_DISABLED);
++	if (!pwm_ret || !gate_ret)
++		WRITE_ONCE(dsi->applied_brightness, 0);
++	if (gate_ret)
++		return gate_ret;
++	WRITE_ONCE(dsi->backlight_gate_enabled, false);
++	if (pwm_ret)
++		dev_warn_ratelimited(dsi->dev,
++				     "PWM blank failed: %d; hardware gate is disabled\n",
++				     pwm_ret);
++	return 0;
++}
++
+ static int micronux_backlight_update(struct backlight_device *backlight)
+ {
+ 	struct micronux_dsi *dsi = bl_get_data(backlight);
+ 	u8 brightness = backlight_get_brightness(backlight);
+-	int ret;
++	int disable_ret, gate_ret, pwm_ret;
+ 
+ 	if (backlight_is_blank(backlight))
+ 		brightness = 0;
+-	if (brightness && !micronux_visible_source_valid(dsi)) {
+-		ret = micronux_i2c_write_reg8(dsi, dsi->handoff.i2c_address,
+-					      dsi->handoff.backlight_register, 0);
+-		if (ret)
+-			return ret;
+-		WRITE_ONCE(dsi->applied_brightness, 0);
++	if (!brightness)
++		return micronux_backlight_disable(dsi);
++	if (!micronux_visible_source_valid(dsi)) {
++		disable_ret = micronux_backlight_disable(dsi);
+ 		dev_warn_ratelimited(dsi->dev,
+ 				     "refusing backlight reveal without a healthy video source\n");
+-		return -EHOSTDOWN;
+-	}
+-	ret = micronux_i2c_write_reg8(dsi, dsi->handoff.i2c_address,
+-				      dsi->handoff.backlight_register, brightness);
+-	if (!ret)
++		return disable_ret ? disable_ret : -EHOSTDOWN;
++	}
++
++	/* Stage PWM while BL_ENABLE is low, then reveal as the final write. */
++	pwm_ret = micronux_i2c_write_reg8(dsi, dsi->handoff.i2c_address,
++					  dsi->handoff.backlight_register,
++					  brightness);
++	if (!pwm_ret)
++		gate_ret = micronux_i2c_write_reg8(dsi,
++						   dsi->handoff.i2c_address,
++						   dsi->handoff.display_control_register,
++						   MICRONUX_DISPLAY_BACKLIGHT_ENABLED);
++	else
++		gate_ret = 0;
++	if (!pwm_ret && !gate_ret) {
+ 		WRITE_ONCE(dsi->applied_brightness, brightness);
+-	return ret;
++		WRITE_ONCE(dsi->backlight_gate_enabled, true);
++		return 0;
++	}
++
++	/* A failed or ambiguous reveal keeps the verified source running. */
++	disable_ret = micronux_backlight_disable(dsi);
++	if (disable_ret)
++		dev_err(dsi->dev,
++			"backlight reveal rollback failed: %d; preserving source\n",
++			disable_ret);
++	return pwm_ret ? pwm_ret : gate_ret;
+ }
+ 
+ static int micronux_backlight_get(struct backlight_device *backlight)
+@@ -1255,10 +1297,10 @@ static void micronux_select_framebuffer(struct micronux_dsi *dsi)
+ 	host = readl(dsi->host + DSI_HOST_VID_MODE_CFG);
+ 	lpclk = readl(dsi->host + DSI_HOST_LPCLK_CTRL);
+ 
+-	lpclk |= DSI_HOST_PHY_TXREQUESTCLKHS;
+-	lpclk &= ~DSI_HOST_AUTO_CLKLANE_CTRL;
+-	host &= ~(DSI_HOST_VPG_EN | DSI_HOST_FRAME_BTA_ACK_EN |
+-		  DSI_HOST_LP_VIDEO_EN_MASK);
++	lpclk &= ~DSI_HOST_PHY_TXREQUESTCLKHS;
++	lpclk |= DSI_HOST_AUTO_CLKLANE_CTRL;
++	host &= ~DSI_HOST_VPG_MASK;
++	host |= DSI_HOST_FRAME_BTA_ACK_EN | DSI_HOST_LP_VIDEO_EN_MASK;
+ 	writel(lpclk, dsi->host + DSI_HOST_LPCLK_CTRL);
+ 	writel(host, dsi->host + DSI_HOST_VID_MODE_CFG);
+ 	writel(bridge | DSI_BRG_DPI_EN,
+@@ -1280,11 +1322,12 @@ static bool micronux_source_policy_valid(struct micronux_dsi *dsi,
+ 	return (host & DSI_HOST_VID_MODE_TYPE_MASK) ==
+ 		DSI_HOST_VID_MODE_BURST &&
+ 	       (host & DSI_HOST_VPG_MASK) == expected_vpg &&
+-	       !(host & (DSI_HOST_FRAME_BTA_ACK_EN |
+-			 DSI_HOST_LP_VIDEO_EN_MASK)) &&
++	       (host & (DSI_HOST_FRAME_BTA_ACK_EN |
++			DSI_HOST_LP_VIDEO_EN_MASK)) ==
++		(DSI_HOST_FRAME_BTA_ACK_EN | DSI_HOST_LP_VIDEO_EN_MASK) &&
+ 	       (lpclk & (DSI_HOST_PHY_TXREQUESTCLKHS |
+ 			 DSI_HOST_AUTO_CLKLANE_CTRL)) ==
+-	       DSI_HOST_PHY_TXREQUESTCLKHS &&
++	       DSI_HOST_AUTO_CLKLANE_CTRL &&
+ 	       (!!(bridge & DSI_BRG_DPI_EN) == !vpg) &&
+ 	       !!channel;
+ }
+@@ -1608,7 +1651,7 @@ static ssize_t boot_ready_store(struct device *dev,
+ 		goto out;
+ 	}
+ 	dev_info(dsi->dev,
+-		 "MICRONUX:M9.2:SCANOUT state=running handoff=blanked-restart stable-frames=%u buffers=3 dma=irq-rearm backlight=restored reveal=userspace-ready frame-ack=disabled clock=forced-hs lp=disabled\n",
++		 "MICRONUX:M9.2:SCANOUT state=running handoff=blanked-restart stable-frames=%u buffers=3 dma=irq-rearm backlight=restored reveal=userspace-ready frame-ack=enabled clock=auto lp=enabled backlight-gate=enabled\n",
+ 		 MICRONUX_SCANOUT_STABLE_FRAMES);
+ out:
+ 	mutex_unlock(&dsi->backlight->ops_lock);
+@@ -1889,17 +1932,18 @@ static ssize_t scanout_show(struct device *dev,
+ 		      !(active & DSI_HOST_LP_VIDEO_EN_ACT_MASK);
+ 
+ 	return sysfs_emit(buf,
+-			  "%s frames=%u->%u error=%08x underruns=%u chen=%u faults=%lx host-errors=%08x:%08x frame-ack=%s clock=%s lp=%s buffers=3 front=%u queued=%d back=%u rearm=%u/%u flips=%u/%u generation=%u guards=%s guard-errors=%u\n",
++			  "%s frames=%u->%u error=%08x underruns=%u chen=%u faults=%lx host-errors=%08x:%08x frame-ack=%s clock=%s lp=%s backlight-gate=%s buffers=3 front=%u queued=%d back=%u rearm=%u/%u flips=%u/%u generation=%u guards=%s guard-errors=%u\n",
+ 			  after != before && !error && !underruns && !faults &&
+ 			  !host_error0 && !host_error1 &&
+ 			  guards_valid &&
+-			  frame_ack_disabled && clock_forced_hs && lp_disabled ?
++			  !frame_ack_disabled && !clock_forced_hs && !lp_disabled ?
+ 			  "running" : "stalled",
+ 			  before, after, error, underruns, !!channel_enable,
+ 			  faults, host_error0, host_error1,
+ 			  frame_ack_disabled ? "off" : "on",
+ 			  clock_forced_hs ? "forced-hs" : "auto",
+ 			  lp_disabled ? "disabled" : "enabled",
++			  READ_ONCE(dsi->backlight_gate_enabled) ? "on" : "off",
+ 			  front, queued, render, rearm_attempts,
+ 			  rearm_failures, flip_requests, flip_completions,
+ 			  READ_ONCE(dsi->source_generation),
+-- 
+2.54.0.windows.1

@@ -1,7 +1,7 @@
 From 8a5f3d53cc030834927c4633331a87963f54aa65 Mon Sep 17 00:00:00 2001
 From: MicroNUX Project <micronux@example.invalid>
 Date: Sat, 8 Aug 2026 03:15:00 -0700
-Subject: [PATCH 01/22] mmc: dw: add ESP32-P4 polled IDMAC mode
+Subject: [PATCH 01/46] mmc: dw: add ESP32-P4 polled IDMAC mode
 
 ESP32-P4 integrates a Synopsys DesignWare Mobile Storage Host Controller,
 but the initial MicroNUX NOMMU port keeps normal block-layer buffers in

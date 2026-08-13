@@ -20,7 +20,13 @@ RISCV_IMAGE_MAGIC = b"RISCV\0\0\0"
 FDT_MAGIC = b"\xd0\x0d\xfe\xed"
 
 
-def read_image(path: Path) -> tuple[bytes, int]:
+def parse_address(value: str) -> int:
+    return int(value, 0)
+
+
+def read_image(
+    path: Path, max_memory_end: int = COMMS_RESERVE_ADDRESS
+) -> tuple[bytes, int]:
     image = path.read_bytes()
     if len(image) < 64:
         raise ValueError(f"Linux Image is too short: {len(image)} bytes")
@@ -34,9 +40,10 @@ def read_image(path: Path) -> tuple[bytes, int]:
         raise ValueError(
             f"Image memory span {memory_size:#x} is smaller than file {len(image):#x}"
         )
-    if KERNEL_LOAD_ADDRESS + memory_size > COMMS_RESERVE_ADDRESS:
+    if KERNEL_LOAD_ADDRESS + memory_size > max_memory_end:
         raise ValueError(
-            "Image memory span overlaps the 0x49f00000 communication reserve"
+            f"Image memory span ends at {KERNEL_LOAD_ADDRESS + memory_size:#010x}, "
+            f"past the configured boundary {max_memory_end:#010x}"
         )
     return image, memory_size
 
@@ -81,9 +88,15 @@ def main() -> int:
     parser.add_argument("--image", required=True, type=Path)
     parser.add_argument("--dtb", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--max-memory-end",
+        type=parse_address,
+        default=COMMS_RESERVE_ADDRESS,
+        help="exclusive virtual-address ceiling for the Image memory span",
+    )
     args = parser.parse_args()
 
-    image, memory_size = read_image(args.image)
+    image, memory_size = read_image(args.image, args.max_memory_end)
     dtb = read_dtb(args.dtb)
     manifest = make_manifest(image, memory_size, dtb)
     args.output.parent.mkdir(parents=True, exist_ok=True)

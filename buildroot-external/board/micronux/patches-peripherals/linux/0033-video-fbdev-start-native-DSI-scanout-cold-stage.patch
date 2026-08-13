@@ -1,0 +1,1402 @@
+From d9dd1b9bebfea6050659c859004c26fc984752d6 Mon Sep 17 00:00:00 2001
+From: d0773d <dottedquad@gmail.com>
+Date: Wed, 12 Aug 2026 01:12:10 -0700
+Subject: [PATCH 33/46] video: fbdev: start native DSI scanout cold stage
+
+Run the ABI-v3 cold-init request through native DPI, bridge, and
+one-frame GDMA initialization after the panel programming boundary.
+
+Initialize and verify deterministic black triple buffers and the
+dedicated descriptor page. Use the stock ESP-IDF v6.0.1 video policy,
+qualify two strict four-frame windows, then register fbdev while
+illumination remains unregistered. Roll every failure back through
+verified quiescent containment. The ABI-v2 adopt-live path is unchanged.
+
+Signed-off-by: d0773d <dottedquad@gmail.com>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 1097 ++++++++++++++++++++++++++++-
+ 1 file changed, 1087 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 6e31b16..81ed0de 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -27,6 +27,7 @@
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/platform_device.h>
++#include <linux/sched.h>
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+ #include <linux/uaccess.h>
+@@ -162,6 +163,16 @@
+ #define DSI_HOST_GEN_VCID		0x30
+ #define DSI_HOST_MODE_CFG		0x34
+ #define DSI_HOST_VID_MODE_CFG		0x38
++#define DSI_HOST_VID_PKT_SIZE		0x3c
++#define DSI_HOST_VID_NUM_CHUNKS		0x40
++#define DSI_HOST_VID_NULL_SIZE		0x44
++#define DSI_HOST_VID_HSA_TIME		0x48
++#define DSI_HOST_VID_HBP_TIME		0x4c
++#define DSI_HOST_VID_HLINE_TIME		0x50
++#define DSI_HOST_VID_VSA_LINES		0x54
++#define DSI_HOST_VID_VBP_LINES		0x58
++#define DSI_HOST_VID_VFP_LINES		0x5c
++#define DSI_HOST_VID_VACTIVE_LINES	0x60
+ #define DSI_HOST_CMD_MODE_CFG		0x68
+ #define DSI_HOST_GEN_HDR			0x6c
+ #define DSI_HOST_GEN_PLD_DATA		0x70
+@@ -190,6 +201,9 @@
+ #define DSI_HOST_INT_STATUS1_DPI_PATH	(BIT(7) | BIT(19))
+ #define DSI_HOST_INT_STATUS1_FB_STARTUP_GRACE DSI_HOST_INT_STATUS1_DPI_PATH
+ #define DSI_HOST_INT_STATUS1_FATAL	DSI_HOST_INT_STATUS1_DPI_PATH
++#define DSI_HOST_DPI_VCID		0x0c
++#define DSI_HOST_DPI_COLOR_CODING	0x10
++#define DSI_HOST_DPI_CFG_POL		0x14
+ #define DSI_HOST_VID_MODE_CFG_ACT	0x138
+ #define DSI_HOST_VID_PKT_STATUS		0x168
+ #define DSI_HOST_VPG_EN			BIT(16)
+@@ -226,9 +240,17 @@
+ #define DSI_HOST_CMD_MODE_DBI_LP		0x010f7f02
+ #define DSI_HOST_FRAME_BTA_ACK_EN_ACT	BIT(8)
+ #define DSI_HOST_LP_VIDEO_EN_ACT_MASK	(GENMASK(7, 2) | BIT(9))
++#define DSI_HOST_NATIVE_VIDEO_POLICY	(DSI_HOST_FRAME_BTA_ACK_EN | \
++					 DSI_HOST_LP_VIDEO_EN_MASK | \
++					 DSI_HOST_VID_MODE_BURST)
++#define DSI_HOST_NATIVE_VIDEO_POLICY_ACT \
++	(DSI_HOST_FRAME_BTA_ACK_EN_ACT | DSI_HOST_LP_VIDEO_EN_ACT_MASK | \
++	 DSI_HOST_VID_MODE_BURST)
+ 
+ #define DSI_BRG_CLK_EN			0x00
+ #define DSI_BRG_EN			0x04
++#define DSI_BRG_BURST_LEN		0x08
++#define DSI_BRG_CREDIT_CONFIG		0x10
+ #define DSI_BRG_DPI_MISC_CONFIG		0x40
+ #define DSI_BRG_MODULE_EN		BIT(0)
+ #define DSI_BRG_DPI_EN			BIT(0)
+@@ -237,14 +259,50 @@
+ #define DSI_BRG_RAW_NUM_TOTAL_SET	BIT(31)
+ #define DSI_BRG_FIFO_FLOW_STATUS	0x14
+ #define DSI_BRG_DMA_BLOCK_INTERVAL	0x1c
++#define DSI_BRG_DMA_REQUEST_INTERVAL	0x20
++#define DSI_BRG_PIXEL_TYPE		0x18
++#define DSI_BRG_V_TIMING0		0x30
++#define DSI_BRG_V_TIMING1		0x34
++#define DSI_BRG_H_TIMING0		0x38
++#define DSI_BRG_H_TIMING1		0x3c
+ #define DSI_BRG_RAW_NUM_AUTO_RELOAD	BIT(28)
+ #define DSI_BRG_INT_ENA			0x50
+ #define DSI_BRG_INT_CLR			0x54
+ #define DSI_BRG_INT_RAW			0x58
+ #define DSI_BRG_INT_UNDERRUN		BIT(0)
+ 
++#define DSI_BRG_FRAME_INTERVAL		0x6c
++#define DSI_BRG_HOST_CTRL		0x80
++#define DSI_BRG_MEM_CLK_CTRL		0x84
++#define DSI_BRG_DMA_FLOW_CTRL		0x88
++#define DSI_BRG_FIFO_EMPTY_THRESHOLD	0x8c
++
++#define DSI_BRG_NATIVE_BURST_LEN	0x00000100
++#define DSI_BRG_NATIVE_RAW_NUM		0x0003e800
++#define DSI_BRG_NATIVE_CREDIT		0x03200400
++#define DSI_BRG_NATIVE_PIXEL_TYPE	0x00000002
++#define DSI_BRG_NATIVE_BLOCK_INTERVAL	0x30002409
++#define DSI_BRG_NATIVE_REQUEST_INTERVAL	0x00000001
++#define DSI_BRG_NATIVE_V_TIMING0	0x0500052c
++#define DSI_BRG_NATIVE_V_TIMING1	0x0004000a
++#define DSI_BRG_NATIVE_H_TIMING0	0x03200370
++#define DSI_BRG_NATIVE_H_TIMING1	0x00140014
++#define DSI_BRG_NATIVE_MISC_OFF		0x00003200
++#define DSI_BRG_NATIVE_MISC_ON		0x00003201
++#define DSI_BRG_NATIVE_FRAME_INTERVAL	0x20002409
++#define DSI_BRG_NATIVE_HOST_CTRL	0x00000001
++#define DSI_BRG_NATIVE_DMA_FLOW		0x00000010
++#define DSI_BRG_NATIVE_FIFO_THRESHOLD	0x00000300
++
++#define DW_GDMA_CFG			0x10
+ #define DW_GDMA_CHEN			0x18
+ #define DW_GDMA_CHABORT			0x1c
++#define DW_GDMA_INT_STATUS		0x30
++#define DW_GDMA_INT_CLEAR		0x38
++#define DW_GDMA_INT_STATUS_ENA		0x40
++#define DW_GDMA_INT_SIGNAL_ENA		0x48
++#define DW_GDMA_INT_COMMON_STATUS	0x50
++#define DW_GDMA_RESET			0x58
+ #define DW_GDMA_CH_BASE(channel)	(0x100 + (channel) * 0x100)
+ #define DW_GDMA_CH_SAR			0x00
+ #define DW_GDMA_CH_DAR			0x08
+@@ -255,10 +313,14 @@
+ #define DW_GDMA_CH_CFG_HI		0x24
+ #define DW_GDMA_CH_LLP			0x28
+ #define DW_GDMA_CH_STATUS		0x30
++#define DW_GDMA_CH_INT_STATUS_ENA1	0x84
+ #define DW_GDMA_CH_INT_STATUS_ENA	0x80
+ #define DW_GDMA_CH_INT_STATUS		0x88
++#define DW_GDMA_CH_INT_STATUS1		0x8c
+ #define DW_GDMA_CH_INT_SIGNAL_ENA	0x90
++#define DW_GDMA_CH_INT_SIGNAL_ENA1	0x94
+ #define DW_GDMA_CH_INT_CLEAR		0x98
++#define DW_GDMA_CH_INT_CLEAR1		0x9c
+ #define DW_GDMA_INT_BLOCK_TFR_DONE	BIT(0)
+ #define DW_GDMA_INT_DMA_TFR_DONE	BIT(1)
+ #define DW_GDMA_INT_ERROR_MASK		(GENMASK(14, 5) | GENMASK(21, 16) | \
+@@ -266,10 +328,22 @@
+ #define DW_GDMA_INT_SCANOUT_MASK	(DW_GDMA_INT_BLOCK_TFR_DONE | \
+ 					 DW_GDMA_INT_DMA_TFR_DONE | \
+ 					 DW_GDMA_INT_ERROR_MASK)
++#define DW_GDMA_INT_NATIVE_SCANOUT_MASK \
++	(DW_GDMA_INT_DMA_TFR_DONE | DW_GDMA_INT_ERROR_MASK)
++#define DW_GDMA_INT_STATUS0_RO_MASK	BIT(25)
++#define DW_GDMA_INT_ECC_ERROR_MASK	GENMASK(3, 0)
++#define DW_GDMA_INT_COMMON_VALID_MASK	0x001fff8f
++#define DW_GDMA_INT_COMMON_RO_MASK	0x001ffe80
++#define DW_GDMA_INT_TOP_CHANNEL0	BIT(0)
++#define DW_GDMA_INT_TOP_COMMON		BIT(16)
++#define DW_GDMA_INT_TOP_ALLOWED		(DW_GDMA_INT_TOP_CHANNEL0 | \
++					 DW_GDMA_INT_TOP_COMMON)
+ #define DW_GDMA_LLP_MEMORY_PORT		BIT(0)
+ #define MICRONUX_DMA_BLOCK_TRANSFER_SIZE 0x0003e7ff
+ #define MICRONUX_DMA_DESCRIPTOR_CTRL_LO	0x001e1b41
+ #define MICRONUX_DMA_DESCRIPTOR_CTRL_HI	0x400f87c0
++#define MICRONUX_NATIVE_DMA_DESCRIPTOR_CTRL_HI	0x40108840
++#define MICRONUX_NATIVE_DMA_DESCRIPTOR_ARMED	0xc0108840
+ #define MICRONUX_DMA_CHANNEL_CFG_LO	0x0000000f
+ #define MICRONUX_DMA_CHANNEL_CFG_HI	0x0a020001
+ #define MICRONUX_HEALTH_POLL_MS		50
+@@ -278,6 +352,7 @@
+ #define MICRONUX_RENDER_COMMIT_MS	20
+ #define MICRONUX_SCANOUT_START_TIMEOUT_MS 500
+ #define MICRONUX_SCANOUT_STABLE_FRAMES	4
++#define MICRONUX_NATIVE_QUALIFICATION_WINDOWS	2
+ #define MICRONUX_FRAME_REVEAL_RECENT_MS	250
+ #define MICRONUX_BACKLIGHT_OFF_SETTLE_MS 100
+ #define MICRONUX_DISPLAY_BACKLIGHT_DISABLED 0x13
+@@ -320,6 +395,11 @@
+ #define HP_CLKRST_DSI_DPHY_CFG_CLK_EN	BIT(0)
+ #define HP_CLKRST_DSI_DPHY_PLL_REFCLK_EN BIT(1)
+ #define HP_CLKRST_DSI_DPI_CLK_EN	BIT(7)
++#define HP_CLKRST_DSI_DPI_CLK_SRC	GENMASK(6, 5)
++#define HP_CLKRST_DSI_DPI_CLK_DIV	GENMASK(15, 8)
++#define HP_CLKRST_DSI_DPI_CLK_SRC_F240M	1
++#define HP_CLKRST_DSI_DPI_CLK_DIV_VALUE	2
++#define HP_CLKRST_DSI_DPI_CLOCK_VALUE	0x000002a3
+ #define HP_CLKRST_GDMA_RESET		BIT(21)
+ #define HP_CLKRST_DSI_BRIDGE_RESET	BIT(26)
+ #define HP_CLKRST_I2C0_RESET		BIT(22)
+@@ -555,6 +635,9 @@ enum micronux_display_state {
+ 	MICRONUX_DISPLAY_STATE_COLD_INITIALIZING,
+ 	MICRONUX_DISPLAY_STATE_LDO_READY,
+ 	MICRONUX_DISPLAY_STATE_PANEL_PROGRAMMED_QUIESCENT,
++	MICRONUX_DISPLAY_STATE_SCANOUT_INITIALIZING,
++	MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT,
++	MICRONUX_DISPLAY_STATE_REMOVING,
+ 	MICRONUX_DISPLAY_STATE_FAILED_QUIESCENT,
+ 	MICRONUX_DISPLAY_STATE_FAILED_UNVERIFIED,
+ 	MICRONUX_DISPLAY_STATE_RUNTIME_READY,
+@@ -664,6 +747,15 @@ struct micronux_dsi {
+ 	bool cold_ldo_enabled;
+ 	bool cold_dsi_active;
+ 	bool cold_ref20_enabled_by_linux;
++	bool cold_dpi_enabled;
++	bool cold_bridge_active;
++	bool cold_gdma_hp_mutated;
++	bool cold_gdma_active;
++	bool cold_irq_registered;
++	bool cold_fb_registered;
++	bool cold_timer_initialized;
++	bool cold_runtime_unverified;
++	bool render_enabled;
+ 	struct hrtimer scanout_timer;
+ 	struct work_struct fault_work;
+ };
+@@ -1033,6 +1125,9 @@ static int micronux_backlight_set_power(struct micronux_dsi *dsi, int power)
+ 	return ret;
+ }
+ 
++static void micronux_cold_runtime_fail_quiescent(struct micronux_dsi *dsi,
++						 const char *stage, int error);
++
+ static void micronux_fault_work(struct work_struct *work)
+ {
+ 	struct micronux_dsi *dsi = container_of(work, struct micronux_dsi,
+@@ -1041,8 +1136,17 @@ static void micronux_fault_work(struct work_struct *work)
+ 	int ret;
+ 
+ 	mutex_lock(&dsi->mode_lock);
+-	mutex_lock(&dsi->backlight->ops_lock);
+ 	faults = READ_ONCE(dsi->fault_bits);
++	if (dsi->required_handoff_abi ==
++	    MICRONUX_DISPLAY_ABI_VERSION_V3) {
++		if (faults &&
++		    READ_ONCE(dsi->display_state) ==
++			MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT)
++			micronux_cold_runtime_fail_quiescent(dsi, "runtime-fault", -EIO);
++		mutex_unlock(&dsi->mode_lock);
++		return;
++	}
++	mutex_lock(&dsi->backlight->ops_lock);
+ 	if (!READ_ONCE(dsi->scanout_ready) || !faults)
+ 		goto out;
+ 
+@@ -1373,13 +1477,28 @@ static void micronux_flush_render(struct micronux_dsi *dsi)
+ 	mutex_unlock(&dsi->render_lock);
+ }
+ 
++static bool micronux_render_allowed(struct micronux_dsi *dsi)
++{
++	if (dsi->required_handoff_abi != MICRONUX_DISPLAY_ABI_VERSION_V3)
++		return true;
++	return READ_ONCE(dsi->render_enabled) &&
++	       READ_ONCE(dsi->display_state) ==
++		MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT;
++}
++
+ static ssize_t micronux_fb_read(struct fb_info *info, char __user *buf,
+ 				size_t count, loff_t *ppos)
+ {
+ 	struct micronux_dsi *dsi = info->par;
+ 	ssize_t ret;
+ 
++	if (!micronux_render_allowed(dsi))
++		return -EAGAIN;
+ 	mutex_lock(&dsi->render_lock);
++	if (!micronux_render_allowed(dsi)) {
++		mutex_unlock(&dsi->render_lock);
++		return -EAGAIN;
++	}
+ 	micronux_prepare_render_locked(dsi);
+ 	ret = fb_io_read(info, buf, count, ppos);
+ 	mutex_unlock(&dsi->render_lock);
+@@ -1398,7 +1517,13 @@ static ssize_t micronux_fb_write(struct fb_info *info,
+ 	ssize_t written = 0;
+ 	int error = 0;
+ 
++	if (!micronux_render_allowed(dsi))
++		return -EAGAIN;
+ 	mutex_lock(&dsi->render_lock);
++	if (!micronux_render_allowed(dsi)) {
++		error = -EAGAIN;
++		goto out_unlock;
++	}
+ 	micronux_prepare_render_locked(dsi);
+ 	if (!info->screen_base)
+ 		goto no_device;
+@@ -1464,7 +1589,13 @@ static void micronux_fb_fillrect(struct fb_info *info,
+ {
+ 	struct micronux_dsi *dsi = info->par;
+ 
++	if (!micronux_render_allowed(dsi))
++		return;
+ 	mutex_lock(&dsi->render_lock);
++	if (!micronux_render_allowed(dsi)) {
++		mutex_unlock(&dsi->render_lock);
++		return;
++	}
+ 	micronux_prepare_render_locked(dsi);
+ 	cfb_fillrect(info, rect);
+ 	micronux_mark_render_dirty_locked(dsi);
+@@ -1476,7 +1607,13 @@ static void micronux_fb_copyarea(struct fb_info *info,
+ {
+ 	struct micronux_dsi *dsi = info->par;
+ 
++	if (!micronux_render_allowed(dsi))
++		return;
+ 	mutex_lock(&dsi->render_lock);
++	if (!micronux_render_allowed(dsi)) {
++		mutex_unlock(&dsi->render_lock);
++		return;
++	}
+ 	micronux_prepare_render_locked(dsi);
+ 	cfb_copyarea(info, area);
+ 	micronux_mark_render_dirty_locked(dsi);
+@@ -1488,7 +1625,13 @@ static void micronux_fb_imageblit(struct fb_info *info,
+ {
+ 	struct micronux_dsi *dsi = info->par;
+ 
++	if (!micronux_render_allowed(dsi))
++		return;
+ 	mutex_lock(&dsi->render_lock);
++	if (!micronux_render_allowed(dsi)) {
++		mutex_unlock(&dsi->render_lock);
++		return;
++	}
+ 	micronux_prepare_render_locked(dsi);
+ 	cfb_imageblit(info, image);
+ 	micronux_mark_render_dirty_locked(dsi);
+@@ -1555,6 +1698,109 @@ static int micronux_dma_start_frame(struct micronux_dsi *dsi, u8 index)
+ 	return micronux_dma_arm_frame(dsi, index);
+ }
+ 
++static int micronux_native_dma_arm_frame(struct micronux_dsi *dsi, u8 index)
++{
++	u32 channel = BIT(dsi->handoff.dma_channel);
++	u32 descriptor_address = dsi->handoff.dma_descriptor_address +
++				 index * MICRONUX_DMA_DESCRIPTOR_SIZE;
++	void __iomem *descriptor = dsi->descriptor[index];
++
++	if (index >= MICRONUX_DISPLAY_BUFFER_COUNT)
++		return -EINVAL;
++	WRITE_ONCE(dsi->rearm_attempts,
++		   READ_ONCE(dsi->rearm_attempts) + 1);
++	writel(MICRONUX_NATIVE_DMA_DESCRIPTOR_ARMED,
++	       descriptor + DMA_LLI_CTRL_HI);
++	writel(MICRONUX_DMA_CHANNEL_CFG_LO,
++	       dsi->channel + DW_GDMA_CH_CFG_LO);
++	writel(MICRONUX_DMA_CHANNEL_CFG_HI,
++	       dsi->channel + DW_GDMA_CH_CFG_HI);
++	writel(descriptor_address | DW_GDMA_LLP_MEMORY_PORT,
++	       dsi->channel + DW_GDMA_CH_LLP);
++	writel(0, dsi->channel + DW_GDMA_CH_LLP + sizeof(u32));
++	/* Publish descriptor and channel programming before enabling GDMA. */
++	wmb();
++	writel(channel | (channel << 8), dsi->gdma + DW_GDMA_CHEN);
++	if (!(readl(dsi->gdma + DW_GDMA_CHEN) & channel) ||
++	    readl(descriptor + DMA_LLI_CTRL_HI) !=
++		MICRONUX_NATIVE_DMA_DESCRIPTOR_ARMED ||
++	    readl(dsi->channel + DW_GDMA_CH_CFG_LO) !=
++		MICRONUX_DMA_CHANNEL_CFG_LO ||
++	    readl(dsi->channel + DW_GDMA_CH_CFG_HI) !=
++		MICRONUX_DMA_CHANNEL_CFG_HI ||
++	    readl(dsi->channel + DW_GDMA_CH_LLP) !=
++		(descriptor_address | DW_GDMA_LLP_MEMORY_PORT)) {
++		WRITE_ONCE(dsi->rearm_failures,
++			   READ_ONCE(dsi->rearm_failures) + 1);
++		return -EIO;
++	}
++	return 0;
++}
++
++static irqreturn_t micronux_native_dma_irq(struct micronux_dsi *dsi)
++{
++	unsigned long flags;
++	u32 common, status0, status1, top;
++	u8 next_index;
++	bool faulted, rearm_failed = false;
++
++	top = readl(dsi->gdma + DW_GDMA_INT_STATUS);
++	status0 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS);
++	status1 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS1);
++	common = readl(dsi->gdma + DW_GDMA_INT_COMMON_STATUS);
++	if (!(top | status0 | status1 | common))
++		return IRQ_NONE;
++
++	/* Clear every underlying W1C source before deciding whether to rearm. */
++	writel(status0, dsi->channel + DW_GDMA_CH_INT_CLEAR);
++	writel(status1, dsi->channel + DW_GDMA_CH_INT_CLEAR1);
++	writel(common, dsi->gdma + DW_GDMA_INT_CLEAR);
++	if (top & ~DW_GDMA_INT_TOP_ALLOWED) {
++		/* Stop an immutable inactive-channel level source from retriggering. */
++		writel(1, dsi->gdma + DW_GDMA_CFG);
++		readl(dsi->gdma + DW_GDMA_CFG);
++	}
++	if ((top & ~DW_GDMA_INT_TOP_ALLOWED) ||
++	    (status0 & DW_GDMA_INT_ERROR_MASK) ||
++	    (status1 & DW_GDMA_INT_ECC_ERROR_MASK) ||
++	    (common & DW_GDMA_INT_COMMON_VALID_MASK)) {
++		WRITE_ONCE(dsi->last_dma_error,
++			   (status0 & DW_GDMA_INT_ERROR_MASK) |
++			   ((status1 || common ||
++			     (top & ~DW_GDMA_INT_TOP_ALLOWED)) ? BIT(31) : 0));
++		micronux_latch_fault(dsi, MICRONUX_FAULT_DMA);
++		return IRQ_HANDLED;
++	}
++
++	if (!(status0 & DW_GDMA_INT_DMA_TFR_DONE))
++		return IRQ_HANDLED;
++	WRITE_ONCE(dsi->scanout_frames,
++		   READ_ONCE(dsi->scanout_frames) + 1);
++	WRITE_ONCE(dsi->last_frame_jiffies, jiffies);
++	spin_lock_irqsave(&dsi->state_lock, flags);
++	if (dsi->scanout_active) {
++		faulted = READ_ONCE(dsi->fault_bits);
++		next_index = !faulted && dsi->queued_index >= 0 ?
++			dsi->queued_index : dsi->front_index;
++		if (faulted || micronux_native_dma_arm_frame(dsi, next_index)) {
++			rearm_failed = !faulted;
++		} else {
++			if (dsi->queued_index >= 0) {
++				dsi->front_index = dsi->queued_index;
++				dsi->queued_index = -1;
++				dsi->flip_completions++;
++			}
++			dsi->source_generation++;
++		}
++	}
++	spin_unlock_irqrestore(&dsi->state_lock, flags);
++	if (rearm_failed) {
++		WRITE_ONCE(dsi->last_dma_error, BIT(30));
++		micronux_latch_fault(dsi, MICRONUX_FAULT_DMA);
++	}
++	return IRQ_HANDLED;
++}
++
+ static irqreturn_t micronux_dma_irq(int irq, void *data)
+ {
+ 	struct micronux_dsi *dsi = data;
+@@ -1564,6 +1810,8 @@ static irqreturn_t micronux_dma_irq(int irq, void *data)
+ 	bool rearm_failed = false;
+ 	u32 status;
+ 
++	if (dsi->required_handoff_abi == MICRONUX_DISPLAY_ABI_VERSION_V3)
++		return micronux_native_dma_irq(dsi);
+ 	status = readl(dsi->channel + DW_GDMA_CH_INT_STATUS);
+ 	if (!status)
+ 		return IRQ_NONE;
+@@ -1618,13 +1866,17 @@ static void micronux_watchdog_seed_progress(struct micronux_dsi *dsi)
+ 	dsi->watchdog_stale_polls = 0;
+ }
+ 
++static bool micronux_native_runtime_policy_valid(struct micronux_dsi *dsi);
++
+ static enum hrtimer_restart micronux_dma_poll(struct hrtimer *timer)
+ {
+ 	struct micronux_dsi *dsi = container_of(timer, struct micronux_dsi,
+ 					       scanout_timer);
+ 	u32 bridge_status, frames, sar;
+-	bool monitor;
++	bool host_status, monitor, native;
+ 
++	native = dsi->required_handoff_abi ==
++		 MICRONUX_DISPLAY_ABI_VERSION_V3;
+ 	bridge_status = readl(dsi->bridge + DSI_BRG_INT_RAW);
+ 	if (bridge_status & DSI_BRG_INT_UNDERRUN) {
+ 		writel(DSI_BRG_INT_UNDERRUN,
+@@ -1633,14 +1885,20 @@ static enum hrtimer_restart micronux_dma_poll(struct hrtimer *timer)
+ 			   READ_ONCE(dsi->bridge_underruns) + 1);
+ 		micronux_latch_fault(dsi, MICRONUX_FAULT_UNDERRUN);
+ 	}
+-	(void)micronux_sample_host_status(dsi, 0);
++	host_status = micronux_sample_host_status(dsi, 0);
++	if (native && host_status)
++		micronux_latch_fault(dsi, MICRONUX_FAULT_DSI_HOST);
+ 	frames = READ_ONCE(dsi->scanout_frames);
+ 	sar = readl(dsi->channel + DW_GDMA_CH_SAR);
+ 	monitor = READ_ONCE(dsi->scanout_ready) &&
+-		  READ_ONCE(dsi->boot_display_ready) &&
+ 		  READ_ONCE(dsi->scanout_active) &&
+ 		  !READ_ONCE(dsi->vpg_test_active) &&
+-		  !READ_ONCE(dsi->fault_bits);
++		  !READ_ONCE(dsi->fault_bits) &&
++		  (native ? READ_ONCE(dsi->display_state) ==
++			MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT :
++			READ_ONCE(dsi->boot_display_ready));
++	if (monitor && native && !micronux_native_runtime_policy_valid(dsi))
++		micronux_latch_fault(dsi, MICRONUX_FAULT_DMA);
+ 	if (monitor && !micronux_pool_guards_valid(dsi, false)) {
+ 		WRITE_ONCE(dsi->pool_guard_errors,
+ 			   READ_ONCE(dsi->pool_guard_errors) + 1);
+@@ -1959,6 +2217,9 @@ static int micronux_fb_blank(int blank, struct fb_info *info)
+ 	struct micronux_dsi *dsi = info->par;
+ 	int ret;
+ 
++	/* register_framebuffer() can call us while cold_init owns mode_lock. */
++	if (dsi->required_handoff_abi == MICRONUX_DISPLAY_ABI_VERSION_V3)
++		return 0;
+ 	mutex_lock(&dsi->mode_lock);
+ 	mutex_lock(&dsi->backlight->ops_lock);
+ 	ret = __micronux_fb_blank(blank, info);
+@@ -3544,7 +3805,8 @@ static void micronux_cold_fail_quiescent(struct micronux_dsi *dsi,
+ 	display_blocks = micronux_cold_dsi_disable(dsi);
+ 	ldo_off = micronux_cold_ldo_disable(dsi);
+ 	contained = !pwm_ret && !prepare_ret && !reset_ret && i2c_released &&
+-		    display_blocks && ldo_off;
++		    display_blocks && ldo_off &&
++		    !READ_ONCE(dsi->cold_runtime_unverified);
+ 	if (contained) {
+ 		dsi->display_state = MICRONUX_DISPLAY_STATE_FAILED_QUIESCENT;
+ 		state = "FAILED_QUIESCENT";
+@@ -3560,7 +3822,8 @@ static void micronux_cold_fail_quiescent(struct micronux_dsi *dsi,
+ 		prepare_ret ? "failed" : "acked",
+ 		reset_ret ? "failed" : "acked", ldo_off ? "clear" : "error",
+ 		i2c_released ? "released-gated" : "state-error",
+-		display_blocks ? "resets-asserted-clocks-off" : "state-error",
++		(display_blocks && !READ_ONCE(dsi->cold_runtime_unverified)) ?
++		"resets-asserted-clocks-off" : "state-error",
+ 		retry);
+ }
+ 
+@@ -3674,6 +3937,12 @@ static ssize_t native_state_show(struct device *dev,
+ 		return sysfs_emit(buf, "LDO_READY\n");
+ 	if (state == MICRONUX_DISPLAY_STATE_PANEL_PROGRAMMED_QUIESCENT)
+ 		return sysfs_emit(buf, "PANEL_PROGRAMMED_QUIESCENT\n");
++	if (state == MICRONUX_DISPLAY_STATE_SCANOUT_INITIALIZING)
++		return sysfs_emit(buf, "SCANOUT_INITIALIZING\n");
++	if (state == MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT)
++		return sysfs_emit(buf, "SCANOUT_QUALIFIED_QUIESCENT\n");
++	if (state == MICRONUX_DISPLAY_STATE_REMOVING)
++		return sysfs_emit(buf, "REMOVING\n");
+ 	if (state == MICRONUX_DISPLAY_STATE_FAILED_QUIESCENT)
+ 		return sysfs_emit(buf, "FAILED_QUIESCENT\n");
+ 	if (state == MICRONUX_DISPLAY_STATE_FAILED_UNVERIFIED)
+@@ -3684,6 +3953,8 @@ static ssize_t native_state_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(native_state);
+ 
++static int micronux_cold_initialize_scanout_stage(struct micronux_dsi *dsi);
++
+ static ssize_t cold_init_store(struct device *dev,
+ 			       struct device_attribute *attribute,
+ 			       const char *buf, size_t count)
+@@ -3708,6 +3979,8 @@ static ssize_t cold_init_store(struct device *dev,
+ 	ret = micronux_cold_initialize_ldo_stage(dsi);
+ 	if (!ret)
+ 		ret = micronux_cold_initialize_panel_stage(dsi);
++	if (!ret)
++		ret = micronux_cold_initialize_scanout_stage(dsi);
+ unlock:
+ 	mutex_unlock(&dsi->mode_lock);
+ 	return ret ? ret : count;
+@@ -4215,6 +4488,798 @@ static int micronux_register_framebuffer(struct micronux_dsi *dsi)
+ 	return register_framebuffer(info);
+ }
+ 
++static void micronux_bind_cold_runtime_profile(struct micronux_dsi *dsi)
++{
++	struct micronux_display_handoff_v3 *cold = &dsi->cold_handoff;
++	struct micronux_display_handoff_v2 *runtime = &dsi->handoff;
++	u8 index;
++
++	memset(runtime, 0, sizeof(*runtime));
++	runtime->magic = cold->magic;
++	runtime->abi_version = cold->abi_version;
++	runtime->struct_size = sizeof(*runtime);
++	runtime->flags = MICRONUX_DISPLAY_RGB565 |
++			 MICRONUX_DISPLAY_DMA_IRQ_REARM |
++			 MICRONUX_DISPLAY_TRIPLE_BUFFER;
++	runtime->width = cold->width;
++	runtime->height = cold->height;
++	runtime->stride = cold->stride;
++	runtime->pixel_clock_hz = cold->pixel_clock_hz;
++	runtime->lane_bit_rate_mbps = cold->lane_bit_rate_mbps;
++	runtime->data_lanes = cold->data_lanes;
++	runtime->buffer_count = cold->buffer_count;
++	runtime->ownership_state = cold->ownership_state;
++	runtime->hsync_pulse_width = cold->hsync_pulse_width;
++	runtime->hsync_back_porch = cold->hsync_back_porch;
++	runtime->hsync_front_porch = cold->hsync_front_porch;
++	runtime->vsync_pulse_width = cold->vsync_pulse_width;
++	runtime->vsync_back_porch = cold->vsync_back_porch;
++	runtime->vsync_front_porch = cold->vsync_front_porch;
++	for (index = 0; index < MICRONUX_DISPLAY_BUFFER_COUNT; index++)
++		runtime->framebuffer_address[index] =
++			cold->framebuffer_address[index];
++	runtime->framebuffer_size = cold->framebuffer_size;
++	runtime->dma_descriptor_address = cold->dma_descriptor_address;
++	runtime->dma_descriptor_size = cold->dma_descriptor_size;
++	runtime->dma_descriptor_count = cold->dma_descriptor_count;
++	runtime->dma_channel = cold->dma_channel;
++	runtime->dsi_fifo_address = cold->dsi_fifo_address;
++	runtime->i2c_address = cold->i2c_address;
++	runtime->display_control_register = cold->display_control_register;
++	runtime->backlight_register = cold->backlight_register;
++	runtime->backlight_brightness = cold->backlight_brightness;
++
++	dsi->channel = dsi->gdma + DW_GDMA_CH_BASE(runtime->dma_channel);
++	for (index = 0; index < MICRONUX_DISPLAY_BUFFER_COUNT; index++) {
++		dsi->descriptor[index] = (void __iomem *)(uintptr_t)
++			(runtime->dma_descriptor_address +
++			 index * MICRONUX_DMA_DESCRIPTOR_SIZE +
++			 dsi->uncached_offset);
++		dsi->framebuffer[index] = (void __iomem *)(uintptr_t)
++			(runtime->framebuffer_address[index] +
++			 dsi->uncached_offset);
++	}
++}
++
++static int micronux_native_initialize_memory(struct micronux_dsi *dsi)
++{
++	void __iomem *descriptor_page = dsi->descriptor[0];
++	u32 index, offset;
++
++	for (index = 0; index < MICRONUX_DISPLAY_BUFFER_COUNT; index++) {
++		memset_io(dsi->framebuffer[index], 0,
++			  dsi->handoff.framebuffer_size);
++		for (offset = 0; offset < dsi->handoff.framebuffer_size;
++		     offset += sizeof(u32)) {
++			if (readl(dsi->framebuffer[index] + offset))
++				return -EIO;
++			if (!(offset & (MICRONUX_COLD_PAGE_SIZE - 1)))
++				cond_resched();
++		}
++	}
++
++	memset_io(descriptor_page, 0, MICRONUX_COLD_PAGE_SIZE);
++	for (offset = 0; offset < MICRONUX_COLD_PAGE_SIZE;
++	     offset += sizeof(u32))
++		if (readl(descriptor_page + offset))
++			return -EIO;
++	for (index = 0; index < MICRONUX_DISPLAY_BUFFER_COUNT; index++) {
++		void __iomem *descriptor = dsi->descriptor[index];
++
++		writel(dsi->handoff.framebuffer_address[index],
++		       descriptor + DMA_LLI_SAR);
++		writel(0, descriptor + DMA_LLI_SAR_HI);
++		writel(dsi->handoff.dsi_fifo_address,
++		       descriptor + DMA_LLI_DAR);
++		writel(0, descriptor + DMA_LLI_DAR_HI);
++		writel(MICRONUX_DMA_BLOCK_TRANSFER_SIZE,
++		       descriptor + DMA_LLI_BLOCK_TS);
++		writel(DW_GDMA_LLP_MEMORY_PORT, descriptor + DMA_LLI_LLP);
++		writel(0, descriptor + DMA_LLI_LLP_HI);
++		writel(MICRONUX_DMA_DESCRIPTOR_CTRL_LO,
++		       descriptor + DMA_LLI_CTRL_LO);
++		writel(MICRONUX_NATIVE_DMA_DESCRIPTOR_CTRL_HI,
++		       descriptor + DMA_LLI_CTRL_HI);
++	}
++	/* Publish every descriptor word before validating the backing page. */
++	wmb();
++
++	for (index = 0; index < MICRONUX_DISPLAY_BUFFER_COUNT; index++) {
++		void __iomem *descriptor = dsi->descriptor[index];
++
++		for (offset = 0; offset < MICRONUX_DMA_DESCRIPTOR_SIZE;
++		     offset += sizeof(u32)) {
++			u32 expected = 0;
++
++			switch (offset) {
++			case DMA_LLI_SAR:
++				expected = dsi->handoff.framebuffer_address[index];
++				break;
++			case DMA_LLI_DAR:
++				expected = dsi->handoff.dsi_fifo_address;
++				break;
++			case DMA_LLI_BLOCK_TS:
++				expected = MICRONUX_DMA_BLOCK_TRANSFER_SIZE;
++				break;
++			case DMA_LLI_LLP:
++				expected = DW_GDMA_LLP_MEMORY_PORT;
++				break;
++			case DMA_LLI_CTRL_LO:
++				expected = MICRONUX_DMA_DESCRIPTOR_CTRL_LO;
++				break;
++			case DMA_LLI_CTRL_HI:
++				expected = MICRONUX_NATIVE_DMA_DESCRIPTOR_CTRL_HI;
++				break;
++			default:
++				break;
++			}
++			if (readl(descriptor + offset) != expected)
++				return -EIO;
++		}
++	}
++	for (offset = dsi->handoff.dma_descriptor_size;
++	     offset < MICRONUX_COLD_PAGE_SIZE; offset += sizeof(u32))
++		if (readl(descriptor_page + offset))
++			return -EIO;
++
++	dsi->front_index = 0;
++	dsi->render_index = 1;
++	dsi->queued_index = -1;
++	dsi->render_needs_sync = false;
++	dsi->render_dirty = false;
++	micronux_initialize_pool_guards(dsi);
++	if (!micronux_pool_guards_valid(dsi, true))
++		return -EIO;
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:COLD-INIT stage=memory state=READY frames=3 fill=black verified=full descriptor-page=4096 descriptor-bytes=192 trailing-zero=verified ctrl-hi=40108840 armed=c0108840 front=0 render=1 spare=2 render-gate=closed\n");
++	return 0;
++}
++
++static int micronux_native_configure_dpi_bridge(struct micronux_dsi *dsi)
++{
++	u32 clock, mask;
++
++	mask = HP_CLKRST_DSI_DPHY_CFG_CLK_EN |
++	       HP_CLKRST_DSI_DPHY_PLL_REFCLK_EN |
++	       HP_CLKRST_DSI_DPI_CLK_EN |
++	       HP_CLKRST_DSI_DPI_CLK_SRC |
++	       HP_CLKRST_DSI_DPI_CLK_DIV;
++	clock = readl(dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL03);
++	clock &= ~(HP_CLKRST_DSI_DPI_CLK_SRC |
++		   HP_CLKRST_DSI_DPI_CLK_DIV |
++		   HP_CLKRST_DSI_DPI_CLK_EN);
++	clock |= FIELD_PREP(HP_CLKRST_DSI_DPI_CLK_SRC,
++			    HP_CLKRST_DSI_DPI_CLK_SRC_F240M) |
++		 FIELD_PREP(HP_CLKRST_DSI_DPI_CLK_DIV,
++			    HP_CLKRST_DSI_DPI_CLK_DIV_VALUE) |
++		 HP_CLKRST_DSI_DPI_CLK_EN;
++	writel(clock, dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL03);
++	dsi->cold_dpi_enabled = true;
++	if ((readl(dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL03) & mask) !=
++	    HP_CLKRST_DSI_DPI_CLOCK_VALUE)
++		return -EIO;
++
++	/* Stock ESP-IDF v6.0.1/YamUI RGB565 burst-with-sync-pulses policy. */
++	writel(0, dsi->host + DSI_HOST_DPI_VCID);
++	writel(0, dsi->host + DSI_HOST_DPI_COLOR_CODING);
++	writel(0, dsi->host + DSI_HOST_DPI_CFG_POL);
++	writel(DSI_HOST_NATIVE_VIDEO_POLICY,
++	       dsi->host + DSI_HOST_VID_MODE_CFG);
++	writel(800, dsi->host + DSI_HOST_VID_PKT_SIZE);
++	writel(0, dsi->host + DSI_HOST_VID_NUM_CHUNKS);
++	writel(0, dsi->host + DSI_HOST_VID_NULL_SIZE);
++	writel(47, dsi->host + DSI_HOST_VID_HSA_TIME);
++	writel(47, dsi->host + DSI_HOST_VID_HBP_TIME);
++	writel(2063, dsi->host + DSI_HOST_VID_HLINE_TIME);
++	writel(4, dsi->host + DSI_HOST_VID_VSA_LINES);
++	writel(10, dsi->host + DSI_HOST_VID_VBP_LINES);
++	writel(30, dsi->host + DSI_HOST_VID_VFP_LINES);
++	writel(1280, dsi->host + DSI_HOST_VID_VACTIVE_LINES);
++	writel(DSI_HOST_CLOCK_LANE_AUTO, dsi->host + DSI_HOST_LPCLK_CTRL);
++
++	writel(0, dsi->bridge + DSI_BRG_CLK_EN);
++	writel(0, dsi->bridge + DSI_BRG_EN);
++	writel(DSI_BRG_NATIVE_BURST_LEN,
++	       dsi->bridge + DSI_BRG_BURST_LEN);
++	writel(DSI_BRG_NATIVE_RAW_NUM | DSI_BRG_RAW_NUM_TOTAL_SET,
++	       dsi->bridge + DSI_BRG_RAW_NUM_CONFIG);
++	writel(DSI_BRG_NATIVE_CREDIT,
++	       dsi->bridge + DSI_BRG_CREDIT_CONFIG);
++	writel(DSI_BRG_NATIVE_PIXEL_TYPE,
++	       dsi->bridge + DSI_BRG_PIXEL_TYPE);
++	writel(DSI_BRG_NATIVE_BLOCK_INTERVAL,
++	       dsi->bridge + DSI_BRG_DMA_BLOCK_INTERVAL);
++	writel(DSI_BRG_NATIVE_REQUEST_INTERVAL,
++	       dsi->bridge + DSI_BRG_DMA_REQUEST_INTERVAL);
++	writel(DSI_BRG_NATIVE_V_TIMING0,
++	       dsi->bridge + DSI_BRG_V_TIMING0);
++	writel(DSI_BRG_NATIVE_V_TIMING1,
++	       dsi->bridge + DSI_BRG_V_TIMING1);
++	writel(DSI_BRG_NATIVE_H_TIMING0,
++	       dsi->bridge + DSI_BRG_H_TIMING0);
++	writel(DSI_BRG_NATIVE_H_TIMING1,
++	       dsi->bridge + DSI_BRG_H_TIMING1);
++	writel(DSI_BRG_NATIVE_MISC_OFF,
++	       dsi->bridge + DSI_BRG_DPI_MISC_CONFIG);
++	writel(DSI_BRG_NATIVE_FRAME_INTERVAL,
++	       dsi->bridge + DSI_BRG_FRAME_INTERVAL);
++	writel(DSI_BRG_NATIVE_HOST_CTRL,
++	       dsi->bridge + DSI_BRG_HOST_CTRL);
++	writel(0, dsi->bridge + DSI_BRG_MEM_CLK_CTRL);
++	writel(DSI_BRG_NATIVE_DMA_FLOW,
++	       dsi->bridge + DSI_BRG_DMA_FLOW_CTRL);
++	writel(DSI_BRG_NATIVE_FIFO_THRESHOLD,
++	       dsi->bridge + DSI_BRG_FIFO_EMPTY_THRESHOLD);
++	writel(0, dsi->bridge + DSI_BRG_INT_ENA);
++	writel(~0U, dsi->bridge + DSI_BRG_INT_CLR);
++	writel(DSI_BRG_MODULE_EN, dsi->bridge + DSI_BRG_EN);
++	writel(1, dsi->bridge + DSI_BRG_DPI_CONFIG_UPDATE);
++	dsi->cold_bridge_active = true;
++
++	if (readl(dsi->host + DSI_HOST_DPI_VCID) ||
++	    readl(dsi->host + DSI_HOST_DPI_COLOR_CODING) ||
++	    readl(dsi->host + DSI_HOST_DPI_CFG_POL) ||
++	    readl(dsi->host + DSI_HOST_VID_MODE_CFG) !=
++		DSI_HOST_NATIVE_VIDEO_POLICY ||
++	    readl(dsi->host + DSI_HOST_VID_PKT_SIZE) != 800 ||
++	    readl(dsi->host + DSI_HOST_VID_NUM_CHUNKS) ||
++	    readl(dsi->host + DSI_HOST_VID_NULL_SIZE) ||
++	    readl(dsi->host + DSI_HOST_VID_HSA_TIME) != 47 ||
++	    readl(dsi->host + DSI_HOST_VID_HBP_TIME) != 47 ||
++	    readl(dsi->host + DSI_HOST_VID_HLINE_TIME) != 2063 ||
++	    readl(dsi->host + DSI_HOST_VID_VSA_LINES) != 4 ||
++	    readl(dsi->host + DSI_HOST_VID_VBP_LINES) != 10 ||
++	    readl(dsi->host + DSI_HOST_VID_VFP_LINES) != 30 ||
++	    readl(dsi->host + DSI_HOST_VID_VACTIVE_LINES) != 1280 ||
++	    readl(dsi->host + DSI_HOST_LPCLK_CTRL) !=
++		DSI_HOST_CLOCK_LANE_AUTO ||
++	    readl(dsi->bridge + DSI_BRG_EN) != DSI_BRG_MODULE_EN ||
++	    readl(dsi->bridge + DSI_BRG_DPI_MISC_CONFIG) !=
++		DSI_BRG_NATIVE_MISC_OFF)
++		return -EIO;
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:COLD-INIT stage=dpi-bridge state=CONFIGURED source=f240m divider=3 dpi-hz=80000000 host=command video-policy=0000ff02 frame-bta=enabled lp=all-periods-and-commands lpclk=00000003 burst=sync-pulses-type2 timing=800x1280:20/20/40:4/10/30 bridge=enabled output=off\n");
++	return 0;
++}
++
++static int micronux_native_configure_gdma(struct micronux_dsi *dsi)
++{
++	u32 clocks0, clocks1, reset, value;
++	int ret;
++
++	clocks0 = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL0);
++	clocks1 = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL1);
++	dsi->cold_gdma_hp_mutated = true;
++	writel(clocks0 | HP_CLKRST_GDMA_CPU_CLK_EN,
++	       dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL0);
++	writel(clocks1 | HP_CLKRST_GDMA_SYS_CLK_EN,
++	       dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL1);
++	reset = readl(dsi->hp_clkrst + HP_CLKRST_HP_RST_EN0);
++	writel(reset | HP_CLKRST_GDMA_RESET,
++	       dsi->hp_clkrst + HP_CLKRST_HP_RST_EN0);
++	writel(reset & ~HP_CLKRST_GDMA_RESET,
++	       dsi->hp_clkrst + HP_CLKRST_HP_RST_EN0);
++	if (!(readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL0) &
++	      HP_CLKRST_GDMA_CPU_CLK_EN) ||
++	    !(readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL1) &
++	      HP_CLKRST_GDMA_SYS_CLK_EN) ||
++	    (readl(dsi->hp_clkrst + HP_CLKRST_HP_RST_EN0) &
++	     HP_CLKRST_GDMA_RESET))
++		return -EIO;
++	dsi->cold_gdma_active = true;
++
++	writel(1, dsi->gdma + DW_GDMA_RESET);
++	ret = readl_poll_timeout(dsi->gdma + DW_GDMA_RESET, value,
++				 !(value & BIT(0)), 1, 1000);
++	if (ret)
++		return ret;
++	/* Keep the global IRQ master disabled until every source is cleared. */
++	writel(1, dsi->gdma + DW_GDMA_CFG);
++	writel(MICRONUX_DMA_CHANNEL_CFG_LO,
++	       dsi->channel + DW_GDMA_CH_CFG_LO);
++	writel(MICRONUX_DMA_CHANNEL_CFG_HI,
++	       dsi->channel + DW_GDMA_CH_CFG_HI);
++	writel(DW_GDMA_INT_NATIVE_SCANOUT_MASK |
++	       DW_GDMA_INT_STATUS0_RO_MASK,
++	       dsi->channel + DW_GDMA_CH_INT_STATUS_ENA);
++	writel(0, dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA);
++	writel(DW_GDMA_INT_COMMON_VALID_MASK |
++	       DW_GDMA_INT_COMMON_RO_MASK,
++	       dsi->gdma + DW_GDMA_INT_STATUS_ENA);
++	writel(0, dsi->gdma + DW_GDMA_INT_SIGNAL_ENA);
++	writel(~0U, dsi->channel + DW_GDMA_CH_INT_CLEAR);
++	writel(~0U, dsi->channel + DW_GDMA_CH_INT_CLEAR1);
++	writel(DW_GDMA_INT_COMMON_VALID_MASK,
++	       dsi->gdma + DW_GDMA_INT_CLEAR);
++	ret = devm_request_irq(dsi->dev, dsi->irq, micronux_dma_irq, 0,
++			       dev_name(dsi->dev), dsi);
++	if (ret)
++		return ret;
++	dsi->cold_irq_registered = true;
++	writel(DW_GDMA_INT_NATIVE_SCANOUT_MASK |
++	       DW_GDMA_INT_STATUS0_RO_MASK,
++	       dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA);
++	writel(DW_GDMA_INT_COMMON_VALID_MASK |
++	       DW_GDMA_INT_COMMON_RO_MASK,
++	       dsi->gdma + DW_GDMA_INT_SIGNAL_ENA);
++	writel(~0U, dsi->channel + DW_GDMA_CH_INT_CLEAR);
++	writel(~0U, dsi->channel + DW_GDMA_CH_INT_CLEAR1);
++	writel(DW_GDMA_INT_COMMON_VALID_MASK,
++	       dsi->gdma + DW_GDMA_INT_CLEAR);
++	if (readl(dsi->gdma + DW_GDMA_CFG) != 1 ||
++	    readl(dsi->channel + DW_GDMA_CH_CFG_LO) !=
++		MICRONUX_DMA_CHANNEL_CFG_LO ||
++	    readl(dsi->channel + DW_GDMA_CH_CFG_HI) !=
++		MICRONUX_DMA_CHANNEL_CFG_HI ||
++	    readl(dsi->channel + DW_GDMA_CH_INT_STATUS_ENA) !=
++		(DW_GDMA_INT_NATIVE_SCANOUT_MASK |
++		 DW_GDMA_INT_STATUS0_RO_MASK) ||
++	    readl(dsi->channel + DW_GDMA_CH_INT_STATUS_ENA1) !=
++		DW_GDMA_INT_ECC_ERROR_MASK ||
++	    readl(dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA) !=
++		(DW_GDMA_INT_NATIVE_SCANOUT_MASK |
++		 DW_GDMA_INT_STATUS0_RO_MASK) ||
++	    readl(dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA1) !=
++		DW_GDMA_INT_ECC_ERROR_MASK ||
++	    readl(dsi->gdma + DW_GDMA_INT_STATUS_ENA) !=
++		DW_GDMA_INT_COMMON_VALID_MASK ||
++	    readl(dsi->gdma + DW_GDMA_INT_SIGNAL_ENA) !=
++		DW_GDMA_INT_COMMON_VALID_MASK ||
++	    (readl(dsi->gdma + DW_GDMA_CHEN) & GENMASK(3, 0)))
++		return -EIO;
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:COLD-INIT stage=gdma-irq state=CONFIGURED controller=enabled irq-master=masked ch=0 cfg=0000000f:0a020001 completion=full-transfer errors=status0-ecc-common irq-route=24:18 descriptors=one-frame-last irq=registered source=stopped immutable-enables=ch0-bit25,ch1-bits0-3,common-bit7-bits9-20\n");
++	return 0;
++}
++
++static bool micronux_native_pms_route_valid(struct micronux_dsi *dsi)
++{
++	struct micronux_display_handoff_v3 *handoff = &dsi->cold_handoff;
++	u32 front_end = handoff->framebuffer_address[0] +
++			handoff->framebuffer_size;
++	u32 descriptor_end = handoff->dma_descriptor_address +
++			     MICRONUX_COLD_PAGE_SIZE;
++	u32 route = readl(dsi->intr_matrix +
++			  INTR_MATRIX_ROUTE(handoff->gdma_irq_source));
++
++	return (route & INTR_MATRIX_ROUTE_MASK) == handoff->gdma_clic_irq &&
++	       micronux_pms_region_matches(dsi, 1,
++					   handoff->framebuffer_address[0],
++					   front_end) &&
++	       micronux_pms_region_matches(dsi, 2,
++					   ESP32P4_DISPLAY_POOL_START,
++					   ESP32P4_DISPLAY_POOL_END) &&
++	       micronux_pms_region_matches(dsi, 3,
++					   handoff->dma_descriptor_address,
++					   descriptor_end) &&
++	       micronux_pms_region_matches(dsi, 4,
++					   ESP32P4_DSI_FIFO_ADDRESS,
++					   ESP32P4_DSI_FIFO_WINDOW_END) &&
++	       readl(dsi->dma_pms + DMA_PMS_GDMA_CH0_R) ==
++		(DMA_PMS_REGION1_MASK | DMA_PMS_REGION2_MASK |
++		 DMA_PMS_REGION3_MASK) &&
++	       readl(dsi->dma_pms + DMA_PMS_GDMA_CH0_W) ==
++		(DMA_PMS_REGION3_MASK | DMA_PMS_REGION4_MASK);
++}
++
++static bool micronux_native_runtime_policy_valid(struct micronux_dsi *dsi)
++{
++	u32 clocks0, clocks1, index, peri03, reset, sar;
++	bool source_valid = false;
++
++	reset = readl(dsi->hp_clkrst + HP_CLKRST_HP_RST_EN0);
++	clocks0 = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL0);
++	clocks1 = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL1);
++	peri03 = readl(dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL03);
++	sar = readl(dsi->channel + DW_GDMA_CH_SAR);
++	for (index = 0; index < MICRONUX_DISPLAY_BUFFER_COUNT; index++) {
++		u32 start = dsi->handoff.framebuffer_address[index];
++
++		/* A completed one-shot can expose the exact end before ISR rearm. */
++		if (sar >= start && sar <= start + dsi->handoff.framebuffer_size)
++			source_valid = true;
++	}
++
++	return !(reset & (HP_CLKRST_GDMA_RESET |
++			   HP_CLKRST_DSI_BRIDGE_RESET)) &&
++	       (clocks0 & HP_CLKRST_GDMA_CPU_CLK_EN) &&
++	       (clocks1 & (HP_CLKRST_GDMA_SYS_CLK_EN |
++			    HP_CLKRST_DSI_SYS_CLK_EN)) ==
++		(HP_CLKRST_GDMA_SYS_CLK_EN | HP_CLKRST_DSI_SYS_CLK_EN) &&
++	       (peri03 & (HP_CLKRST_DSI_DPHY_CFG_CLK_EN |
++			  HP_CLKRST_DSI_DPHY_PLL_REFCLK_EN |
++			  HP_CLKRST_DSI_DPI_CLK_EN |
++			  HP_CLKRST_DSI_DPI_CLK_SRC |
++			  HP_CLKRST_DSI_DPI_CLK_DIV)) ==
++		HP_CLKRST_DSI_DPI_CLOCK_VALUE &&
++	       micronux_cold_ldo_matches(dsi) &&
++	       micronux_cold_i2c_released(dsi) &&
++	       micronux_native_pms_route_valid(dsi) &&
++	       !(readl(dsi->host + DSI_HOST_MODE_CFG) & BIT(0)) &&
++	       readl(dsi->host + DSI_HOST_VID_MODE_CFG) ==
++		DSI_HOST_NATIVE_VIDEO_POLICY &&
++	       readl(dsi->host + DSI_HOST_VID_MODE_CFG_ACT) ==
++		DSI_HOST_NATIVE_VIDEO_POLICY_ACT &&
++	       readl(dsi->host + DSI_HOST_LPCLK_CTRL) ==
++		DSI_HOST_CLOCK_LANE_AUTO &&
++	       !(readl(dsi->host + DSI_HOST_VID_MODE_CFG) &
++		 DSI_HOST_VPG_MASK) &&
++	       readl(dsi->bridge + DSI_BRG_CLK_EN) == 0 &&
++	       readl(dsi->bridge + DSI_BRG_EN) == DSI_BRG_MODULE_EN &&
++	       readl(dsi->bridge + DSI_BRG_BURST_LEN) ==
++		DSI_BRG_NATIVE_BURST_LEN &&
++	       (readl(dsi->bridge + DSI_BRG_RAW_NUM_CONFIG) &
++		GENMASK(22, 0)) == DSI_BRG_NATIVE_RAW_NUM &&
++	       readl(dsi->bridge + DSI_BRG_CREDIT_CONFIG) ==
++		DSI_BRG_NATIVE_CREDIT &&
++	       readl(dsi->bridge + DSI_BRG_PIXEL_TYPE) ==
++		DSI_BRG_NATIVE_PIXEL_TYPE &&
++	       readl(dsi->bridge + DSI_BRG_DMA_BLOCK_INTERVAL) ==
++		DSI_BRG_NATIVE_BLOCK_INTERVAL &&
++	       readl(dsi->bridge + DSI_BRG_DMA_REQUEST_INTERVAL) ==
++		DSI_BRG_NATIVE_REQUEST_INTERVAL &&
++	       readl(dsi->bridge + DSI_BRG_V_TIMING0) ==
++		DSI_BRG_NATIVE_V_TIMING0 &&
++	       readl(dsi->bridge + DSI_BRG_V_TIMING1) ==
++		DSI_BRG_NATIVE_V_TIMING1 &&
++	       readl(dsi->bridge + DSI_BRG_H_TIMING0) ==
++		DSI_BRG_NATIVE_H_TIMING0 &&
++	       readl(dsi->bridge + DSI_BRG_H_TIMING1) ==
++		DSI_BRG_NATIVE_H_TIMING1 &&
++	       readl(dsi->bridge + DSI_BRG_DPI_MISC_CONFIG) ==
++		DSI_BRG_NATIVE_MISC_ON &&
++	       readl(dsi->bridge + DSI_BRG_FRAME_INTERVAL) ==
++		DSI_BRG_NATIVE_FRAME_INTERVAL &&
++	       readl(dsi->bridge + DSI_BRG_HOST_CTRL) ==
++		DSI_BRG_NATIVE_HOST_CTRL &&
++	       readl(dsi->bridge + DSI_BRG_MEM_CLK_CTRL) == 0 &&
++	       readl(dsi->bridge + DSI_BRG_DMA_FLOW_CTRL) ==
++		DSI_BRG_NATIVE_DMA_FLOW &&
++	       readl(dsi->bridge + DSI_BRG_FIFO_EMPTY_THRESHOLD) ==
++		DSI_BRG_NATIVE_FIFO_THRESHOLD &&
++	       readl(dsi->gdma + DW_GDMA_CFG) == 3 &&
++	       !(readl(dsi->gdma + DW_GDMA_CHEN) & GENMASK(3, 1)) &&
++	       readl(dsi->channel + DW_GDMA_CH_CFG_LO) ==
++		MICRONUX_DMA_CHANNEL_CFG_LO &&
++	       readl(dsi->channel + DW_GDMA_CH_CFG_HI) ==
++		MICRONUX_DMA_CHANNEL_CFG_HI &&
++	       readl(dsi->channel + DW_GDMA_CH_INT_STATUS_ENA) ==
++		(DW_GDMA_INT_NATIVE_SCANOUT_MASK |
++		 DW_GDMA_INT_STATUS0_RO_MASK) &&
++	       readl(dsi->channel + DW_GDMA_CH_INT_STATUS_ENA1) ==
++		DW_GDMA_INT_ECC_ERROR_MASK &&
++	       readl(dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA) ==
++		(DW_GDMA_INT_NATIVE_SCANOUT_MASK |
++		 DW_GDMA_INT_STATUS0_RO_MASK) &&
++	       readl(dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA1) ==
++		DW_GDMA_INT_ECC_ERROR_MASK &&
++	       readl(dsi->gdma + DW_GDMA_INT_STATUS_ENA) ==
++		DW_GDMA_INT_COMMON_VALID_MASK &&
++	       readl(dsi->gdma + DW_GDMA_INT_SIGNAL_ENA) ==
++		DW_GDMA_INT_COMMON_VALID_MASK &&
++	       source_valid &&
++	       micronux_pool_guards_valid(dsi, false);
++}
++
++static int micronux_native_start_scanout(struct micronux_dsi *dsi)
++{
++	u32 common, initial_generation, status, status0, status1, top, window;
++	int ret;
++
++	dsi->front_index = 0;
++	dsi->render_index = 1;
++	dsi->queued_index = -1;
++	/* The global IRQ master stays masked across this final clean snapshot. */
++	if (readl(dsi->gdma + DW_GDMA_CFG) != 1)
++		return -EIO;
++	top = readl(dsi->gdma + DW_GDMA_INT_STATUS);
++	status0 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS);
++	status1 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS1);
++	common = readl(dsi->gdma + DW_GDMA_INT_COMMON_STATUS);
++	if (micronux_sample_host_status(dsi, 0) ||
++	    !micronux_host_status_clean(dsi) ||
++	    READ_ONCE(dsi->last_dma_error) || READ_ONCE(dsi->fault_bits) ||
++	    (readl(dsi->bridge + DSI_BRG_INT_RAW) & DSI_BRG_INT_UNDERRUN) ||
++	    (top & ~DW_GDMA_INT_TOP_ALLOWED) ||
++	    (status0 & DW_GDMA_INT_NATIVE_SCANOUT_MASK) ||
++	    (status1 & DW_GDMA_INT_ECC_ERROR_MASK) ||
++	    (common & DW_GDMA_INT_COMMON_VALID_MASK))
++		return -EIO;
++	dsi->scanout_active = true;
++	/* From this point every new source is delivered; never clear it blindly. */
++	writel(3, dsi->gdma + DW_GDMA_CFG);
++	if (readl(dsi->gdma + DW_GDMA_CFG) != 3 ||
++	    READ_ONCE(dsi->last_dma_error) || READ_ONCE(dsi->fault_bits))
++		return -EIO;
++	ret = micronux_native_dma_arm_frame(dsi, dsi->front_index);
++	if (ret)
++		return ret;
++	writel(0, dsi->host + DSI_HOST_MODE_CFG);
++	writel(DSI_BRG_NATIVE_MISC_ON,
++	       dsi->bridge + DSI_BRG_DPI_MISC_CONFIG);
++	writel(1, dsi->bridge + DSI_BRG_DPI_CONFIG_UPDATE);
++	readl(dsi->bridge + DSI_BRG_DPI_MISC_CONFIG);
++
++	for (window = 0; window < MICRONUX_NATIVE_QUALIFICATION_WINDOWS;
++	     window++) {
++		initial_generation = READ_ONCE(dsi->source_generation);
++		ret = read_poll_timeout(READ_ONCE, status,
++					(u32)(status - initial_generation) >=
++						MICRONUX_SCANOUT_STABLE_FRAMES,
++					1000,
++					MICRONUX_SCANOUT_START_TIMEOUT_MS * 1000,
++					false, dsi->source_generation);
++		if (ret ||
++		    micronux_sample_host_status(dsi, 0) ||
++		    !micronux_host_status_clean(dsi) ||
++		    READ_ONCE(dsi->last_dma_error) ||
++		    READ_ONCE(dsi->fault_bits) ||
++		    (readl(dsi->bridge + DSI_BRG_INT_RAW) &
++		     DSI_BRG_INT_UNDERRUN) ||
++		    !micronux_pool_guards_valid(dsi, true) ||
++		    !micronux_native_runtime_policy_valid(dsi))
++			return ret ? ret : -EIO;
++	}
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:COLD-INIT stage=scanout-qualification state=PASSED windows=2 frames-per-window=4 completions=8 source-generation=8 host-errors=0 gdma-errors=0 ecc-errors=0 common-errors=0 bridge-underruns=0 guards=verified source=black\n");
++	return 0;
++}
++
++static bool micronux_native_final_status_clean(struct micronux_dsi *dsi)
++{
++	return !micronux_sample_host_status(dsi, 0) &&
++	       micronux_host_status_clean(dsi) &&
++	       !(readl(dsi->bridge + DSI_BRG_INT_RAW) &
++		 DSI_BRG_INT_UNDERRUN) &&
++	       !(readl(dsi->channel + DW_GDMA_CH_INT_STATUS) &
++		 DW_GDMA_INT_ERROR_MASK) &&
++	       !(readl(dsi->channel + DW_GDMA_CH_INT_STATUS1) &
++		 DW_GDMA_INT_ECC_ERROR_MASK) &&
++	       !(readl(dsi->gdma + DW_GDMA_INT_COMMON_STATUS) &
++		 DW_GDMA_INT_COMMON_VALID_MASK) &&
++	       !READ_ONCE(dsi->last_dma_error) &&
++	       !READ_ONCE(dsi->fault_bits) &&
++	       micronux_pool_guards_valid(dsi, true) &&
++	       micronux_native_runtime_policy_valid(dsi);
++}
++
++static bool micronux_cold_runtime_teardown(struct micronux_dsi *dsi)
++{
++	u32 abort_mask, channel, peri03, reset, state, value;
++	bool registers_contained = true, stopped = true;
++
++	WRITE_ONCE(dsi->render_enabled, false);
++	/* Close the render gate before revoking published scanout readiness. */
++	smp_wmb();
++	WRITE_ONCE(dsi->scanout_ready, false);
++	WRITE_ONCE(dsi->boot_display_ready, false);
++	WRITE_ONCE(dsi->scanout_active, false);
++	if (dsi->cold_timer_initialized) {
++		hrtimer_cancel(&dsi->scanout_timer);
++		dsi->cold_timer_initialized = false;
++	}
++	/* Drain a renderer that passed the gate before it was closed. */
++	mutex_lock(&dsi->render_lock);
++	dsi->render_dirty = false;
++	mutex_unlock(&dsi->render_lock);
++	/* A drained renderer may have queued this work before releasing lock. */
++	cancel_delayed_work_sync(&dsi->render_work);
++
++	if (dsi->cold_bridge_active || dsi->cold_dpi_enabled) {
++		writel(DSI_BRG_NATIVE_MISC_OFF,
++		       dsi->bridge + DSI_BRG_DPI_MISC_CONFIG);
++		writel(1, dsi->bridge + DSI_BRG_DPI_CONFIG_UPDATE);
++		writel(0, dsi->bridge + DSI_BRG_EN);
++		writel(1, dsi->host + DSI_HOST_MODE_CFG);
++	}
++	if (dsi->cold_gdma_active) {
++		writel(0, dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA);
++		writel(0, dsi->gdma + DW_GDMA_INT_SIGNAL_ENA);
++		writel(~0U, dsi->channel + DW_GDMA_CH_INT_CLEAR);
++		writel(~0U, dsi->channel + DW_GDMA_CH_INT_CLEAR1);
++		writel(DW_GDMA_INT_COMMON_VALID_MASK,
++		       dsi->gdma + DW_GDMA_INT_CLEAR);
++		channel = BIT(dsi->handoff.dma_channel);
++		abort_mask = channel | (channel << 8);
++		writel(channel << 8, dsi->gdma + DW_GDMA_CHEN);
++		if (readl_poll_timeout_atomic(dsi->gdma + DW_GDMA_CHEN,
++					      state, !(state & channel), 1,
++					      1000)) {
++			/* Abort is only the bounded fallback for a hung channel. */
++			writel(abort_mask, dsi->gdma + DW_GDMA_CHABORT);
++			if (readl_poll_timeout_atomic(dsi->gdma + DW_GDMA_CHABORT,
++						      state,
++						      !(state & abort_mask), 1,
++						      1000) ||
++			    (readl(dsi->gdma + DW_GDMA_CHEN) & channel))
++				stopped = false;
++		}
++		/* Disable the global interrupt master before releasing the IRQ. */
++		writel(0, dsi->channel + DW_GDMA_CH_INT_STATUS_ENA);
++		writel(0, dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA);
++		writel(0, dsi->gdma + DW_GDMA_INT_STATUS_ENA);
++		writel(0, dsi->gdma + DW_GDMA_INT_SIGNAL_ENA);
++		writel(0, dsi->gdma + DW_GDMA_CFG);
++		if (readl(dsi->gdma + DW_GDMA_CFG))
++			stopped = false;
++	}
++	if (dsi->cold_irq_registered) {
++		devm_free_irq(dsi->dev, dsi->irq, dsi);
++		dsi->cold_irq_registered = false;
++	}
++	if (dsi->cold_gdma_active) {
++		writel(0, dsi->channel + DW_GDMA_CH_INT_STATUS_ENA);
++		writel(0, dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA);
++		writel(0, dsi->gdma + DW_GDMA_INT_STATUS_ENA);
++		writel(0, dsi->gdma + DW_GDMA_INT_SIGNAL_ENA);
++		writel(0, dsi->gdma + DW_GDMA_CFG);
++		writel(1, dsi->gdma + DW_GDMA_RESET);
++		if (readl_poll_timeout(dsi->gdma + DW_GDMA_RESET, value,
++				       !(value & BIT(0)), 1, 1000))
++			stopped = false;
++		writel(0, dsi->channel + DW_GDMA_CH_INT_STATUS_ENA);
++		writel(0, dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA);
++		writel(0, dsi->gdma + DW_GDMA_INT_STATUS_ENA);
++		writel(0, dsi->gdma + DW_GDMA_INT_SIGNAL_ENA);
++		writel(~0U, dsi->channel + DW_GDMA_CH_INT_CLEAR);
++		writel(~0U, dsi->channel + DW_GDMA_CH_INT_CLEAR1);
++		writel(DW_GDMA_INT_COMMON_VALID_MASK,
++		       dsi->gdma + DW_GDMA_INT_CLEAR);
++		/* P4 hw_ver3 retains the documented RO-one interrupt residues. */
++		registers_contained =
++			readl(dsi->channel + DW_GDMA_CH_INT_STATUS_ENA) ==
++				DW_GDMA_INT_STATUS0_RO_MASK &&
++			readl(dsi->channel + DW_GDMA_CH_INT_STATUS_ENA1) ==
++				DW_GDMA_INT_ECC_ERROR_MASK &&
++			readl(dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA) ==
++				DW_GDMA_INT_STATUS0_RO_MASK &&
++			readl(dsi->channel + DW_GDMA_CH_INT_SIGNAL_ENA1) ==
++				DW_GDMA_INT_ECC_ERROR_MASK &&
++			readl(dsi->gdma + DW_GDMA_INT_STATUS_ENA) ==
++				DW_GDMA_INT_COMMON_RO_MASK &&
++			readl(dsi->gdma + DW_GDMA_INT_SIGNAL_ENA) ==
++				DW_GDMA_INT_COMMON_RO_MASK &&
++			!readl(dsi->gdma + DW_GDMA_CFG) &&
++			!(readl(dsi->gdma + DW_GDMA_CHEN) & GENMASK(3, 0));
++		dsi->cold_gdma_active = false;
++	}
++	if (dsi->cold_gdma_hp_mutated) {
++		/* HP clock/reset containment is safe even if GDMA was inaccessible. */
++		reset = readl(dsi->hp_clkrst + HP_CLKRST_HP_RST_EN0);
++		writel(reset | HP_CLKRST_GDMA_RESET,
++		       dsi->hp_clkrst + HP_CLKRST_HP_RST_EN0);
++		value = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL0);
++		writel(value & ~HP_CLKRST_GDMA_CPU_CLK_EN,
++		       dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL0);
++		value = readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL1);
++		writel(value & ~HP_CLKRST_GDMA_SYS_CLK_EN,
++		       dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL1);
++		dsi->cold_gdma_hp_mutated = false;
++	}
++	if (dsi->cold_dpi_enabled) {
++		peri03 = readl(dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL03);
++		writel(peri03 & ~HP_CLKRST_DSI_DPI_CLK_EN,
++		       dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL03);
++		dsi->cold_dpi_enabled = false;
++	}
++	dsi->cold_bridge_active = false;
++	if (dsi->cold_fb_registered) {
++		unregister_framebuffer(dsi->info);
++		dsi->cold_fb_registered = false;
++	}
++
++	return stopped && registers_contained && !dsi->cold_irq_registered &&
++	       !dsi->cold_fb_registered &&
++	       !(readl(dsi->bridge + DSI_BRG_EN) & DSI_BRG_MODULE_EN) &&
++	       !(readl(dsi->bridge + DSI_BRG_DPI_MISC_CONFIG) &
++		 DSI_BRG_DPI_EN) &&
++	       (readl(dsi->host + DSI_HOST_MODE_CFG) & BIT(0)) &&
++	       (readl(dsi->hp_clkrst + HP_CLKRST_HP_RST_EN0) &
++		 HP_CLKRST_GDMA_RESET) &&
++	       !(readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL0) &
++		 HP_CLKRST_GDMA_CPU_CLK_EN) &&
++	       !(readl(dsi->hp_clkrst + HP_CLKRST_SOC_CLK_CTRL1) &
++		 HP_CLKRST_GDMA_SYS_CLK_EN) &&
++	       !(readl(dsi->hp_clkrst + HP_CLKRST_PERI_CLK_CTRL03) &
++		 HP_CLKRST_DSI_DPI_CLK_EN);
++}
++
++static void micronux_cold_runtime_fail_quiescent(struct micronux_dsi *dsi,
++						 const char *stage, int error)
++{
++	bool runtime_off;
++
++	runtime_off = micronux_cold_runtime_teardown(dsi);
++	WRITE_ONCE(dsi->cold_runtime_unverified, !runtime_off);
++	micronux_cold_fail_quiescent(dsi, stage, error);
++}
++
++static int micronux_cold_initialize_scanout_stage(struct micronux_dsi *dsi)
++{
++	int ret;
++
++	if (dsi->display_state !=
++		MICRONUX_DISPLAY_STATE_PANEL_PROGRAMMED_QUIESCENT ||
++	    !micronux_cold_stage_c_matches(dsi) ||
++	    !micronux_native_pms_route_valid(dsi)) {
++		ret = -EIO;
++		goto fail_precondition;
++	}
++	dsi->display_state = MICRONUX_DISPLAY_STATE_SCANOUT_INITIALIZING;
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:COLD-INIT state=SCANOUT_INITIALIZING stage=native-dpi-gdma-fb source=none render-gate=closed external-command-history=pwm0-control13-acked physical-panel-state=unobserved\n");
++	micronux_bind_cold_runtime_profile(dsi);
++	/* Establish the software baseline before any native interrupt is live. */
++	WRITE_ONCE(dsi->scanout_frames, 0);
++	WRITE_ONCE(dsi->source_generation, 0);
++	WRITE_ONCE(dsi->last_dma_error, 0);
++	WRITE_ONCE(dsi->host_error0, 0);
++	WRITE_ONCE(dsi->host_error1, 0);
++	WRITE_ONCE(dsi->bridge_underruns, 0);
++	WRITE_ONCE(dsi->fault_bits, 0);
++	ret = micronux_native_initialize_memory(dsi);
++	if (ret)
++		goto fail_memory;
++	ret = micronux_native_configure_dpi_bridge(dsi);
++	if (ret)
++		goto fail_bridge;
++	ret = micronux_native_configure_gdma(dsi);
++	if (ret)
++		goto fail_gdma;
++	ret = micronux_native_start_scanout(dsi);
++	if (ret)
++		goto fail_scanout;
++
++	ret = micronux_register_framebuffer(dsi);
++	if (ret)
++		goto fail_framebuffer;
++	dsi->cold_fb_registered = true;
++	if (!micronux_native_final_status_clean(dsi)) {
++		ret = -EIO;
++		goto fail_publication;
++	}
++	micronux_watchdog_seed_progress(dsi);
++	WRITE_ONCE(dsi->scanout_ready, true);
++	WRITE_ONCE(dsi->render_enabled, true);
++	/* Publish both gates before the userspace-visible terminal state. */
++	smp_wmb();
++	WRITE_ONCE(dsi->display_state,
++		   MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT);
++	hrtimer_init(&dsi->scanout_timer, CLOCK_MONOTONIC,
++		     HRTIMER_MODE_REL_PINNED);
++	dsi->scanout_timer.function = micronux_dma_poll;
++	dsi->cold_timer_initialized = true;
++	hrtimer_start(&dsi->scanout_timer,
++		      ms_to_ktime(MICRONUX_HEALTH_POLL_MS),
++		      HRTIMER_MODE_REL_PINNED);
++	dev_info(dsi->dev,
++		 "MICRONUX:M9.2:COLD-INIT state=SCANOUT_QUALIFIED_QUIESCENT fb=fb%d registered=yes irq=registered source=black scanout=advancing windows=2 frames=8 buffers=3 dma=irq-rearm ctrl-hi=c0108840 host=video frame-bta=enabled lp=all lpclk=00000003 bridge=active boot-ready=0 render-gate=open backlight=unregistered touch=unregistered external-command-history=pwm0-control13-acked physical-panel-state=unobserved next=userspace-render\n",
++		 dsi->info->node);
++	return 0;
++
++fail_publication:
++	micronux_cold_runtime_fail_quiescent(dsi, "publication-check", ret);
++	return ret;
++fail_framebuffer:
++	micronux_cold_runtime_fail_quiescent(dsi, "framebuffer-register", ret);
++	return ret;
++fail_scanout:
++	micronux_cold_runtime_fail_quiescent(dsi, "scanout-qualification", ret);
++	return ret;
++fail_gdma:
++	micronux_cold_runtime_fail_quiescent(dsi, "gdma-irq", ret);
++	return ret;
++fail_bridge:
++	micronux_cold_runtime_fail_quiescent(dsi, "dpi-bridge", ret);
++	return ret;
++fail_memory:
++	micronux_cold_runtime_fail_quiescent(dsi, "memory", ret);
++	return ret;
++fail_precondition:
++	micronux_cold_runtime_fail_quiescent(dsi, "stage-d-precondition", ret);
++	return ret;
++}
++
+ static int micronux_validate_display_pool(struct device_node *node)
+ {
+ 	struct device_node *pool;
+@@ -4471,20 +5536,29 @@ static void micronux_dsi_remove(struct platform_device *pdev)
+ 	const char *reset_status;
+ 	bool cold_contained;
+ 	bool cold_dsi_off, cold_i2c_off, cold_i2c_released, cold_ldo_off;
++	bool cold_runtime_off = true;
+ 	bool dark = false;
+ 	int prepare_ret, pwm_ret, reset_ret, ret;
+ 
+ 	if (dsi->required_handoff_abi == MICRONUX_DISPLAY_ABI_VERSION_V3) {
+ 		device_remove_file(&pdev->dev, &dev_attr_cold_init);
+ 		device_remove_file(&pdev->dev, &dev_attr_native_state);
++		mutex_lock(&dsi->mode_lock);
+ 		state = READ_ONCE(dsi->display_state);
++		WRITE_ONCE(dsi->display_state,
++			   MICRONUX_DISPLAY_STATE_REMOVING);
+ 		if (state == MICRONUX_DISPLAY_STATE_PROBED_QUIESCENT) {
++			mutex_unlock(&dsi->mode_lock);
+ 			dev_info(dsi->dev,
+ 				 "MICRONUX:M9.2:COLD-REMOVE state=PROBED_QUIESCENT display-writes=0\n");
+ 			framebuffer_release(dsi->info);
+ 			return;
+ 		}
+-		mutex_lock(&dsi->mode_lock);
++		if (dsi->cold_dpi_enabled || dsi->cold_bridge_active ||
++		    dsi->cold_gdma_hp_mutated || dsi->cold_gdma_active ||
++		    dsi->cold_irq_registered ||
++		    dsi->cold_fb_registered || dsi->cold_timer_initialized)
++			cold_runtime_off = micronux_cold_runtime_teardown(dsi);
+ 		if (state == MICRONUX_DISPLAY_STATE_FAILED_QUIESCENT) {
+ 			pwm_ret = 0;
+ 			prepare_ret = 0;
+@@ -4507,7 +5581,8 @@ static void micronux_dsi_remove(struct platform_device *pdev)
+ 		cold_dsi_off = micronux_cold_dsi_disable(dsi);
+ 		cold_ldo_off = micronux_cold_ldo_disable(dsi);
+ 		cold_contained = !pwm_ret && !prepare_ret && !reset_ret &&
+-				 cold_i2c_released && cold_dsi_off && cold_ldo_off;
++				 cold_i2c_released && cold_runtime_off &&
++				 cold_dsi_off && cold_ldo_off;
+ 		cold_remove_state = cold_contained ? "QUIESCENT" : "UNVERIFIED";
+ 		mutex_unlock(&dsi->mode_lock);
+ 		dev_info(dsi->dev,
+@@ -4515,8 +5590,10 @@ static void micronux_dsi_remove(struct platform_device *pdev)
+ 			 cold_remove_state, pwm_status, prepare_status, reset_status,
+ 			 cold_ldo_off ? "clear" : "error",
+ 			 cold_i2c_released ? "released-gated" : "state-error",
+-			 cold_dsi_off ? "resets-asserted-clocks-off" :
++			 (cold_runtime_off && cold_dsi_off) ?
++			 "resets-asserted-clocks-off" :
+ 			 "state-error");
++		cancel_work_sync(&dsi->fault_work);
+ 		framebuffer_release(dsi->info);
+ 		return;
+ 	}
+-- 
+2.54.0.windows.1

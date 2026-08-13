@@ -21,15 +21,21 @@ REQUIRED_MARKERS = (
     "MICRONUX:M7:PMP baseline=pass early-deny=pass "
     "handoff=13-14-unlocked overlay=13-14",
     "MICRONUX:M7:DMA-PMS state=pass region0=[4ff80000,4ff82000) "
-    "sdmmc=rw:00000001 display=ch0:r:00000006:w:0000000c",
+    "sdmmc=rw:00000001 display=ch0:r:0000000e:w:00000018",
     "fifo=[50105000,50106000) other=deny",
     "MICRONUX:M7:SPLASH state=ready title=MICRONUX "
     "resolution=800x1280 format=rgb565",
+    "MICRONUX:M9:PANEL-RESET state=ready pwm=off "
+    "sequence=release-assert-release delays_ms=5,10,130 "
+    "backlight-enable=off",
     "MICRONUX:M7:SPLASH progress=100 state=visible",
-    "MICRONUX:M7:DSI-BLANK state=ready backlight=off "
+    "MICRONUX:M7:DSI-BLANK state=ready backlight=off gate=disabled "
     "settle_ms=100 restore=linux-after-status-ready",
-    "MICRONUX:M7:DSI-HANDOFF state=ready owner=linux-pending "
-    "pattern=framebuffer dma=descriptor-ring channel=0 "
+    "MICRONUX:M9.2:DSI-HANDOFF-SOURCE state=ready "
+    "pattern=vertical-bars bridge=dpi-disabled backlight=off",
+    "MICRONUX:M9.2:DSI-HANDOFF state=ready abi=2 owner=linux-pending "
+    "pattern=vertical-bars buffers=3 dma=irq-rearm channel=0 "
+    "timing=20/20/40:4/10/30 "
     "rearm=linux-after-status-ready",
     "MICRONUX:M7:IRQ source=24 matrix=500d6060 clic=18 handoff=armed",
     "MICRONUX:M7:PMP cached=7-10 direct=12-13 mode=per-mm+wx+tor+napot "
@@ -37,15 +43,17 @@ REQUIRED_MARKERS = (
     "MICRONUX:M7:POOL state=ready range=[49700000,49f00000) pages=2048 "
     "zero=on-arena+allocate ownership=per-mm",
     "Linux version 6.12.27",
-    "MICRONUX:M7:DSI-LINUX state=ready owner=linux fb=fb0 "
-    "resolution=800x1280 format=rgb565 dma=ch0:auto-reload "
-    "event=block-done-irq irq=3 health_poll_ms=50 enable_delay_ms=0 "
-    "underrun=monitored write_chunk=512 write_gap_us=2 "
+    "MICRONUX:M9.2:CLAIM state=ready abi=2 owner=linux loader-source=vpg "
+    "fb=fb0 "
+    "resolution=800x1280 format=rgb565 timing=20/20/40:4/10/30 "
+    "buffers=3 dma=ch0:irq-rearm config=0000000f:0a020001 "
+    "event=transfer-done-irq irq=3 health_poll_ms=50 commit_ms=20 "
+    "underrun=monitored guards=pool-monitored write_chunk=512 write_gap_us=2 "
     "backlight=linux mmap=denied",
-    "MICRONUX:M7:DSI-SCANOUT state=ready handoff=blanked-restart "
-    "stable-frames=4 scanout=hardware-reload-running "
+    "MICRONUX:M9.2:SCANOUT state=running handoff=blanked-restart "
+    "stable-frames=4 qualification-windows=2 buffers=3 dma=irq-rearm "
     "backlight=restored reveal=userspace-ready frame-ack=disabled "
-    "clock=forced-hs lp=disabled",
+    "clock=auto lp=enabled backlight-gate=enabled",
     "MICRONUX:M7:FB-CONSOLE state=ready tty=tty1 role=status usb=ttyGS0 "
     "reveal=userspace-ready cursor=steady",
     "MICRONUX:M6:COMBINED:SHELL ready console=ttyGS0 network=nonblocking",
@@ -65,7 +73,7 @@ REQUIRED_MARKERS = (
     "MICRONUX:M7:DMA:ONLINE:RC=0",
     "MICRONUX:M7:DMA:NETWORK:RC=0",
     "MICRONUX:M7:DISPLAY:PASS owner=linux fb=fb0 "
-    "pattern=framebuffer-only scanout=auto-reload writes=paced "
+    "pattern=framebuffer-only scanout=irq-rearm buffers=3 writes=paced "
     "backlight=restored",
     "MICRONUX:M5:PASS",
     "MICRONUX:M7:POOL-TEST:SELFTEST:RC=0",
@@ -102,6 +110,9 @@ FORBIDDEN_MARKERS = (
     "MICRONUX:M7:DSI-HANDOFF state=fail",
     "MICRONUX:M7:DSI-LINUX state=fail",
     "MICRONUX:M7:DSI-SCANOUT state=fail",
+    "MICRONUX:M9.2:DSI-HANDOFF state=fail",
+    "MICRONUX:M9.2:CLAIM state=fail",
+    "MICRONUX:M9.2:SCANOUT state=fail",
     "MICRONUX:M7:DISPLAY:FAIL",
     "MICRONUX:M9:DISPLAY-FAULT",
     "MICRONUX:M7:POOL state=fail",
@@ -214,7 +225,8 @@ def workload_command() -> str:
         "BACKLIGHT=/sys/class/backlight/micronux-backlight; "
         "DISPLAY_RC=0; "
         "[ -c /dev/fb0 ] || DISPLAY_RC=1; "
-        "grep -q '^linux fb0 dma-channel=0 frame-irq=3 mmap=denied$' "
+        "grep -q '^linux abi=2 fb0 buffers=3 dma-channel=0 frame-irq=3 "
+        "rearm=explicit mmap=denied$' "
         "$DISPLAY/ownership || DISPLAY_RC=1; "
         "grep -q '^framebuffer$' $DISPLAY/pattern || DISPLAY_RC=1; "
         "if echo vertical 2>/dev/null >$DISPLAY/pattern; then "
@@ -222,17 +234,24 @@ def workload_command() -> str:
         "grep -q '^framebuffer$' $DISPLAY/pattern || DISPLAY_RC=1; "
         "dd if=/dev/zero of=/dev/fb0 bs=4096 count=500 "
         "2>/dev/null || DISPLAY_RC=1; "
-        "grep -q '^running frames=.* error=00000000 underruns=0 "
+        "grep -Eq '^running frames=[0-9]+->[0-9]+ error=00000000 "
+        "underruns=0 "
         "chen=1 faults=0 host-errors=00000000:00000000 "
-        "frame-ack=off clock=forced-hs lp=disabled$' "
+        "frame-ack=off clock=auto lp=enabled backlight-gate=on buffers=3 "
+        "front=[0-2] queued=(-1|[0-2]) back=[0-2] "
+        "rearm=[1-9][0-9]*/0 flips=[0-9]+/[0-9]+ "
+        "generation=[1-9][0-9]* guards=ok guard-errors=0$' "
         "$DISPLAY/scanout || DISPLAY_RC=1; "
+        "grep -Eq ' bridge-fifo=0000[0-3][0-9a-f]{3} .*"
+        "guards=ok guard-errors=0$' "
+        "$DISPLAY/diagnostics || DISPLAY_RC=1; "
         "OLD_BRIGHTNESS=$(cat $BACKLIGHT/brightness) || DISPLAY_RC=1; "
         "echo 64 >$BACKLIGHT/brightness || DISPLAY_RC=1; "
         "[ \"$(cat $BACKLIGHT/brightness)\" = 64 ] || DISPLAY_RC=1; "
         "echo $OLD_BRIGHTNESS >$BACKLIGHT/brightness || DISPLAY_RC=1; "
         "if [ \"$DISPLAY_RC\" -eq 0 ]; then "
         "echo MICRONUX:M7:DISPLAY:PASS owner=linux fb=fb0 "
-        "pattern=framebuffer-only scanout=auto-reload writes=paced "
+        "pattern=framebuffer-only scanout=irq-rearm buffers=3 writes=paced "
         "backlight=restored; else "
         "echo MICRONUX:M7:DISPLAY:FAIL rc=$DISPLAY_RC; fi; "
         "/usr/bin/micronux-selftest; "

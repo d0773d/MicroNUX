@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@example.invalid>
 Date: Mon, 10 Aug 2026 22:10:00 -0700
-Subject: [PATCH 21/22] video: fbdev: add bounded DSI VPG diagnostic
+Subject: [PATCH 21/46] video: fbdev: add bounded DSI VPG diagnostic
 
 Add a root-only VPG one-shot. It displays vertical host bars for 250 ms to
 10 seconds, then restores framebuffer scanout. Match ESP-IDF v6.0.1 by

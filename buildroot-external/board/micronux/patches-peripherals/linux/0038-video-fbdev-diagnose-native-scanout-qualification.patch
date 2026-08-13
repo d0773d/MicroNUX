@@ -1,0 +1,376 @@
+From 397b8bed56b6165251011f0109ded884d1bd0fe2 Mon Sep 17 00:00:00 2001
+From: d0773d <dottedquad@gmail.com>
+Date: Wed, 12 Aug 2026 05:27:39 -0700
+Subject: [PATCH 38/46] video: fbdev: diagnose native scanout qualification
+
+Permit released I2C policy while native scanout remains in its dark
+initialization state. Keep the existing physical clock and pin release
+predicate mandatory before qualification can pass.
+
+Capture each scanout-start failure at its decision point. Distinguish the
+clean precheck, global interrupt enable, descriptor arm readback, and each
+qualification window. Preserve one-shot read-to-clear host sampling and
+fail-dark behavior.
+
+Signed-off-by: d0773d <dottedquad@gmail.com>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 260 +++++++++++++++++++++++++-----
+ 1 file changed, 216 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 520b502..9773fdc 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -804,6 +804,49 @@ struct micronux_dsi {
+ 	struct work_struct fault_work;
+ };
+ 
++struct micronux_scanout_snapshot {
++	u32 host_raw0;
++	u32 host_raw1;
++	u32 host_sticky0;
++	u32 host_sticky1;
++	u32 bridge_raw;
++	u32 bridge_underruns;
++	u32 gdma_top;
++	u32 gdma_status0;
++	u32 gdma_status1;
++	u32 gdma_common;
++	u32 gdma_cfg;
++	u32 gdma_chen;
++	u32 gdma_cfg_lo;
++	u32 gdma_cfg_hi;
++	u32 gdma_llp;
++	u32 gdma_sar;
++	u32 descriptor_ctrl_hi;
++	u32 generation;
++	u32 frames;
++	u32 last_dma_error;
++	u32 rearm_attempts;
++	u32 rearm_failures;
++	u32 host_mode;
++	u32 host_vid;
++	u32 host_active;
++	u32 host_lpclk;
++	unsigned long fault_bits;
++	bool host_status_seen;
++	bool guards_valid;
++	bool runtime_policy_valid;
++};
++
++static void
++micronux_capture_scanout_snapshot(struct micronux_dsi *dsi,
++				  struct micronux_scanout_snapshot *snapshot, u8 index,
++	u32 ignored_status1);
++static void
++micronux_log_scanout_failure(struct micronux_dsi *dsi,
++			     const char *reason, const char *detail,
++	int error, int window, int poll_error, u32 initial_generation,
++	const struct micronux_scanout_snapshot *snapshot);
++
+ static int micronux_i2c_prepare_locked(struct micronux_dsi *dsi)
+ {
+ 	u32 fifo;
+@@ -961,8 +1004,10 @@ static void micronux_discard_host_status(struct micronux_dsi *dsi)
+ 	spin_unlock_irqrestore(&dsi->host_status_lock, flags);
+ }
+ 
+-static bool micronux_sample_host_status(struct micronux_dsi *dsi,
+-					u32 ignored_status1)
++static bool micronux_sample_host_status_raw(struct micronux_dsi *dsi,
++					    u32 ignored_status1,
++					    u32 *raw_status0,
++					    u32 *raw_status1)
+ {
+ 	unsigned long flags;
+ 	u32 ignored1, status0, status1;
+@@ -972,6 +1017,10 @@ static bool micronux_sample_host_status(struct micronux_dsi *dsi,
+ 		  DSI_HOST_INT_STATUS0_VALID;
+ 	status1 = readl(dsi->host + DSI_HOST_INT_STATUS1) &
+ 		  DSI_HOST_INT_STATUS1_VALID;
++	if (raw_status0)
++		*raw_status0 = status0;
++	if (raw_status1)
++		*raw_status1 = status1;
+ 	ignored1 = status1 & ignored_status1;
+ 	status1 &= ~ignored_status1;
+ 
+@@ -990,6 +1039,12 @@ static bool micronux_sample_host_status(struct micronux_dsi *dsi,
+ 	return status0 || status1;
+ }
+ 
++static bool micronux_sample_host_status(struct micronux_dsi *dsi,
++					u32 ignored_status1)
++{
++	return micronux_sample_host_status_raw(dsi, ignored_status1, NULL, NULL);
++}
++
+ static bool micronux_host_status_clean(struct micronux_dsi *dsi)
+ {
+ 	return !READ_ONCE(dsi->host_error0) &&
+@@ -2093,12 +2148,15 @@ static int micronux_dma_start_frame(struct micronux_dsi *dsi, u8 index)
+ 	return micronux_dma_arm_frame(dsi, index);
+ }
+ 
+-static int micronux_native_dma_arm_frame(struct micronux_dsi *dsi, u8 index)
++static int
++micronux_native_dma_arm_frame(struct micronux_dsi *dsi, u8 index,
++			      struct micronux_scanout_snapshot *failure_snapshot)
+ {
+ 	u32 channel = BIT(dsi->handoff.dma_channel);
+ 	u32 descriptor_address = dsi->handoff.dma_descriptor_address +
+ 				 index * MICRONUX_DMA_DESCRIPTOR_SIZE;
+ 	void __iomem *descriptor = dsi->descriptor[index];
++	u32 cfg_hi, cfg_lo, chen, ctrl_hi, llp;
+ 
+ 	if (index >= MICRONUX_DISPLAY_BUFFER_COUNT)
+ 		return -EINVAL;
+@@ -2116,17 +2174,27 @@ static int micronux_native_dma_arm_frame(struct micronux_dsi *dsi, u8 index)
+ 	/* Publish descriptor and channel programming before enabling GDMA. */
+ 	wmb();
+ 	writel(channel | (channel << 8), dsi->gdma + DW_GDMA_CHEN);
+-	if (!(readl(dsi->gdma + DW_GDMA_CHEN) & channel) ||
+-	    readl(descriptor + DMA_LLI_CTRL_HI) !=
+-		MICRONUX_NATIVE_DMA_DESCRIPTOR_ARMED ||
+-	    readl(dsi->channel + DW_GDMA_CH_CFG_LO) !=
+-		MICRONUX_DMA_CHANNEL_CFG_LO ||
+-	    readl(dsi->channel + DW_GDMA_CH_CFG_HI) !=
+-		MICRONUX_DMA_CHANNEL_CFG_HI ||
+-	    readl(dsi->channel + DW_GDMA_CH_LLP) !=
+-		(descriptor_address | DW_GDMA_LLP_MEMORY_PORT)) {
++	chen = readl(dsi->gdma + DW_GDMA_CHEN);
++	ctrl_hi = readl(descriptor + DMA_LLI_CTRL_HI);
++	cfg_lo = readl(dsi->channel + DW_GDMA_CH_CFG_LO);
++	cfg_hi = readl(dsi->channel + DW_GDMA_CH_CFG_HI);
++	llp = readl(dsi->channel + DW_GDMA_CH_LLP);
++	if (!(chen & channel) ||
++	    ctrl_hi != MICRONUX_NATIVE_DMA_DESCRIPTOR_ARMED ||
++	    cfg_lo != MICRONUX_DMA_CHANNEL_CFG_LO ||
++	    cfg_hi != MICRONUX_DMA_CHANNEL_CFG_HI ||
++	    llp != (descriptor_address | DW_GDMA_LLP_MEMORY_PORT)) {
+ 		WRITE_ONCE(dsi->rearm_failures,
+ 			   READ_ONCE(dsi->rearm_failures) + 1);
++		if (failure_snapshot) {
++			micronux_capture_scanout_snapshot(dsi,
++							  failure_snapshot, index, 0);
++			failure_snapshot->gdma_chen = chen;
++			failure_snapshot->descriptor_ctrl_hi = ctrl_hi;
++			failure_snapshot->gdma_cfg_lo = cfg_lo;
++			failure_snapshot->gdma_cfg_hi = cfg_hi;
++			failure_snapshot->gdma_llp = llp;
++		}
+ 		return -EIO;
+ 	}
+ 	return 0;
+@@ -2228,7 +2296,7 @@ static irqreturn_t micronux_native_dma_irq(struct micronux_dsi *dsi)
+ 			dsi->queued_index : dsi->front_index;
+ 		if ((faulted || dma_error) && !preserve) {
+ 			rearm_failed = false;
+-		} else if (micronux_native_dma_arm_frame(dsi, next_index)) {
++		} else if (micronux_native_dma_arm_frame(dsi, next_index, NULL)) {
+ 			rearm_failed = true;
+ 		} else {
+ 			if (!dma_error) {
+@@ -5508,8 +5576,10 @@ static bool micronux_native_i2c_policy_valid(struct micronux_dsi *dsi)
+ 	enum micronux_native_i2c_state i2c_state =
+ 		READ_ONCE(dsi->native_i2c_state);
+ 
+-	if (display_state ==
+-	    MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT)
++	/* Dark qualification intentionally keeps the external bus released. */
++	if (display_state == MICRONUX_DISPLAY_STATE_SCANOUT_INITIALIZING ||
++	    display_state ==
++		MICRONUX_DISPLAY_STATE_SCANOUT_QUALIFIED_QUIESCENT)
+ 		return i2c_state == MICRONUX_NATIVE_I2C_RELEASED &&
+ 		       micronux_cold_i2c_released(dsi);
+ 	if (display_state == MICRONUX_DISPLAY_STATE_REVEALING &&
+@@ -5636,39 +5706,138 @@ static bool micronux_native_runtime_policy_valid(struct micronux_dsi *dsi)
+ 	       micronux_pool_guards_valid(dsi, false);
+ }
+ 
++static void
++micronux_capture_scanout_snapshot(struct micronux_dsi *dsi,
++				  struct micronux_scanout_snapshot *snapshot, u8 index,
++	u32 ignored_status1)
++{
++	if (index >= MICRONUX_DISPLAY_BUFFER_COUNT)
++		index = 0;
++	memset(snapshot, 0, sizeof(*snapshot));
++	snapshot->host_status_seen =
++		micronux_sample_host_status_raw(dsi, ignored_status1,
++						&snapshot->host_raw0,
++						&snapshot->host_raw1);
++	snapshot->host_sticky0 = READ_ONCE(dsi->host_error0);
++	snapshot->host_sticky1 = READ_ONCE(dsi->host_error1);
++	snapshot->bridge_raw = readl(dsi->bridge + DSI_BRG_INT_RAW);
++	snapshot->bridge_underruns = READ_ONCE(dsi->bridge_underruns);
++	snapshot->gdma_top = readl(dsi->gdma + DW_GDMA_INT_STATUS);
++	snapshot->gdma_status0 =
++		readl(dsi->channel + DW_GDMA_CH_INT_STATUS);
++	snapshot->gdma_status1 =
++		readl(dsi->channel + DW_GDMA_CH_INT_STATUS1);
++	snapshot->gdma_common =
++		readl(dsi->gdma + DW_GDMA_INT_COMMON_STATUS);
++	snapshot->gdma_cfg = readl(dsi->gdma + DW_GDMA_CFG);
++	snapshot->gdma_chen = readl(dsi->gdma + DW_GDMA_CHEN);
++	snapshot->gdma_cfg_lo = readl(dsi->channel + DW_GDMA_CH_CFG_LO);
++	snapshot->gdma_cfg_hi = readl(dsi->channel + DW_GDMA_CH_CFG_HI);
++	snapshot->gdma_llp = readl(dsi->channel + DW_GDMA_CH_LLP);
++	snapshot->gdma_sar = readl(dsi->channel + DW_GDMA_CH_SAR);
++	snapshot->descriptor_ctrl_hi =
++		readl(dsi->descriptor[index] + DMA_LLI_CTRL_HI);
++	snapshot->generation = READ_ONCE(dsi->source_generation);
++	snapshot->frames = READ_ONCE(dsi->scanout_frames);
++	snapshot->fault_bits = READ_ONCE(dsi->fault_bits);
++	snapshot->last_dma_error = READ_ONCE(dsi->last_dma_error);
++	snapshot->rearm_attempts = READ_ONCE(dsi->rearm_attempts);
++	snapshot->rearm_failures = READ_ONCE(dsi->rearm_failures);
++	snapshot->guards_valid = micronux_pool_guards_valid(dsi, true);
++	snapshot->host_mode = readl(dsi->host + DSI_HOST_MODE_CFG);
++	snapshot->host_vid = readl(dsi->host + DSI_HOST_VID_MODE_CFG);
++	snapshot->host_active =
++		readl(dsi->host + DSI_HOST_VID_MODE_CFG_ACT);
++	snapshot->host_lpclk = readl(dsi->host + DSI_HOST_LPCLK_CTRL);
++	snapshot->runtime_policy_valid =
++		micronux_native_runtime_policy_valid(dsi);
++}
++
++static void
++micronux_log_scanout_failure(struct micronux_dsi *dsi,
++			     const char *reason, const char *detail,
++	int error, int window, int poll_error, u32 initial_generation,
++	const struct micronux_scanout_snapshot *snapshot)
++{
++	dev_err(dsi->dev,
++		"MICRONUX:M9.2:COLD-INIT stage=scanout-qualification reason=%s detail=%s error=%d window=%d poll-error=%d initial-generation=%u generation=%u frames=%u faults=%lx dma-error=%08x rearm=%u/%u guards=%u runtime-policy=%u\n",
++		reason, detail, error, window, poll_error, initial_generation,
++		snapshot->generation, snapshot->frames, snapshot->fault_bits,
++		snapshot->last_dma_error, snapshot->rearm_attempts,
++		snapshot->rearm_failures, snapshot->guards_valid,
++		snapshot->runtime_policy_valid);
++	dev_err(dsi->dev,
++		"MICRONUX:M9.2:COLD-INIT stage=scanout-qualification reason=%s snapshot=host raw=%08x:%08x sticky=%08x:%08x seen=%u mode=%08x vid=%08x active=%08x lpclk=%08x bridge-raw=%08x underruns=%u gdma=%08x:%08x:%08x:%08x cfg=%08x chen=%08x cfglo=%08x cfghi=%08x llp=%08x sar=%08x ctrlhi=%08x\n",
++		reason, snapshot->host_raw0, snapshot->host_raw1,
++		snapshot->host_sticky0, snapshot->host_sticky1,
++		snapshot->host_status_seen, snapshot->host_mode,
++		snapshot->host_vid, snapshot->host_active,
++		snapshot->host_lpclk, snapshot->bridge_raw,
++		snapshot->bridge_underruns,
++		snapshot->gdma_top, snapshot->gdma_status0,
++		snapshot->gdma_status1, snapshot->gdma_common,
++		snapshot->gdma_cfg, snapshot->gdma_chen,
++		snapshot->gdma_cfg_lo, snapshot->gdma_cfg_hi,
++		snapshot->gdma_llp, snapshot->gdma_sar,
++		snapshot->descriptor_ctrl_hi);
++}
++
+ static int micronux_native_start_scanout(struct micronux_dsi *dsi)
+ {
+-	u32 common, initial_generation, status, status0, status1, top, window;
+-	int ret;
++	struct micronux_scanout_snapshot snapshot;
++	unsigned long faults;
++	u32 cfg, initial_generation, last_dma_error, status, window;
++	int error, ret;
+ 
+ 	dsi->front_index = 0;
+ 	dsi->render_index = 1;
+ 	dsi->queued_index = -1;
+ 	/* The global IRQ master stays masked across this final clean snapshot. */
+-	if (readl(dsi->gdma + DW_GDMA_CFG) != 1)
++	micronux_capture_scanout_snapshot(dsi, &snapshot,
++					  dsi->front_index, 0);
++	if (snapshot.gdma_cfg != 1) {
++		micronux_log_scanout_failure(dsi, "initial-precheck",
++					     "global-master-masked", -EIO,
++			-1, 0, snapshot.generation, &snapshot);
+ 		return -EIO;
+-	top = readl(dsi->gdma + DW_GDMA_INT_STATUS);
+-	status0 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS);
+-	status1 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS1);
+-	common = readl(dsi->gdma + DW_GDMA_INT_COMMON_STATUS);
+-	if (micronux_sample_host_status(dsi, 0) ||
+-	    !micronux_host_status_clean(dsi) ||
+-	    READ_ONCE(dsi->last_dma_error) || READ_ONCE(dsi->fault_bits) ||
+-	    (readl(dsi->bridge + DSI_BRG_INT_RAW) & DSI_BRG_INT_UNDERRUN) ||
+-	    (top & ~DW_GDMA_INT_TOP_ALLOWED) ||
+-	    (status0 & DW_GDMA_INT_NATIVE_SCANOUT_MASK) ||
+-	    (status1 & DW_GDMA_INT_ECC_ERROR_MASK) ||
+-	    (common & DW_GDMA_INT_COMMON_VALID_MASK))
++	}
++	if (snapshot.host_status_seen || snapshot.host_sticky0 ||
++	    snapshot.host_sticky1 || snapshot.last_dma_error ||
++	    snapshot.fault_bits ||
++	    (snapshot.bridge_raw & DSI_BRG_INT_UNDERRUN) ||
++	    (snapshot.gdma_top & ~DW_GDMA_INT_TOP_ALLOWED) ||
++	    (snapshot.gdma_status0 & DW_GDMA_INT_NATIVE_SCANOUT_MASK) ||
++	    (snapshot.gdma_status1 & DW_GDMA_INT_ECC_ERROR_MASK) ||
++	    (snapshot.gdma_common & DW_GDMA_INT_COMMON_VALID_MASK)) {
++		micronux_log_scanout_failure(dsi, "initial-precheck",
++					     "latched-status", -EIO, -1, 0,
++			snapshot.generation, &snapshot);
+ 		return -EIO;
++	}
+ 	dsi->scanout_active = true;
+ 	/* From this point every new source is delivered; never clear it blindly. */
+ 	writel(3, dsi->gdma + DW_GDMA_CFG);
+-	if (readl(dsi->gdma + DW_GDMA_CFG) != 3 ||
+-	    READ_ONCE(dsi->last_dma_error) || READ_ONCE(dsi->fault_bits))
++	cfg = readl(dsi->gdma + DW_GDMA_CFG);
++	last_dma_error = READ_ONCE(dsi->last_dma_error);
++	faults = READ_ONCE(dsi->fault_bits);
++	if (cfg != 3 || last_dma_error || faults) {
++		micronux_capture_scanout_snapshot(dsi, &snapshot,
++						  dsi->front_index, 0);
++		micronux_log_scanout_failure(dsi, "global-enable",
++					     "master-or-latched-fault", -EIO,
++			-1, 0, snapshot.generation, &snapshot);
+ 		return -EIO;
+-	ret = micronux_native_dma_arm_frame(dsi, dsi->front_index);
+-	if (ret)
++	}
++	ret = micronux_native_dma_arm_frame(dsi, dsi->front_index, &snapshot);
++	if (ret) {
++		if (ret != -EIO)
++			micronux_capture_scanout_snapshot(dsi, &snapshot,
++							  dsi->front_index, 0);
++		micronux_log_scanout_failure(dsi, "arm-readback",
++					     "descriptor-channel-readback", ret,
++			-1, 0, snapshot.generation, &snapshot);
+ 		return ret;
++	}
+ 	writel(0, dsi->host + DSI_HOST_MODE_CFG);
+ 	writel(DSI_BRG_NATIVE_MISC_ON,
+ 	       dsi->bridge + DSI_BRG_DPI_MISC_CONFIG);
+@@ -5684,16 +5853,19 @@ static int micronux_native_start_scanout(struct micronux_dsi *dsi)
+ 					1000,
+ 					MICRONUX_SCANOUT_START_TIMEOUT_MS * 1000,
+ 					false, dsi->source_generation);
+-		if (ret ||
+-		    micronux_sample_host_status(dsi, 0) ||
+-		    !micronux_host_status_clean(dsi) ||
+-		    READ_ONCE(dsi->last_dma_error) ||
+-		    READ_ONCE(dsi->fault_bits) ||
+-		    (readl(dsi->bridge + DSI_BRG_INT_RAW) &
+-		     DSI_BRG_INT_UNDERRUN) ||
+-		    !micronux_pool_guards_valid(dsi, true) ||
+-		    !micronux_native_runtime_policy_valid(dsi))
+-			return ret ? ret : -EIO;
++		micronux_capture_scanout_snapshot(dsi, &snapshot,
++						  dsi->front_index, 0);
++		if (ret || snapshot.host_status_seen || snapshot.host_sticky0 ||
++		    snapshot.host_sticky1 || snapshot.last_dma_error ||
++		    snapshot.fault_bits ||
++		    (snapshot.bridge_raw & DSI_BRG_INT_UNDERRUN) ||
++		    !snapshot.guards_valid || !snapshot.runtime_policy_valid) {
++			error = ret ? ret : -EIO;
++			micronux_log_scanout_failure(dsi,
++						     "qualification-window", "window-health", error,
++				window, ret, initial_generation, &snapshot);
++			return error;
++		}
+ 	}
+ 	dev_info(dsi->dev,
+ 		 "MICRONUX:M9.2:COLD-INIT stage=scanout-qualification state=PASSED windows=2 frames-per-window=4 completions=8 source-generation=8 host-errors=0 gdma-errors=0 ecc-errors=0 common-errors=0 bridge-underruns=0 guards=verified source=black\n");
+-- 
+2.54.0.windows.1

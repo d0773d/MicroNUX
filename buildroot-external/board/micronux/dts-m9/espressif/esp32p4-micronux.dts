@@ -51,6 +51,11 @@
 			no-map;
 		};
 
+		display_pool: display-pool@49300000 {
+			reg = <0x49300000 0x00400000>;
+			no-map;
+		};
+
 		user_pool: user-pool@49700000 {
 			compatible = "micronux,esp32p4-user-pool";
 			reg = <0x49700000 0x00800000>;
@@ -84,12 +89,14 @@
 		interrupts = <17>;
 		clock-frequency = <80000000>;
 		espressif,dual-slot;
+		espressif,allow-single-slot;
 		#address-cells = <1>;
 		#size-cells = <0>;
 		status = "okay";
 
 		microsd: slot@0 {
 			reg = <0>;
+			status = "disabled";
 			max-frequency = <20000000>;
 			bus-width = <4>;
 			broken-cd;
@@ -113,13 +120,26 @@
 		compatible = "espressif,esp32p4-micronux-dsi";
 		reg = <0x500a0000 0x00000800>,
 		      <0x500a0800 0x00000104>,
+		      <0x500a6000 0x00001000>,
 		      <0x50081000 0x00001000>,
-		      <0x500c4000 0x00001000>;
-		reg-names = "dsi-host", "dsi-bridge", "gdma", "i2c";
+		      <0x500c4000 0x00001000>,
+		      <0x500d6000 0x00001000>,
+		      <0x500e0000 0x00001000>,
+		      <0x500e1000 0x00001000>,
+		      <0x500e6000 0x00001000>,
+		      <0x50115000 0x00001000>,
+		      <0x5012d000 0x00001000>;
+		reg-names = "dsi-host", "dsi-bridge", "dma-pms", "gdma",
+			    "i2c", "intr-matrix", "gpio", "iomux",
+			    "hp-clkrst", "pmu", "efuse";
 		interrupt-parent = <&cpu0_intc>;
 		interrupts = <18>;
 		espressif,handoff-address = <0x49f00000>;
+		espressif,required-handoff-abi = <3>;
+		espressif,required-silicon-revision = <103>;
 		espressif,uncached-offset = <0x40000000>;
+		firmware-name = "micronux/jd9365-waveshare-10.1-v2.bin";
+		memory-region = <&display_pool>;
 		espressif,touch-address = <0x5d>;
 		espressif,touch-poll-ms = <10>;
 		touchscreen-size-x = <800>;

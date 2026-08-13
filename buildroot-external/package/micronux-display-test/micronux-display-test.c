@@ -21,7 +21,6 @@
 #define DISPLAY_STRIDE (DISPLAY_WIDTH * 2U)
 #define TOUCH_NAME "MicroNUX GT9271 Touchscreen"
 #define TOUCH_SYSFS "/sys/bus/platform/devices/500a0000.display/touch"
-#define BOOT_READY_SYSFS "/sys/bus/platform/devices/500a0000.display/boot_ready"
 #define LOCK_PATH "/run/micronux-display.lock"
 #define MAX_INPUT_DEVICES 8
 #define TARGET_HALF 32U
@@ -84,23 +83,22 @@ static int bit_is_set(const unsigned long *bits, unsigned int bit)
 		  (1UL << (bit % BITS_PER_LONG)));
 }
 
-static int set_boot_ready(int ready)
+static int set_framebuffer_blank(int blank)
 {
-	const char value[2] = { ready ? '1' : '0', '\n' };
 	int fd;
-	int saved_errno;
+	int first_error = 0;
 
-	fd = open(BOOT_READY_SYSFS, O_WRONLY | O_CLOEXEC);
+	fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
 	if (fd < 0)
 		return -1;
-	if (write(fd, value, sizeof(value)) != (ssize_t)sizeof(value)) {
-		saved_errno = errno ? errno : EIO;
-		(void)close(fd);
-		errno = saved_errno;
+	if (ioctl(fd, FBIOBLANK, blank) < 0)
+		first_error = errno;
+	if (close(fd) < 0 && !first_error)
+		first_error = errno;
+	if (first_error) {
+		errno = first_error;
 		return -1;
 	}
-	if (close(fd) < 0)
-		return -1;
 	return 0;
 }
 
@@ -108,18 +106,18 @@ static int restore_console_state(void)
 {
 	int first_error = 0;
 
-	if (graphics_active && console_fd >= 0) {
-		/* Keep fbcon's KD_TEXT redraw dark until the status frame is complete. */
-		if (set_boot_ready(0) < 0)
+	if (graphics_active) {
+		if (set_framebuffer_blank(FB_BLANK_POWERDOWN) < 0)
 			first_error = errno;
-		if (!first_error && ioctl(console_fd, KDSETMODE, KD_TEXT) < 0)
+		if (ioctl(console_fd, KDSETMODE, KD_TEXT) < 0 && !first_error)
 			first_error = errno;
-		if (!first_error && set_boot_ready(1) < 0)
+		if (set_framebuffer_blank(FB_BLANK_UNBLANK) < 0 && !first_error)
 			first_error = errno;
 	}
 	graphics_active = 0;
 	if (console_fd >= 0) {
-		(void)close(console_fd);
+		if (close(console_fd) < 0 && !first_error)
+			first_error = errno;
 		console_fd = -1;
 	}
 	if (first_error) {
@@ -143,25 +141,14 @@ static void handle_signal(int signal_number)
 
 static int acquire_graphics(void)
 {
-	int framebuffer_fd;
-	int saved_errno;
-
 	console_fd = open("/dev/tty1", O_RDWR | O_CLOEXEC);
 	if (console_fd < 0)
 		return fail("tty1-open");
 	if (ioctl(console_fd, KDSETMODE, KD_GRAPHICS) < 0)
 		return fail("kd-graphics");
 	graphics_active = 1;
-	framebuffer_fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
-	if (framebuffer_fd < 0)
-		return fail("framebuffer-unblank-open");
-	if (ioctl(framebuffer_fd, FBIOBLANK, FB_BLANK_UNBLANK) < 0) {
-		saved_errno = errno;
-		(void)close(framebuffer_fd);
-		errno = saved_errno;
+	if (set_framebuffer_blank(FB_BLANK_UNBLANK) < 0)
 		return fail("framebuffer-unblank");
-	}
-	(void)close(framebuffer_fd);
 	return 0;
 }
 
@@ -233,8 +220,13 @@ static int open_touch(char *path, size_t path_size)
 			continue;
 		memset(name, 0, sizeof(name));
 		if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) >= 0 &&
-		    strcmp(name, TOUCH_NAME) == 0 && touch_capabilities_ok(fd))
-			return fd;
+		    strcmp(name, TOUCH_NAME) == 0) {
+			if (touch_capabilities_ok(fd))
+				return fd;
+			(void)close(fd);
+			errno = EPROTO;
+			return -1;
+		}
 		(void)close(fd);
 	}
 	errno = ENODEV;
@@ -244,21 +236,52 @@ static int open_touch(char *path, size_t path_size)
 static int read_touch_status(char *status, size_t status_size)
 {
 	ssize_t length;
+	int first_error = 0;
 	int fd = open(TOUCH_SYSFS, O_RDONLY | O_CLOEXEC);
 
 	if (fd < 0)
 		return -1;
 	length = read(fd, status, status_size - 1U);
-	(void)close(fd);
-	if (length <= 0)
-		return -1;
-	status[length] = '\0';
-	if (strncmp(status, "ready product=9271 ",
-		    sizeof("ready product=9271 ") - 1U) != 0) {
-		errno = EPROTO;
+	if (length < 0)
+		first_error = errno;
+	else if (length == 0)
+		first_error = EIO;
+	if (close(fd) < 0 && !first_error)
+		first_error = errno;
+	if (first_error) {
+		errno = first_error;
 		return -1;
 	}
+	status[length] = '\0';
 	return 0;
+}
+
+static int touch_status_ready(const char *status)
+{
+	char canonical[256];
+	unsigned int address;
+	unsigned int interval_ms;
+	unsigned int reads;
+	unsigned int errors;
+	unsigned int down;
+	int canonical_length;
+	int consumed = -1;
+
+	if (sscanf(status,
+		   "ready product=9271 address=0x%x mode=poll interval_ms=%u reads=%u errors=%u down=%u%n",
+		   &address, &interval_ms, &reads, &errors, &down,
+		   &consumed) != 5 || consumed < 0 ||
+	    strcmp(status + consumed, "\n") != 0)
+		return 0;
+	if ((address != 0x5dU && address != 0x14U) || interval_ms < 5U ||
+	    interval_ms > 100U || down > 1U)
+		return 0;
+	canonical_length = snprintf(canonical, sizeof(canonical),
+		"ready product=9271 address=0x%02x mode=poll interval_ms=%u reads=%u errors=%u down=%u\n",
+		address, interval_ms, reads, errors, down);
+	if (canonical_length < 0 || canonical_length >= (int)sizeof(canonical))
+		return 0;
+	return strcmp(status, canonical) == 0;
 }
 
 static int write_paced(int fd, const void *buffer, size_t length, off_t offset)
@@ -409,20 +432,39 @@ static int run_check(void)
 	if (fb < 0)
 		return fail("framebuffer-check");
 	touch = open_touch(touch_path, sizeof(touch_path));
-	if (touch < 0) {
-		(void)close(fb);
-		return fail("touch-check");
-	}
+	if (touch < 0 && errno != ENODEV)
+		goto touch_check_failed;
 	if (read_touch_status(status, sizeof(status)) != 0) {
-		(void)close(touch);
+		if (touch >= 0)
+			(void)close(touch);
 		(void)close(fb);
-		return fail("touch-status");
+		return fail("touch-status-read");
 	}
-	printf("MICRONUX:M9:DISPLAY-TEST:PASS mode=check fb=800x1280-rgb565 stride=1600 input=%s %s",
-	       touch_path, status);
-	(void)close(touch);
+	if (touch >= 0 && !touch_status_ready(status)) {
+		errno = EPROTO;
+		goto touch_status_failed;
+	}
+	if (touch < 0 && strcmp(status, "unavailable\n") != 0) {
+		errno = EPROTO;
+		goto touch_status_failed;
+	}
+	if (touch >= 0) {
+		printf("MICRONUX:M9:DISPLAY-TEST:PASS mode=check fb=800x1280-rgb565 stride=1600 input=%s %s",
+		       touch_path, status);
+		(void)close(touch);
+	} else {
+		printf("MICRONUX:M9:DISPLAY-TEST:PASS mode=check fb=800x1280-rgb565 stride=1600 input=unavailable %s",
+		       status);
+	}
 	(void)close(fb);
 	return 0;
+
+touch_status_failed:
+	if (touch >= 0)
+		(void)close(touch);
+touch_check_failed:
+	(void)close(fb);
+	return fail("touch-check");
 }
 
 static int run_draw(unsigned int seconds)
@@ -457,6 +499,7 @@ static int run_touch(unsigned int timeout_ms)
 	struct touch_state state = { 0 };
 	char touch_path[64];
 	unsigned int index;
+	int result = 1;
 	int touch;
 	int fb;
 
@@ -467,21 +510,27 @@ static int run_touch(unsigned int timeout_ms)
 		return fail("framebuffer-touch-open");
 	touch = open_touch(touch_path, sizeof(touch_path));
 	if (touch < 0) {
-		(void)close(fb);
-		return fail("touch-open");
+		result = fail("touch-open");
+		goto close_framebuffer;
 	}
-	if (draw_test_pattern(fb) != 0)
-		return fail("touch-background");
+	if (draw_test_pattern(fb) != 0) {
+		result = fail("touch-background");
+		goto close_touch;
+	}
 
 	for (index = 0; index < sizeof(targets) / sizeof(targets[0]); ++index) {
 		const struct target *target = &targets[index];
 
-		if (draw_target(fb, target->x, target->y, UINT16_C(0xffe0)) != 0)
-			return fail("touch-target-draw");
+		if (draw_target(fb, target->x, target->y, UINT16_C(0xffe0)) != 0) {
+			result = fail("touch-target-draw");
+			goto close_touch;
+		}
 		printf("MICRONUX:M9:TOUCH-TARGET state=waiting index=%u name=%s x=%u y=%u\n",
 		       index + 1U, target->name, target->x, target->y);
-		if (wait_touch_state(touch, &state, 1, timeout_ms) != 0)
-			return fail("touch-press-timeout");
+		if (wait_touch_state(touch, &state, 1, timeout_ms) != 0) {
+			result = fail("touch-press-timeout");
+			goto close_touch;
+		}
 		if (distance((unsigned int)state.x, target->x) >
 		    TARGET_TOLERANCE ||
 		    distance((unsigned int)state.y, target->y) >
@@ -491,18 +540,27 @@ static int run_touch(unsigned int timeout_ms)
 				"MICRONUX:M9:TOUCH-TARGET:FAIL index=%u expected=%u,%u actual=%d,%d tolerance=%u\n",
 				index + 1U, target->x, target->y, state.x, state.y,
 				TARGET_TOLERANCE);
-			return 1;
+			goto close_touch;
 		}
-		if (draw_target(fb, target->x, target->y, UINT16_C(0x07e0)) != 0)
-			return fail("touch-target-pass-draw");
+		if (draw_target(fb, target->x, target->y, UINT16_C(0x07e0)) != 0) {
+			result = fail("touch-target-pass-draw");
+			goto close_touch;
+		}
 		printf("MICRONUX:M9:TOUCH-TARGET:PASS index=%u name=%s actual=%d,%d\n",
 		       index + 1U, target->name, state.x, state.y);
-		if (wait_touch_state(touch, &state, 0, timeout_ms) != 0)
-			return fail("touch-release-timeout");
+		if (wait_touch_state(touch, &state, 0, timeout_ms) != 0) {
+			result = fail("touch-release-timeout");
+			goto close_touch;
+		}
 	}
 
+	result = 0;
+close_touch:
 	(void)close(touch);
+close_framebuffer:
 	(void)close(fb);
+	if (result != 0)
+		return result;
 	if (restore_console_state() != 0)
 		return fail("console-restore");
 	printf("MICRONUX:M9:DISPLAY-TEST:PASS mode=touch points=5 input=%s console=restored\n",

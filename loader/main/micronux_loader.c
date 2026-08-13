@@ -48,6 +48,7 @@
 
 #define MICRONUX_PSRAM_VADDR UINT32_C(0x48000000)
 #define MICRONUX_KERNEL_VADDR UINT32_C(0x48400000)
+#define MICRONUX_DISPLAY_POOL_VADDR UINT32_C(0x49300000)
 #define MICRONUX_COMMS_VADDR UINT32_C(0x49F00000)
 #define MICRONUX_PSRAM_END UINT32_C(0x4A000000)
 #define MICRONUX_LOADER_RESERVE_SIZE UINT32_C(0x00400000)
@@ -156,6 +157,9 @@ static DRAM_ATTR micronux_handoff_v1_t s_handoff;
 static DRAM_ATTR micronux_payload_v1_t s_payload;
 static esp_ldo_channel_handle_t s_sd_ldo;
 static sd_host_ctlr_handle_t s_sd_controller;
+#if CONFIG_MICRONUX_M9_JD9365_COLD_RELINQUISH
+static bool s_cold_external_sequence_started;
+#endif
 
 extern void micronux_handoff_jump(uint32_t boot_hart_id,
                                   const void *dtb,
@@ -163,6 +167,18 @@ extern void micronux_handoff_jump(uint32_t boot_hart_id,
     __attribute__((noreturn));
 
 static void fail(const char *reason) __attribute__((noreturn));
+
+#if CONFIG_MICRONUX_M9_JD9365_COLD_RELINQUISH
+#define MICRONUX_RUNTIME_CHECK(expression, reason)                         \
+    do {                                                                  \
+        const esp_err_t micronux_check_result = (expression);             \
+        if (micronux_check_result != ESP_OK) {                            \
+            fail(reason);                                                 \
+        }                                                                 \
+    } while (0)
+#else
+#define MICRONUX_RUNTIME_CHECK(expression, reason) ESP_ERROR_CHECK(expression)
+#endif
 
 static inline uint32_t read_reg32(uint32_t address)
 {
@@ -215,6 +231,11 @@ static void characterize_clint(void)
 
 static void fail(const char *reason)
 {
+#if CONFIG_MICRONUX_M9_JD9365_COLD_RELINQUISH
+    if (s_cold_external_sequence_started) {
+        micronux_mipi_dsi_cold_fail_cleanup();
+    }
+#endif
     ESP_LOGE(TAG, "MICRONUX:M3:FAIL reason=%s", reason);
     abort();
 }
@@ -270,8 +291,10 @@ static void validate_manifest(const esp_partition_t *metadata_partition)
         fail("metadata-partition");
     }
 
-    ESP_ERROR_CHECK(esp_partition_read(metadata_partition, 0, &s_payload,
-                                       sizeof(s_payload)));
+    MICRONUX_RUNTIME_CHECK(
+        esp_partition_read(metadata_partition, 0, &s_payload,
+                           sizeof(s_payload)),
+        "metadata-read");
     const uint32_t calculated_crc = esp_rom_crc32_le(
         0, (const uint8_t *)&s_payload,
         offsetof(micronux_payload_v1_t, crc32));
@@ -292,7 +315,11 @@ static void validate_manifest(const esp_partition_t *metadata_partition)
 
     const uint64_t kernel_end = (uint64_t)s_payload.kernel_load_vaddr +
                                 s_payload.kernel_memory_size;
+#if CONFIG_MICRONUX_M7_EARLY_UMODE_DENY
+    if (kernel_end > MICRONUX_DISPLAY_POOL_VADDR) {
+#else
     if (kernel_end > MICRONUX_COMMS_VADDR) {
+#endif
         fail("kernel-memory-span");
     }
 
@@ -327,8 +354,9 @@ static void load_kernel(const esp_partition_t *partition, uint8_t *kernel,
         const size_t remaining = size - offset;
         const size_t chunk = remaining < MICRONUX_KERNEL_READ_CHUNK ?
                              remaining : MICRONUX_KERNEL_READ_CHUNK;
-        ESP_ERROR_CHECK(esp_partition_read(partition, offset,
-                                           kernel + offset, chunk));
+        MICRONUX_RUNTIME_CHECK(
+            esp_partition_read(partition, offset, kernel + offset, chunk),
+            "kernel-read");
         offset += chunk;
         const uint8_t percent = (uint8_t)(30U +
             (uint64_t)offset * 50U / size);
@@ -397,8 +425,9 @@ static void configure_sd_iomux_pin(gpio_num_t gpio, bool pull_up)
     }
     gpio_input_enable(gpio);
     gpio_iomux_output(gpio, MICRONUX_SD_IOMUX_FUNCTION);
-    ESP_ERROR_CHECK(gpio_set_drive_capability(
-        gpio, MICRONUX_SD_DRIVE_CAPABILITY));
+    MICRONUX_RUNTIME_CHECK(
+        gpio_set_drive_capability(gpio, MICRONUX_SD_DRIVE_CAPABILITY),
+        "sd-drive-capability");
 }
 
 static void prepare_microsd_electrical_state(void)
@@ -408,7 +437,8 @@ static void prepare_microsd_electrical_state(void)
         .voltage_mv = MICRONUX_SD_LDO_MILLIVOLTS,
     };
 
-    ESP_ERROR_CHECK(esp_ldo_acquire_channel(&ldo_config, &s_sd_ldo));
+    MICRONUX_RUNTIME_CHECK(
+        esp_ldo_acquire_channel(&ldo_config, &s_sd_ldo), "sd-ldo");
     configure_sd_iomux_pin(MICRONUX_SD_CLK_GPIO, false);
     configure_sd_iomux_pin(MICRONUX_SD_CMD_GPIO, true);
     configure_sd_iomux_pin(MICRONUX_SD_D0_GPIO, true);
@@ -427,16 +457,19 @@ static void prepare_microsd_electrical_state(void)
 static void configure_c6_sdio_pin(gpio_num_t gpio, int signal,
                                   gpio_mode_t mode, bool pull_up)
 {
-    ESP_ERROR_CHECK(gpio_reset_pin(gpio));
-    ESP_ERROR_CHECK(gpio_set_direction(gpio, mode));
-    ESP_ERROR_CHECK(gpio_pulldown_dis(gpio));
+    MICRONUX_RUNTIME_CHECK(gpio_reset_pin(gpio), "c6-gpio-reset");
+    MICRONUX_RUNTIME_CHECK(gpio_set_direction(gpio, mode),
+                            "c6-gpio-direction");
+    MICRONUX_RUNTIME_CHECK(gpio_pulldown_dis(gpio),
+                            "c6-gpio-pulldown");
     if (pull_up) {
-        ESP_ERROR_CHECK(gpio_pullup_en(gpio));
+        MICRONUX_RUNTIME_CHECK(gpio_pullup_en(gpio), "c6-gpio-pullup");
     } else {
-        ESP_ERROR_CHECK(gpio_pullup_dis(gpio));
+        MICRONUX_RUNTIME_CHECK(gpio_pullup_dis(gpio), "c6-gpio-pullup");
     }
-    ESP_ERROR_CHECK(gpio_set_drive_capability(
-        gpio, MICRONUX_SD_DRIVE_CAPABILITY));
+    MICRONUX_RUNTIME_CHECK(
+        gpio_set_drive_capability(gpio, MICRONUX_SD_DRIVE_CAPABILITY),
+        "c6-drive-capability");
 
     if (mode == GPIO_MODE_INPUT || mode == GPIO_MODE_INPUT_OUTPUT) {
         esp_rom_gpio_connect_in_signal(gpio, signal, false);
@@ -475,13 +508,16 @@ static void prepare_c6_sdio_electrical_state(void)
                           sdmmc_slot_gpio_sig[1].d3,
                           GPIO_MODE_INPUT_OUTPUT, true);
 
-    ESP_ERROR_CHECK(gpio_config(&reset_config));
+    MICRONUX_RUNTIME_CHECK(gpio_config(&reset_config), "c6-reset-config");
     /* GPIO54 is C6 CHIP_PU: low resets the coprocessor, high runs it. */
-    ESP_ERROR_CHECK(gpio_set_level(MICRONUX_C6_RESET_GPIO, 1));
+    MICRONUX_RUNTIME_CHECK(gpio_set_level(MICRONUX_C6_RESET_GPIO, 1),
+                            "c6-reset-release");
     vTaskDelay(pdMS_TO_TICKS(MICRONUX_C6_RESET_PULSE_MS));
-    ESP_ERROR_CHECK(gpio_set_level(MICRONUX_C6_RESET_GPIO, 0));
+    MICRONUX_RUNTIME_CHECK(gpio_set_level(MICRONUX_C6_RESET_GPIO, 0),
+                            "c6-reset-assert");
     vTaskDelay(pdMS_TO_TICKS(MICRONUX_C6_RESET_PULSE_MS));
-    ESP_ERROR_CHECK(gpio_set_level(MICRONUX_C6_RESET_GPIO, 1));
+    MICRONUX_RUNTIME_CHECK(gpio_set_level(MICRONUX_C6_RESET_GPIO, 1),
+                            "c6-reset-release");
     vTaskDelay(pdMS_TO_TICKS(MICRONUX_C6_RESET_SETTLE_MS));
 
     ESP_LOGI(TAG,
@@ -512,8 +548,10 @@ static void prepare_sdmmc_electrical_state(void)
         .dma_desc_num = 1,
     };
 
-    ESP_ERROR_CHECK(sd_host_create_sdmmc_controller(
-        &controller_config, &s_sd_controller));
+    MICRONUX_RUNTIME_CHECK(
+        sd_host_create_sdmmc_controller(&controller_config,
+                                        &s_sd_controller),
+        "sd-controller");
     /* No IDF slot is registered: silence its ISR before exposing the pins. */
     quiesce_sdmmc_controller();
 
@@ -705,6 +743,16 @@ void app_main(void)
         fail("unsupported-silicon-revision");
     }
 
+#if CONFIG_MICRONUX_M9_JD9365_COLD_RELINQUISH
+    s_cold_external_sequence_started = true;
+    if (micronux_mipi_dsi_cold_early_dark() != ESP_OK) {
+        fail("mipi-dsi-early-dark");
+    }
+    if (micronux_mipi_dsi_cold_prepare() != ESP_OK) {
+        fail("mipi-dsi-prepare");
+    }
+#endif
+
     characterize_clint();
 #if CONFIG_MICRONUX_C6_PROVISIONING
     const esp_err_t provisioning_err = micronux_provisioning_run();
@@ -736,9 +784,11 @@ void app_main(void)
         fail("psram-capacity");
     }
 
+#if !CONFIG_MICRONUX_M9_JD9365_COLD_RELINQUISH
     if (micronux_mipi_dsi_prepare() != ESP_OK) {
         fail("mipi-dsi-prepare");
     }
+#endif
 
     const esp_partition_t *metadata_partition = find_partition(
         (esp_partition_subtype_t)MICRONUX_METADATA_PARTITION_SUBTYPE,
@@ -766,8 +816,9 @@ void app_main(void)
     if (dtb == NULL || (uintptr_t)dtb >= MICRONUX_KERNEL_VADDR) {
         fail("dtb-buffer-allocation");
     }
-    ESP_ERROR_CHECK(esp_partition_read(dtb_partition, 0, dtb,
-                                       s_payload.dtb_size));
+    MICRONUX_RUNTIME_CHECK(
+        esp_partition_read(dtb_partition, 0, dtb, s_payload.dtb_size),
+        "dtb-read");
     memset(dtb + s_payload.dtb_size, 0,
            dtb_allocation_size - s_payload.dtb_size);
     if (dtb[0] != 0xd0 || dtb[1] != 0x0d ||
@@ -790,6 +841,13 @@ void app_main(void)
                  kernel, s_payload.kernel_load_vaddr);
         fail("kernel-load-address");
     }
+#if CONFIG_MICRONUX_M7_EARLY_UMODE_DENY
+    const uint64_t kernel_allocation_end = (uint64_t)(uintptr_t)kernel +
+                                           kernel_allocation_size;
+    if (kernel_allocation_end > MICRONUX_DISPLAY_POOL_VADDR) {
+        fail("kernel-allocation-span");
+    }
+#endif
     micronux_mipi_dsi_progress(25);
     if (!test_kernel_buffer((uint32_t *)kernel, kernel_allocation_size)) {
         fail("psram-integrity");
@@ -807,9 +865,12 @@ void app_main(void)
     esp_paddr_t dtb_paddr = 0;
     mmu_target_t kernel_target = MMU_TARGET_FLASH0;
     mmu_target_t dtb_target = MMU_TARGET_FLASH0;
-    ESP_ERROR_CHECK(esp_mmu_vaddr_to_paddr(
-        kernel, &kernel_paddr, &kernel_target));
-    ESP_ERROR_CHECK(esp_mmu_vaddr_to_paddr(dtb, &dtb_paddr, &dtb_target));
+    MICRONUX_RUNTIME_CHECK(
+        esp_mmu_vaddr_to_paddr(kernel, &kernel_paddr, &kernel_target),
+        "kernel-mmu-translation");
+    MICRONUX_RUNTIME_CHECK(
+        esp_mmu_vaddr_to_paddr(dtb, &dtb_paddr, &dtb_target),
+        "dtb-mmu-translation");
     if (kernel_target != MMU_TARGET_PSRAM0 ||
         dtb_target != MMU_TARGET_PSRAM0 ||
         kernel_paddr != MICRONUX_LOADER_RESERVE_SIZE ||
@@ -890,15 +951,21 @@ void app_main(void)
         0, (const uint8_t *)&s_handoff,
         offsetof(micronux_handoff_v1_t, crc32));
 
-    ESP_ERROR_CHECK(esp_cache_msync(
-        kernel, kernel_allocation_size,
-        ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA));
-    ESP_ERROR_CHECK(esp_cache_msync(
-        kernel, kernel_allocation_size,
-        ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_INST));
-    ESP_ERROR_CHECK(esp_cache_msync(
-        dtb, dtb_allocation_size,
-        ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA));
+    MICRONUX_RUNTIME_CHECK(
+        esp_cache_msync(
+            kernel, kernel_allocation_size,
+            ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA),
+        "kernel-cache-writeback");
+    MICRONUX_RUNTIME_CHECK(
+        esp_cache_msync(
+            kernel, kernel_allocation_size,
+            ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_INST),
+        "kernel-cache-invalidate");
+    MICRONUX_RUNTIME_CHECK(
+        esp_cache_msync(
+            dtb, dtb_allocation_size,
+            ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA),
+        "dtb-cache-writeback");
     micronux_mipi_dsi_progress(100);
 
     ESP_LOGI(TAG,
@@ -925,7 +992,11 @@ void app_main(void)
              MICRONUX_SDMMC_PARK_CLIC_ID,
              MICRONUX_SDMMC_IRQ_PLACEHOLDER_ID);
 
+#if CONFIG_MICRONUX_M9_JD9365_COLD_RELINQUISH
+    if (micronux_mipi_dsi_cold_handoff() != ESP_OK) {
+#else
     if (micronux_mipi_dsi_handoff() != ESP_OK) {
+#endif
         fail("mipi-dsi-handoff");
     }
     prepare_gdma_for_linux();
@@ -937,7 +1008,6 @@ void app_main(void)
     if (micronux_dma_pms_prepare() != ESP_OK) {
         fail("dma-pms");
     }
-
     fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(100));
 
@@ -945,12 +1015,37 @@ void app_main(void)
 
     const int current_core = esp_cpu_get_core_id();
     const int other_core = current_core == 0 ? 1 : 0;
+#if CONFIG_MICRONUX_M9_JD9365_COLD_RELINQUISH
+    /*
+     * Complete every operation that can fail, log, delay, or depend on the
+     * scheduler before shutting the IDF runtime down.  The staged contract
+     * remains invalid because its magic word is still zero.
+     */
+    prepare_usb_serial_jtag_for_linux();
+    if (micronux_mipi_dsi_cold_stage() != ESP_OK) {
+        fail("mipi-dsi-cold-stage");
+    }
+    if (!micronux_mipi_dsi_cold_staged()) {
+        fail("mipi-dsi-cold-stage-invariant");
+    }
+    fflush(stdout);
+#endif
+
     esp_cpu_stall(other_core);
     vTaskSuspendAll();
     portDISABLE_INTERRUPTS();
     esp_cpu_intr_disable(UINT32_MAX);
+#if !CONFIG_MICRONUX_M9_JD9365_COLD_RELINQUISH
     prepare_usb_serial_jtag_for_linux();
+#endif
     prepare_clic_for_linux();
 
+#if CONFIG_MICRONUX_M9_JD9365_COLD_RELINQUISH
+    /*
+     * Publish the ABI magic through the uncached alias as the final write
+     * before the non-returning jump.  No cleanup path is reachable here.
+     */
+    micronux_mipi_dsi_cold_commit();
+#endif
     micronux_handoff_jump(0, dtb, s_payload.kernel_load_vaddr);
 }

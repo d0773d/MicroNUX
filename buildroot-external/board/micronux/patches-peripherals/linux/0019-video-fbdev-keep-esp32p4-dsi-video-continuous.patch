@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: MicroNUX <micronux@example.invalid>
 Date: Mon, 10 Aug 2026 20:15:00 -0700
-Subject: [PATCH 19/22] video: fbdev: keep ESP32-P4 DSI video continuous
+Subject: [PATCH 19/46] video: fbdev: keep ESP32-P4 DSI video continuous
 
 The JD9365 is a direct-video panel. Preserve a continuous high-speed clock,
 disable low-power video intervals, and remove the unserviced per-frame BTA ACK

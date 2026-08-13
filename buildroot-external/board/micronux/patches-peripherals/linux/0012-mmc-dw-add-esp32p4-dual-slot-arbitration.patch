@@ -1,7 +1,7 @@
 From 5ac9e42a80e4c29cbeb180677bbb7df68f32358a Mon Sep 17 00:00:00 2001
 From: MicroNUX contributors <micronux@users.noreply.github.com>
 Date: Sat, 8 Aug 2026 21:35:00 -0700
-Subject: [PATCH 12/22] mmc: dw: add ESP32-P4 dual-slot arbitration
+Subject: [PATCH 12/46] mmc: dw: add ESP32-P4 dual-slot arbitration
 
 ESP32-P4 exposes one DesignWare controller with two independently wired
 physical slots: slot 0 is the removable microSD connector and slot 1 is the

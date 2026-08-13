@@ -1,7 +1,7 @@
 From 2d36d783c6f4e20fe3555fedfb7382c70d1c2636 Mon Sep 17 00:00:00 2001
 From: MicroNUX Project <micronux@example.invalid>
 Date: Sat, 8 Aug 2026 04:40:00 -0700
-Subject: [PATCH 02/22] mmc: dw: add ESP32-P4 IDMAC descriptor builder
+Subject: [PATCH 02/46] mmc: dw: add ESP32-P4 IDMAC descriptor builder
 
 ESP32-P4 uses 64-byte IDMAC descriptors even in 32-bit address mode and
 keeps chained mode set on the terminal descriptor with a null next pointer.

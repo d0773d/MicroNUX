@@ -1,7 +1,7 @@
 From 7bf3eb65b1d2b9cf56c28db81439286d9f43d4c8 Mon Sep 17 00:00:00 2001
 From: MicroNUX Project <micronux@example.invalid>
 Date: Fri, 7 Aug 2026 12:00:00 -0700
-Subject: [PATCH 1/7] riscv: add ESP32-P4 NOMMU platform support
+Subject: [PATCH 1/8] riscv: add ESP32-P4 NOMMU platform support
 
 The ESP32-P4 HP core only implements CLIC mode.  Its mtvec base is
 64-byte aligned, its interrupt enables are memory mapped, and its mcause

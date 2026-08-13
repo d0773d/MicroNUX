@@ -9,11 +9,11 @@ $ErrorActionPreference = "Stop"
 $expectedCommit = "8c19b156084a0753687347cca1f5355782893533"
 $expectedSourceHashes = [ordered]@{
     "components/esp_hw_support/port/esp32p4/cpu_region_protect.c" =
-        "26c4c6a1fed3aa64ef7b331fab905f54bb33674fe71db561412a157dc9db131f"
+        "6fef47b34a8fddd51823fba5bbd443e78435d7d34f3cc3937bb254a29fce63be"
     "components/esp_lcd/dsi/esp_lcd_panel_dpi.c" =
-        "f5f5ce836267020d72f5f9a7591647cc6606d8729fc26a12197889d03b3eeeb1"
+        "c817340fedf56ca6c6d74d634948ed39473df5766c371e0ca07f06e26f662264"
     "components/esp_lcd/dsi/include/esp_lcd_mipi_dsi.h" =
-        "eb60e0441b65229424eb55f9ffae4638186d4785a0279296c1b53c452dc44ba6"
+        "f81b73c3dc9d4b5f88e15ca638773e955a7657ca43a5495eda55f6d41b961d9d"
 }
 $repoPath = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $patchPaths = @(
@@ -68,7 +68,8 @@ if (-not (Test-Path -LiteralPath $WorktreePath)) {
     $parent = Split-Path -Parent $WorktreePath
     New-Item -ItemType Directory -Path $parent -Force | Out-Null
     Invoke-GitChecked @(
-        "-C", $SourcePath, "worktree", "add", "--detach", $WorktreePath, $expectedCommit
+        "-c", "core.autocrlf=false", "-C", $SourcePath,
+        "worktree", "add", "--detach", $WorktreePath, $expectedCommit
     ) | Out-Null
 }
 if (-not (Test-Path -LiteralPath (Join-Path $WorktreePath ".git"))) {
@@ -129,7 +130,8 @@ foreach ($patchPath in $patchPaths) {
 }
 
 Invoke-GitChecked @(
-    "-C", $WorktreePath, "submodule", "update", "--init", "--recursive", "--jobs", "8"
+    "-C", $WorktreePath, "submodule", "update", "--init", "--recursive",
+    "--depth", "1", "--recommend-shallow", "--jobs", "8"
 ) | Out-Null
 
 Write-Host "M7 ESP-IDF prepared: tag=v6.0.1 commit=$expectedCommit patches=$($patchPaths.Count) path=$WorktreePath"

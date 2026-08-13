@@ -328,15 +328,18 @@ The physical fault suite now reports 19 cases and proves:
 `scripts/check-bflt-wx.py` independently audited all 14 generated user
 executables for the required 128-byte boundary.
 
-WP6 also audits every DMA master enabled by the accepted image. The loader's
+WP6 also audited every DMA master enabled by the accepted M7 image. The loader's
 P4 DMA permission controller grants SDMMC read/write access only to its
 internal bounce/descriptor window. The exact display GDMA channel can read
 only the rounded framebuffer range, read/write only its descriptor page, and
-write only the DSI FIFO page; other DMA channels are denied. Linux verifies the
-versioned circular-display contract before claiming `/dev/fb0`, then programs
-hardware-reload scanout, counts frames through a routed block-done
-interrupt, paces CPU writes to avoid bridge underruns, and disables userspace
-framebuffer `mmap()`. See the [Linux-owned display report](m7-linux-display.md).
+write only the DSI FIFO page; other DMA channels are denied. That image
+validated the versioned circular-display contract before claiming `/dev/fb0`,
+then programmed hardware-reload scanout and counted frames through a routed
+block-done interrupt. Current M9.2 source supersedes that mechanism with three
+protected framebuffers and transactional per-frame IRQ rearm while preserving
+the same DMA-deny-by-default and no-userspace-`mmap()` boundaries. See the
+[historical M7 display report](m7-linux-display.md) and the
+[M9.2 ownership plan](m9-2-native-linux-display-ownership-plan.md).
 
 The final WP6/display candidate passed three independent ROM resets with the
 same payload hash, complete SD/C6/display workloads, exact arena accounting,

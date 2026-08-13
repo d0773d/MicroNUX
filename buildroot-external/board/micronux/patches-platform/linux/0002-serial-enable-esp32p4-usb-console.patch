@@ -1,7 +1,7 @@
 From a83a8ff4eed81d9f90e5b60a75734184dde9fa4e Mon Sep 17 00:00:00 2001
 From: MicroNUX Project <micronux@example.invalid>
 Date: Fri, 7 Aug 2026 15:00:00 -0700
-Subject: [PATCH 2/7] serial: enable ESP32-P4 USB Serial/JTAG console
+Subject: [PATCH 2/8] serial: enable ESP32-P4 USB Serial/JTAG console
 
 The ESP32-P4 USB Serial/JTAG block uses the same FIFO and interrupt
 register layout as the controller already supported by esp32_acm.  Add the

@@ -1,0 +1,7 @@
+config BR2_PACKAGE_MICRONUX_JD9365_FIRMWARE
+	bool "micronux-jd9365-firmware"
+	help
+	  Install the separately licensed Waveshare JD9365 10.1-inch panel
+	  DCS command program used by the native MicroNUX display driver.
+	  The artifact contains bounded command/data/delay records only; it
+	  cannot perform arbitrary ESP32-P4 register writes.

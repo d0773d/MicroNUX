@@ -1,0 +1,98 @@
+From 4c5a77ea966fb837f3473b2f1e7530568ddc5c5c Mon Sep 17 00:00:00 2001
+From: MicroNUX <micronux@example.invalid>
+Date: Tue, 11 Aug 2026 21:10:00 -0700
+Subject: [PATCH 25/46] video: fbdev: qualify initial reveal and log blocks
+
+Use the same grace-plus-strict framebuffer qualification for the initial
+stopped-to-running transition that already protects VPG restoration.  Keep
+the backlight dark and report every reveal predicate when validation fails.
+
+Signed-off-by: MicroNUX <micronux@example.invalid>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 36 +++++++++++++++++++++++++-----------
+ 1 file changed, 25 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index eec4e0a..2075280 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -606,6 +606,8 @@ static int micronux_backlight_update(struct backlight_device *backlight)
+ {
+ 	struct micronux_dsi *dsi = bl_get_data(backlight);
+ 	u8 brightness = backlight_get_brightness(backlight);
++	unsigned long frame_age_ms, last_frame;
++	bool policy_valid, vpg;
+ 	int disable_ret, gate_ret, pwm_ret;
+ 
+ 	if (backlight_is_blank(backlight))
+@@ -614,8 +616,25 @@ static int micronux_backlight_update(struct backlight_device *backlight)
+ 		return micronux_backlight_disable(dsi);
+ 	if (!micronux_visible_source_valid(dsi)) {
+ 		disable_ret = micronux_backlight_disable(dsi);
++		last_frame = READ_ONCE(dsi->last_frame_jiffies);
++		frame_age_ms = last_frame ?
++			jiffies_to_msecs(jiffies - last_frame) : ~0UL;
++		vpg = READ_ONCE(dsi->vpg_test_active);
++		policy_valid = micronux_source_policy_valid(dsi, vpg);
+ 		dev_warn_ratelimited(dsi->dev,
+-				     "refusing backlight reveal without a healthy video source\n");
++			"MICRONUX:M9.2:REVEAL state=blocked scanout-ready=%u boot-ready=%u active=%u vpg=%u faults=%lx guards=%s host-errors=%08x:%08x dma=%08x bridge-raw=%08x policy=%s frame-age-ms=%lu\n",
++			READ_ONCE(dsi->scanout_ready),
++			READ_ONCE(dsi->boot_display_ready),
++			READ_ONCE(dsi->scanout_active),
++			vpg,
++			READ_ONCE(dsi->fault_bits),
++			micronux_pool_guards_valid(dsi, false) ? "ok" : "bad",
++			READ_ONCE(dsi->host_error0),
++			READ_ONCE(dsi->host_error1),
++			READ_ONCE(dsi->last_dma_error),
++			readl(dsi->bridge + DSI_BRG_INT_RAW),
++			policy_valid ? "ok" : "bad",
++			frame_age_ms);
+ 		return disable_ret ? disable_ret : -EHOSTDOWN;
+ 	}
+ 
+@@ -1518,7 +1537,7 @@ static void micronux_log_scanout_start_failure(struct micronux_dsi *dsi,
+ static int __micronux_fb_blank(int blank, struct fb_info *info)
+ {
+ 	struct micronux_dsi *dsi = info->par;
+-	u32 bridge_status, frame, initial_frame;
++	u32 bridge_status, initial_frame, initial_underruns;
+ 	int ret;
+ 
+ 	micronux_flush_render(dsi);
+@@ -1554,20 +1573,15 @@ static int __micronux_fb_blank(int blank, struct fb_info *info)
+ 	       DSI_BRG_RAW_NUM_TOTAL_SET,
+ 	       dsi->bridge + DSI_BRG_RAW_NUM_CONFIG);
+ 	initial_frame = READ_ONCE(dsi->scanout_frames);
++	initial_underruns = READ_ONCE(dsi->bridge_underruns);
+ 	ret = micronux_dma_start_frame(dsi,
+ 				       micronux_select_initial_front(dsi));
+ 	if (ret) {
+ 		bridge_status = readl(dsi->bridge + DSI_BRG_INT_RAW);
+ 		goto start_failed;
+ 	}
+-	micronux_select_framebuffer(dsi);
+-	/* Ignore only the intentional dark stopped-to-framebuffer residue. */
+-	micronux_discard_host_status(dsi);
+-	ret = read_poll_timeout(READ_ONCE, frame,
+-				(u32)(frame - initial_frame) >=
+-				MICRONUX_SCANOUT_STABLE_FRAMES,
+-				1000, MICRONUX_SCANOUT_START_TIMEOUT_MS * 1000,
+-				false, dsi->scanout_frames);
++	/* Qualify one grace and one strict frame window while still dark. */
++	ret = micronux_restore_framebuffer_source(dsi, initial_underruns);
+ 	bridge_status = readl(dsi->bridge + DSI_BRG_INT_RAW);
+ 	if (ret || READ_ONCE(dsi->last_dma_error) ||
+ 	    (bridge_status & DSI_BRG_INT_UNDERRUN)) {
+@@ -1651,7 +1665,7 @@ static ssize_t boot_ready_store(struct device *dev,
+ 		goto out;
+ 	}
+ 	dev_info(dsi->dev,
+-		 "MICRONUX:M9.2:SCANOUT state=running handoff=blanked-restart stable-frames=%u buffers=3 dma=irq-rearm backlight=restored reveal=userspace-ready frame-ack=enabled clock=auto lp=enabled backlight-gate=enabled\n",
++		 "MICRONUX:M9.2:SCANOUT state=running handoff=blanked-restart stable-frames=%u qualification-windows=2 buffers=3 dma=irq-rearm backlight=restored reveal=userspace-ready frame-ack=enabled clock=auto lp=enabled backlight-gate=enabled\n",
+ 		 MICRONUX_SCANOUT_STABLE_FRAMES);
+ out:
+ 	mutex_unlock(&dsi->backlight->ops_lock);
+-- 
+2.54.0.windows.1

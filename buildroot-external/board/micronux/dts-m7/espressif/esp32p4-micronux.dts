@@ -51,6 +51,11 @@
 			no-map;
 		};
 
+		display_pool: display-pool@49300000 {
+			reg = <0x49300000 0x00400000>;
+			no-map;
+		};
+
 		user_pool: user-pool@49700000 {
 			compatible = "micronux,esp32p4-user-pool";
 			reg = <0x49700000 0x00800000>;
@@ -119,7 +124,9 @@
 		interrupt-parent = <&cpu0_intc>;
 		interrupts = <18>;
 		espressif,handoff-address = <0x49f00000>;
+		espressif,required-handoff-abi = <2>;
 		espressif,uncached-offset = <0x40000000>;
+		memory-region = <&display_pool>;
 		status = "okay";
 	};
 

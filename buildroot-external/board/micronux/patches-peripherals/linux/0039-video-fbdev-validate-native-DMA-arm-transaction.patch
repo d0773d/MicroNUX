@@ -1,0 +1,112 @@
+From 99fcff145f84b22c8996e7cab8ce9a77abe472e7 Mon Sep 17 00:00:00 2001
+From: d0773d <dottedquad@gmail.com>
+Date: Wed, 12 Aug 2026 06:07:43 -0700
+Subject: [PATCH 39/46] video: fbdev: validate native DMA arm transaction
+
+The DesignWare GDMA consumes and advances LLP immediately after channel
+enable. The one-shot terminal descriptor therefore exposes only its
+memory-port bit after the engine fetches the programmed head.
+
+Validate the armed descriptor, channel configuration, head LLP, disabled
+channel, and clean status before enabling the channel. After enable,
+validate only the channel-enable and error status that remain
+software-stable, leaving hardware-owned descriptor and LLP state alone.
+
+Keep the shared initial and IRQ rearm path non-sleeping and preserve
+fail-dark handling.
+
+Signed-off-by: d0773d <dottedquad@gmail.com>
+---
+ drivers/video/fbdev/esp32p4-dsi.c | 49 +++++++++++++++++++++++++++----
+ 1 file changed, 44 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/video/fbdev/esp32p4-dsi.c b/drivers/video/fbdev/esp32p4-dsi.c
+index 9773fdc..712066d 100644
+--- a/drivers/video/fbdev/esp32p4-dsi.c
++++ b/drivers/video/fbdev/esp32p4-dsi.c
+@@ -2156,12 +2156,22 @@ micronux_native_dma_arm_frame(struct micronux_dsi *dsi, u8 index,
+ 	u32 descriptor_address = dsi->handoff.dma_descriptor_address +
+ 				 index * MICRONUX_DMA_DESCRIPTOR_SIZE;
+ 	void __iomem *descriptor = dsi->descriptor[index];
+-	u32 cfg_hi, cfg_lo, chen, ctrl_hi, llp;
++	u32 cfg_hi, cfg_lo, chen, common, ctrl_hi, llp, llp_hi;
++	u32 status0, status1, top;
+ 
+ 	if (index >= MICRONUX_DISPLAY_BUFFER_COUNT)
+ 		return -EINVAL;
+ 	WRITE_ONCE(dsi->rearm_attempts,
+ 		   READ_ONCE(dsi->rearm_attempts) + 1);
++	chen = readl(dsi->gdma + DW_GDMA_CHEN);
++	if (chen & channel) {
++		WRITE_ONCE(dsi->rearm_failures,
++			   READ_ONCE(dsi->rearm_failures) + 1);
++		if (failure_snapshot)
++			micronux_capture_scanout_snapshot(dsi,
++							  failure_snapshot, index, 0);
++		return -EIO;
++	}
+ 	writel(MICRONUX_NATIVE_DMA_DESCRIPTOR_ARMED,
+ 	       descriptor + DMA_LLI_CTRL_HI);
+ 	writel(MICRONUX_DMA_CHANNEL_CFG_LO,
+@@ -2171,19 +2181,28 @@ micronux_native_dma_arm_frame(struct micronux_dsi *dsi, u8 index,
+ 	writel(descriptor_address | DW_GDMA_LLP_MEMORY_PORT,
+ 	       dsi->channel + DW_GDMA_CH_LLP);
+ 	writel(0, dsi->channel + DW_GDMA_CH_LLP + sizeof(u32));
+-	/* Publish descriptor and channel programming before enabling GDMA. */
++	/* Verify software-owned programming before GDMA can consume it. */
+ 	wmb();
+-	writel(channel | (channel << 8), dsi->gdma + DW_GDMA_CHEN);
+ 	chen = readl(dsi->gdma + DW_GDMA_CHEN);
+ 	ctrl_hi = readl(descriptor + DMA_LLI_CTRL_HI);
+ 	cfg_lo = readl(dsi->channel + DW_GDMA_CH_CFG_LO);
+ 	cfg_hi = readl(dsi->channel + DW_GDMA_CH_CFG_HI);
+ 	llp = readl(dsi->channel + DW_GDMA_CH_LLP);
+-	if (!(chen & channel) ||
++	llp_hi = readl(dsi->channel + DW_GDMA_CH_LLP + sizeof(u32));
++	status0 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS);
++	status1 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS1);
++	common = readl(dsi->gdma + DW_GDMA_INT_COMMON_STATUS);
++	top = readl(dsi->gdma + DW_GDMA_INT_STATUS);
++	if ((chen & channel) ||
+ 	    ctrl_hi != MICRONUX_NATIVE_DMA_DESCRIPTOR_ARMED ||
+ 	    cfg_lo != MICRONUX_DMA_CHANNEL_CFG_LO ||
+ 	    cfg_hi != MICRONUX_DMA_CHANNEL_CFG_HI ||
+-	    llp != (descriptor_address | DW_GDMA_LLP_MEMORY_PORT)) {
++	    llp != (descriptor_address | DW_GDMA_LLP_MEMORY_PORT) ||
++	    llp_hi ||
++	    (status0 & DW_GDMA_INT_NATIVE_SCANOUT_MASK) ||
++	    (status1 & DW_GDMA_INT_ECC_ERROR_MASK) ||
++	    (common & DW_GDMA_INT_COMMON_VALID_MASK) ||
++	    (top & ~DW_GDMA_INT_TOP_ALLOWED)) {
+ 		WRITE_ONCE(dsi->rearm_failures,
+ 			   READ_ONCE(dsi->rearm_failures) + 1);
+ 		if (failure_snapshot) {
+@@ -2197,6 +2216,26 @@ micronux_native_dma_arm_frame(struct micronux_dsi *dsi, u8 index,
+ 		}
+ 		return -EIO;
+ 	}
++
++	/* The one-shot engine owns descriptor and LLP state after this write. */
++	writel(channel | (channel << 8), dsi->gdma + DW_GDMA_CHEN);
++	chen = readl(dsi->gdma + DW_GDMA_CHEN);
++	status0 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS);
++	status1 = readl(dsi->channel + DW_GDMA_CH_INT_STATUS1);
++	common = readl(dsi->gdma + DW_GDMA_INT_COMMON_STATUS);
++	top = readl(dsi->gdma + DW_GDMA_INT_STATUS);
++	if (!(chen & channel) ||
++	    (status0 & DW_GDMA_INT_ERROR_MASK) ||
++	    (status1 & DW_GDMA_INT_ECC_ERROR_MASK) ||
++	    (common & DW_GDMA_INT_COMMON_VALID_MASK) ||
++	    (top & ~DW_GDMA_INT_TOP_ALLOWED)) {
++		WRITE_ONCE(dsi->rearm_failures,
++			   READ_ONCE(dsi->rearm_failures) + 1);
++		if (failure_snapshot)
++			micronux_capture_scanout_snapshot(dsi,
++							  failure_snapshot, index, 0);
++		return -EIO;
++	}
+ 	return 0;
+ }
+ 
+-- 
+2.54.0.windows.1

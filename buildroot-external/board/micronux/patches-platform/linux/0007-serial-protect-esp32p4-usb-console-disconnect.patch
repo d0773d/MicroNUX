@@ -1,7 +1,7 @@
 From 9a14c7efc7611244a69823ba3848287d7014796d Mon Sep 17 00:00:00 2001
 From: MicroNUX Project <micronux@example.invalid>
 Date: Mon, 10 Aug 2026 18:02:00 -0700
-Subject: [PATCH 7/7] power: protect ESP32-P4 from USB console disconnect
+Subject: [PATCH 7/8] power: protect ESP32-P4 from USB console disconnect
 
 The ESP32-P4 USB Serial/JTAG controller normally converts a host CDC
 control-line transition into a chip reset.  Windows closes the native COM

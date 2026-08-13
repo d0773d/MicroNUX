@@ -1,7 +1,7 @@
 From f90b556392933844432e972f8f0126ce86f733ae Mon Sep 17 00:00:00 2001
 From: MicroNUX contributors <micronux@users.noreply.github.com>
 Date: Sat, 8 Aug 2026 16:20:00 -0700
-Subject: [PATCH 10/22] mmc: dw: poll ESP32-P4 SDIO interrupts
+Subject: [PATCH 10/46] mmc: dw: poll ESP32-P4 SDIO interrupts
 
 The ESP32-P4 physical MMC interrupt is deliberately parked while the NOMMU
 CLIC port is stabilized.  Command and data requests are already serviced by
