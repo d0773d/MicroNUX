@@ -180,6 +180,9 @@ typedef struct {
  */
 esp_err_t micronux_mipi_dsi_prepare(void);
 
+/* Run the Linux-free ESP-IDF display baseline indefinitely. */
+void micronux_mipi_dsi_standalone_run(void);
+
 /* Update the loader splash with a monotonic, real-work progress value. */
 void micronux_mipi_dsi_progress(uint8_t percent);
 

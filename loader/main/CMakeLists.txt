@@ -1,12 +1,24 @@
-idf_component_register(
-    SRCS
+if(CONFIG_MICRONUX_DISPLAY_STANDALONE)
+    set(MICRONUX_MAIN_SRCS
+        "micronux_display_standalone.c"
+        "micronux_mipi_dsi.c"
+        "micronux_panel_guard.c")
+    set(MICRONUX_PRIVATE_REQUIRES
+        esp_psram
+        esp_hw_support
+        esp_driver_gpio
+        esp_driver_i2c
+        esp_lcd
+        espressif__i2c_bus
+        freertos)
+else()
+    set(MICRONUX_MAIN_SRCS
         "micronux_loader.c"
         "micronux_dma_pms.c"
         "micronux_mipi_dsi.c"
         "micronux_panel_guard.c"
-        "handoff_jump.S"
-    INCLUDE_DIRS "."
-    PRIV_REQUIRES
+        "handoff_jump.S")
+    set(MICRONUX_PRIVATE_REQUIRES
         esp_mm
         esp_partition
         esp_psram
@@ -22,7 +34,13 @@ idf_component_register(
         esp_rom
         esp_system
         freertos
-        mbedtls
+        mbedtls)
+endif()
+
+idf_component_register(
+    SRCS ${MICRONUX_MAIN_SRCS}
+    INCLUDE_DIRS "."
+    PRIV_REQUIRES ${MICRONUX_PRIVATE_REQUIRES}
 )
 
 # The pinned Waveshare panel constructors perform their own unbounded I2C

@@ -89,6 +89,7 @@ userspace image and workload.
 ## Documentation
 
 - [Hardware contract](docs/hardware.md)
+- [Linux-free ESP-IDF display baseline](docs/idf-display-baseline.md)
 - [Linux device ownership and application model](docs/device-ownership-and-applications.md)
 - [Milestone roadmap](docs/roadmap.md)
 - [M1 QEMU build and test](docs/m1-qemu.md)

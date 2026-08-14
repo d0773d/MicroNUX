@@ -3,6 +3,7 @@
 #include <inttypes.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "sdkconfig.h"
 #include "esp_cache.h"
@@ -838,8 +839,10 @@ static esp_lcd_panel_io_handle_t s_panel_io;
 static esp_lcd_panel_handle_t s_panel;
 static i2c_master_bus_handle_t s_i2c_bus;
 static i2c_master_dev_handle_t s_backlight;
+#if !CONFIG_MICRONUX_DISPLAY_STANDALONE
 static micronux_display_dma_policy_t s_dma_policy;
 static bool s_dma_policy_ready;
+#endif
 static void *s_framebuffer;
 static size_t s_framebuffer_size;
 static uint8_t s_progress_percent;
@@ -862,6 +865,7 @@ static void best_effort_display_dark(void)
     (void)write_backlight_register(MICRONUX_DSI_BACKLIGHT_REGISTER, 0);
 }
 
+#if !CONFIG_MICRONUX_DISPLAY_STANDALONE
 static esp_err_t disable_backlight_gate(void)
 {
     const esp_err_t pwm_result = write_backlight_register(
@@ -881,6 +885,7 @@ static esp_err_t disable_backlight_gate(void)
     }
     return ESP_OK;
 }
+#endif
 
 static void delay_at_least_ms(uint32_t milliseconds)
 {
@@ -900,6 +905,7 @@ static void release_backlight_bus(void)
     }
 }
 
+#if !CONFIG_MICRONUX_DISPLAY_STANDALONE
 static esp_err_t release_backlight_device(void)
 {
     if (s_backlight == NULL) {
@@ -930,6 +936,7 @@ static uint32_t align_up_4k(uint32_t address)
 {
     return (address + UINT32_C(0xfff)) & ~UINT32_C(0xfff);
 }
+#endif
 
 typedef struct {
     char character;
@@ -1446,6 +1453,94 @@ void micronux_mipi_dsi_progress(uint8_t percent)
     s_progress_percent = percent;
     ESP_LOGI(TAG, "MICRONUX:M7:SPLASH progress=%u state=visible",
              percent);
+#endif
+}
+
+void micronux_mipi_dsi_standalone_run(void)
+{
+#if !CONFIG_MICRONUX_DISPLAY_STANDALONE
+    ESP_LOGE(TAG,
+             "MICRONUX:IDF-DISPLAY state=refused reason=profile-disabled");
+#else
+    static const char title[] = "MICRONUX";
+    static const char subtitle[] = "COLOR BURN IN";
+    static const char state[] = "RUNNING";
+    const uint32_t title_scale = splash_title_scale(s_profile.width);
+    const uint32_t text_scale = title_scale / 3U;
+    const uint32_t title_width = splash_text_width(title, title_scale);
+    const uint32_t subtitle_width = splash_text_width(subtitle, text_scale);
+    const uint32_t state_width = splash_text_width(state, text_scale);
+    const uint32_t title_y = s_profile.height / 2U - 110U;
+    const uint32_t heartbeat_size = 36U;
+    const uint32_t heartbeat_x = (s_profile.width - heartbeat_size) / 2U;
+    const uint32_t heartbeat_y = title_y + 190U;
+    bool heartbeat_on = false;
+    uint32_t seconds = 0;
+
+    if (s_panel == NULL || s_framebuffer == NULL ||
+        s_framebuffer_size == 0) {
+        ESP_LOGE(TAG,
+                 "MICRONUX:IDF-DISPLAY state=failed reason=display-missing");
+        abort();
+    }
+
+    ESP_ERROR_CHECK(esp_lcd_dpi_panel_set_pattern(
+        s_panel, MIPI_DSI_PATTERN_BAR_VERTICAL));
+    ESP_LOGI(TAG,
+             "MICRONUX:IDF-DISPLAY state=color-bars duration_s=5"
+             " source=hardware-vpg");
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    splash_fill_rect(s_framebuffer, s_profile.width, s_profile.height,
+                     0, 0, s_profile.width, s_profile.height,
+                     MICRONUX_SPLASH_BACKGROUND);
+    splash_draw_text(s_framebuffer, s_profile.width, s_profile.height,
+                     (s_profile.width - title_width) / 2U, title_y,
+                     title, title_scale, MICRONUX_SPLASH_FOREGROUND);
+    splash_draw_text(s_framebuffer, s_profile.width, s_profile.height,
+                     (s_profile.width - subtitle_width) / 2U,
+                     title_y + 100U, subtitle, text_scale,
+                     MICRONUX_SPLASH_ACCENT);
+    splash_draw_text(s_framebuffer, s_profile.width, s_profile.height,
+                     (s_profile.width - state_width) / 2U,
+                     title_y + 145U, state, text_scale,
+                     MICRONUX_SPLASH_FOREGROUND);
+    ESP_ERROR_CHECK(esp_cache_msync(
+        s_framebuffer, s_framebuffer_size,
+        ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA));
+    ESP_ERROR_CHECK(esp_lcd_dpi_panel_set_pattern(
+        s_panel, MIPI_DSI_PATTERN_NONE));
+    ESP_LOGI(TAG,
+             "MICRONUX:IDF-DISPLAY state=running owner=esp-idf"
+             " source=framebuffer resolution=%ux%u format=rgb565"
+             " linux=disabled sdmmc=disabled c6=disabled",
+             s_profile.width, s_profile.height);
+
+    while (true) {
+        heartbeat_on = !heartbeat_on;
+        splash_fill_rect(s_framebuffer, s_profile.width, s_profile.height,
+                         heartbeat_x, heartbeat_y,
+                         heartbeat_size, heartbeat_size,
+                         heartbeat_on ? MICRONUX_SPLASH_ACCENT :
+                                        MICRONUX_SPLASH_BACKGROUND);
+        uint8_t *const heartbeat =
+            (uint8_t *)s_framebuffer +
+            ((size_t)heartbeat_y * s_profile.width + heartbeat_x) *
+                sizeof(uint16_t);
+        ESP_ERROR_CHECK(esp_cache_msync(
+            heartbeat,
+            (size_t)heartbeat_size * s_profile.width * sizeof(uint16_t),
+            ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+                ESP_CACHE_MSYNC_FLAG_TYPE_DATA |
+                ESP_CACHE_MSYNC_FLAG_UNALIGNED));
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        ++seconds;
+        if (seconds % 60U == 0U) {
+            ESP_LOGI(TAG,
+                     "MICRONUX:IDF-DISPLAY state=running uptime_s=%" PRIu32,
+                     seconds);
+        }
+    }
 #endif
 }
 
